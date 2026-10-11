@@ -5,18 +5,27 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { routePerChannel, type ChannelRouterServices } from "./channel-service";
+import { ChannelService, channelDecisionCommand, channelDecisionNeedsAllowList, isPrivateChat, parsePersistedRecipient, recipientWarning, routePerChannel, sendWithRetry, type ChannelRouterServices } from "./channel-service";
 import type { ChannelAdapter, ChannelMessage } from "../comms/channels/telegram";
+import { initDatabase } from "../vault/schema";
+import { getSetting, setSetting } from "../vault/settings";
+
+// Discord user ids are snowflakes, and since #883 an allow-list entry that is
+// not one names nobody.
+const U1 = "100000000000000001";
+const OWNER = "100000000000000002";
+const STRANGER = "100000000000000003";
 
 class FakeAdapter implements ChannelAdapter {
-  name = "fake";
+  name: string;
   private connected: boolean;
   private throwOnSend: Error | null;
   public sent: Array<{ to: string; text: string }> = [];
 
-  constructor(opts: { connected: boolean; throwOnSend?: Error }) {
+  constructor(opts: { connected: boolean; throwOnSend?: Error; name?: string }) {
     this.connected = opts.connected;
     this.throwOnSend = opts.throwOnSend ?? null;
+    this.name = opts.name ?? "fake";
   }
 
   async connect(): Promise<void> {
@@ -35,6 +44,20 @@ class FakeAdapter implements ChannelAdapter {
   isConnected(): boolean {
     return this.connected;
   }
+}
+
+/**
+ * A config whose channels have these allow-lists and nothing else. start()
+ * registers no adapter for it (no channel is enabled), so tests register
+ * their own fakes under the channel's name.
+ */
+function allowListConfig(lists: { telegram?: number[]; discord?: string[] }): never {
+  return {
+    channels: {
+      telegram: { enabled: false, bot_token: "", allowed_users: lists.telegram ?? [] },
+      discord: { enabled: false, bot_token: "", allowed_users: lists.discord ?? [] },
+    },
+  } as never;
 }
 
 function makeServices(opts: {
@@ -138,5 +161,861 @@ describe("routePerChannel", () => {
     }));
     expect(res.delivered).toEqual(["telegram"]);
     expect(tg.sent).toHaveLength(1);
+  });
+});
+
+/** Adapter that fails with each scripted error in turn, then succeeds. */
+class ScriptedAdapter {
+  name = "scripted";
+  public sent: Array<{ to: string; text: string }> = [];
+  constructor(private failures: unknown[]) {}
+
+  async sendMessage(to: string, text: string): Promise<void> {
+    const failure = this.failures.shift();
+    if (failure) throw failure;
+    this.sent.push({ to, text });
+  }
+}
+
+function makeSleepRecorder(): { sleeps: number[]; sleep: (ms: number) => Promise<void> } {
+  const sleeps: number[] = [];
+  return {
+    sleeps,
+    sleep: async (ms: number) => {
+      sleeps.push(ms);
+    },
+  };
+}
+
+function rateLimitError(retryAfterMs?: number): Error & { retryAfterMs?: number } {
+  const err = new Error("Telegram API error 429: Too Many Requests") as Error & { retryAfterMs?: number };
+  if (retryAfterMs !== undefined) err.retryAfterMs = retryAfterMs;
+  return err;
+}
+
+describe("sendWithRetry", () => {
+  test("first-try success makes one attempt and never sleeps", async () => {
+    const adapter = new ScriptedAdapter([]);
+    const { sleeps, sleep } = makeSleepRecorder();
+
+    const res = await sendWithRetry(adapter, "user", "hi", { sleep });
+
+    expect(res).toEqual({ ok: true, attempts: 1 });
+    expect(adapter.sent).toEqual([{ to: "user", text: "hi" }]);
+    expect(sleeps).toEqual([]);
+  });
+
+  test("retries transient failures with exponential backoff", async () => {
+    const adapter = new ScriptedAdapter([rateLimitError(), rateLimitError()]);
+    const { sleeps, sleep } = makeSleepRecorder();
+
+    const res = await sendWithRetry(adapter, "user", "hi", { sleep, baseDelayMs: 2_000 });
+
+    expect(res).toEqual({ ok: true, attempts: 3 });
+    expect(sleeps).toEqual([2_000, 4_000]);
+  });
+
+  test("an explicit retryAfterMs larger than the backoff wins", async () => {
+    const adapter = new ScriptedAdapter([rateLimitError(7_000)]);
+    const { sleeps, sleep } = makeSleepRecorder();
+
+    const res = await sendWithRetry(adapter, "user", "hi", { sleep, baseDelayMs: 2_000 });
+
+    expect(res).toEqual({ ok: true, attempts: 2 });
+    expect(sleeps).toEqual([7_000]);
+  });
+
+  test("a retryAfterMs smaller than the backoff loses to the backoff", async () => {
+    const adapter = new ScriptedAdapter([rateLimitError(500)]);
+    const { sleeps, sleep } = makeSleepRecorder();
+
+    const res = await sendWithRetry(adapter, "user", "hi", { sleep, baseDelayMs: 2_000 });
+
+    expect(res).toEqual({ ok: true, attempts: 2 });
+    expect(sleeps).toEqual([2_000]);
+  });
+
+  test("non-transient errors are not retried", async () => {
+    const adapter = new ScriptedAdapter([new Error("Telegram API error: Bad Request: chat not found")]);
+    const { sleeps, sleep } = makeSleepRecorder();
+
+    const res = await sendWithRetry(adapter, "user", "hi", { sleep });
+
+    expect(res).toEqual({ ok: false, attempts: 1, error: "Telegram API error: Bad Request: chat not found" });
+    expect(sleeps).toEqual([]);
+    expect(adapter.sent).toEqual([]);
+  });
+
+  test("fails immediately when the provider demands a wait beyond the budget", async () => {
+    const adapter = new ScriptedAdapter([rateLimitError(120_000)]);
+    const { sleeps, sleep } = makeSleepRecorder();
+
+    const res = await sendWithRetry(adapter, "user", "hi", { sleep, budgetMs: 60_000 });
+
+    expect(res.ok).toBe(false);
+    expect(res.attempts).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  test("gives up after maxAttempts on persistent transient failure", async () => {
+    const adapter = new ScriptedAdapter([
+      rateLimitError(), rateLimitError(), rateLimitError(), rateLimitError(),
+    ]);
+    const { sleeps, sleep } = makeSleepRecorder();
+
+    const res = await sendWithRetry(adapter, "user", "hi", { sleep, maxAttempts: 4, baseDelayMs: 2_000 });
+
+    expect(res.ok).toBe(false);
+    expect(res.attempts).toBe(4);
+    expect(sleeps).toEqual([2_000, 4_000, 8_000]);
+  });
+
+  test("honors an explicit retryAfterMs beyond the per-wait cap when it fits the budget", async () => {
+    // Sleeping only the capped 30s would retry inside Telegram's stated
+    // penalty window and burn an attempt on a guaranteed 429.
+    const adapter = new ScriptedAdapter([rateLimitError(45_000)]);
+    const { sleeps, sleep } = makeSleepRecorder();
+
+    const res = await sendWithRetry(adapter, "user", "hi", { sleep, maxDelayMs: 30_000, budgetMs: 60_000 });
+
+    expect(res).toEqual({ ok: true, attempts: 2 });
+    expect(sleeps).toEqual([45_000]);
+  });
+
+  test("caps the synthetic backoff at maxDelayMs", async () => {
+    const adapter = new ScriptedAdapter([rateLimitError(), rateLimitError()]);
+    const { sleeps, sleep } = makeSleepRecorder();
+
+    const res = await sendWithRetry(adapter, "user", "hi", { sleep, baseDelayMs: 20_000, maxDelayMs: 30_000 });
+
+    expect(res).toEqual({ ok: true, attempts: 3 });
+    expect(sleeps).toEqual([20_000, 30_000]);
+  });
+
+  test("depletes the budget across attempts, counting elapsed wall-clock time", async () => {
+    const adapter = new ScriptedAdapter([rateLimitError(), rateLimitError(), rateLimitError()]);
+    let clock = 0;
+    const sleeps: number[] = [];
+    const sleep = async (ms: number) => {
+      sleeps.push(ms);
+      clock += ms;
+    };
+
+    const res = await sendWithRetry(adapter, "user", "hi", {
+      sleep,
+      now: () => clock,
+      baseDelayMs: 2_000,
+      budgetMs: 10_000,
+    });
+
+    // Backoff wants 2s, 4s, then 8s — but after 6s of sleeping only 4s of
+    // budget remains, so the third retry fails fast instead of sleeping.
+    expect(res.ok).toBe(false);
+    expect(res.attempts).toBe(3);
+    expect(sleeps).toEqual([2_000, 4_000]);
+  });
+
+  test("retries a fetch timeout (AbortError)", async () => {
+    const abortError = new Error("The operation was aborted.");
+    abortError.name = "AbortError";
+    const adapter = new ScriptedAdapter([abortError]);
+    const { sleeps, sleep } = makeSleepRecorder();
+
+    const res = await sendWithRetry(adapter, "user", "hi", { sleep, baseDelayMs: 2_000 });
+
+    expect(res).toEqual({ ok: true, attempts: 2 });
+    expect(sleeps).toEqual([2_000]);
+  });
+
+  test("retries connection-level failures identified by error code", async () => {
+    const connError = new Error("Unable to connect") as Error & { code?: string };
+    connError.code = "ConnectionRefused";
+    const adapter = new ScriptedAdapter([connError]);
+    const { sleeps, sleep } = makeSleepRecorder();
+
+    const res = await sendWithRetry(adapter, "user", "hi", { sleep, baseDelayMs: 2_000 });
+
+    expect(res).toEqual({ ok: true, attempts: 2 });
+    expect(sleeps).toEqual([2_000]);
+  });
+
+  test("resumes from the error's remainingText instead of resending sent chunks", async () => {
+    class ResumeAdapter {
+      name = "resume";
+      public sent: string[] = [];
+      private calls = 0;
+      async sendMessage(_to: string, text: string): Promise<void> {
+        this.calls++;
+        if (this.calls === 1) {
+          const err = rateLimitError() as Error & { remainingText?: string };
+          err.remainingText = "tail";
+          throw err;
+        }
+        this.sent.push(text);
+      }
+    }
+    const adapter = new ResumeAdapter();
+    const { sleep } = makeSleepRecorder();
+
+    const res = await sendWithRetry(adapter, "user", "head-and-tail", { sleep });
+
+    expect(res).toEqual({ ok: true, attempts: 2 });
+    expect(adapter.sent).toEqual(["tail"]);
+  });
+
+  test("resends the full text when the error carries no remainingText", async () => {
+    class RecordingAdapter {
+      name = "recording";
+      public sent: string[] = [];
+      private failures = 1;
+      async sendMessage(_to: string, text: string): Promise<void> {
+        if (this.failures-- > 0) throw rateLimitError();
+        this.sent.push(text);
+      }
+    }
+    const adapter = new RecordingAdapter();
+    const { sleep } = makeSleepRecorder();
+
+    const res = await sendWithRetry(adapter, "user", "full message", { sleep });
+
+    expect(res).toEqual({ ok: true, attempts: 2 });
+    expect(adapter.sent).toEqual(["full message"]);
+  });
+});
+
+describe("stop() drops adapters (settings hot reload restart-in-place)", () => {
+  test("a disabled channel's adapter does not survive a stop/start cycle", async () => {
+    initDatabase(":memory:");
+    const svc = new ChannelService({} as never, {} as never);
+    const adapter = new FakeAdapter({ connected: true });
+    svc.getManager().register(adapter);
+
+    await svc.stop();
+
+    // Regression: stop() used to only disconnect, so connectAll() in the
+    // next start() reconnected the stale adapter even though the channel
+    // was disabled in the fresh config.
+    expect(adapter.isConnected()).toBe(false);
+    expect(svc.getManager().listChannels()).toEqual([]);
+
+    // start() with a config that enables no channels stays empty.
+    await svc.start();
+    expect(svc.getManager().listChannels()).toEqual([]);
+  });
+});
+
+describe("delivery failure handler", () => {
+  function makeService(adapter: ChannelAdapter): ChannelService {
+    // Constructor only stores deps and creates the manager; the live
+    // agent/STT stack is needed only by start(), which we don't call.
+    const svc = new ChannelService({} as never, {} as never);
+    svc.getManager().register(adapter);
+    return svc;
+  }
+
+  test("broadcastToAll notifies the handler when a channel exhausts its retries", async () => {
+    // broadcastToAll needs a last-known recipient, which is only loaded from
+    // the settings table during start() — seed it through an in-memory vault.
+    // Since #852 it must also be a user the channel's allow-list names.
+    initDatabase(":memory:");
+    setSetting("channel.lastRecipient.discord", JSON.stringify({ to: "c1", userId: U1 }));
+    const svc = new ChannelService(allowListConfig({ discord: [U1] }), {} as never);
+    await svc.start();
+    const failing = new FakeAdapter({
+      connected: true,
+      name: "discord",
+      throwOnSend: new Error("Telegram API error: Bad Request: chat not found"),
+    });
+    svc.getManager().register(failing);
+    const failures: Array<{ channel: string; attempts: number; error: string }> = [];
+    svc.setDeliveryFailureHandler((f) => failures.push(f));
+
+    await svc.broadcastToAll("hi");
+
+    expect(failures).toEqual([
+      { channel: "discord", attempts: 1, error: "Telegram API error: Bad Request: chat not found" },
+    ]);
+  });
+
+  test("notifies the handler when a send exhausts its retries", async () => {
+    const failing = new FakeAdapter({
+      connected: true,
+      throwOnSend: new Error("Telegram API error: Bad Request: chat not found"),
+    });
+    const svc = makeService(failing);
+    const failures: Array<{ channel: string; attempts: number; error: string }> = [];
+    svc.setDeliveryFailureHandler((f) => failures.push(f));
+
+    await svc.sendToChannel("fake", "user", "hi");
+
+    expect(failures).toEqual([
+      { channel: "fake", attempts: 1, error: "Telegram API error: Bad Request: chat not found" },
+    ]);
+  });
+
+  test("does not notify the handler on success", async () => {
+    const healthy = new FakeAdapter({ connected: true });
+    const svc = makeService(healthy);
+    const failures: unknown[] = [];
+    svc.setDeliveryFailureHandler((f) => failures.push(f));
+
+    await svc.sendToChannel("fake", "user", "hi");
+
+    expect(failures).toEqual([]);
+    expect(healthy.sent).toEqual([{ to: "user", text: "hi" }]);
+  });
+
+  test("a throwing handler does not break the send path", async () => {
+    const failing = new FakeAdapter({
+      connected: true,
+      throwOnSend: new Error("Telegram API error: Bad Request: chat not found"),
+    });
+    const svc = makeService(failing);
+    svc.setDeliveryFailureHandler(() => {
+      throw new Error("handler boom");
+    });
+
+    await expect(svc.sendToChannel("fake", "user", "hi")).resolves.toBeUndefined();
+  });
+});
+
+/**
+ * #718. The approval card asks for literal text; that has to reach the
+ * adapter on the first attempt and on every retry.
+ */
+describe("#718: send options reach the adapter", () => {
+  class OptionsAdapter {
+    name = "discord";
+    public calls: unknown[][] = [];
+    constructor(private failures = 1) {}
+    isConnected() { return true; }
+    async sendMessage(...args: unknown[]): Promise<void> {
+      this.calls.push(args);
+      if (this.failures-- > 0) throw rateLimitError();
+    }
+  }
+
+  test("sendWithRetry passes them on every attempt, and passes nothing when given none", async () => {
+    const adapter = new OptionsAdapter();
+    const { sleep } = makeSleepRecorder();
+    await sendWithRetry(adapter, "user", "card", { sleep, send: { literal: true } });
+    expect(adapter.calls).toEqual([["user", "card", { literal: true }], ["user", "card", { literal: true }]]);
+
+    const plain = new OptionsAdapter();
+    await sendWithRetry(plain, "user", "hi", { sleep });
+    expect(plain.calls).toEqual([["user", "hi"], ["user", "hi"]]);
+  });
+
+  test("broadcastToAll hands them to each channel", async () => {
+    initDatabase(":memory:");
+    setSetting("channel.lastRecipient.discord", JSON.stringify({ to: "user-1", userId: U1 }));
+    const svc = new ChannelService(allowListConfig({ discord: [U1] }), {} as never);
+    await svc.start();
+    const adapter = new OptionsAdapter(0);
+    svc.getManager().register(adapter as unknown as ChannelAdapter);
+
+    await svc.broadcastToAll("card", { literal: true });
+
+    expect(adapter.calls).toEqual([["user-1", "card", { literal: true }]]);
+  });
+});
+
+/**
+ * #811. An empty allow-list lets anyone chat, and nobody decide an approval.
+ */
+describe("#811: an approve or deny needs a sender the allow-list names", () => {
+  const message = (text: string, senderAllowListed?: boolean): ChannelMessage => ({
+    id: "m1", channel: "discord", from: "someone", text, timestamp: 0,
+    metadata: { channelId: "c1", userId: U1 },
+    ...(senderAllowListed === undefined ? {} : { senderAllowListed }),
+  });
+  const setup = () => {
+    initDatabase(":memory:");
+    const decisions: unknown[][] = [];
+    const chats: string[] = [];
+    const agent = { handleThreadMessage: async (text: string) => { chats.push(text); return "chat reply"; } };
+    // Since #860 the configured list must name the sender as well as the
+    // adapter saying so; U1 is that sender.
+    const svc = new ChannelService(allowListConfig({ discord: [U1] }), agent as never);
+    svc.setApprovalHandler(async (...args) => { decisions.push(args); return "decided"; });
+    const handle = (msg: ChannelMessage) =>
+      (svc as unknown as { handleChannelMessage(m: ChannelMessage): Promise<string> }).handleChannelMessage(msg);
+    return { decisions, chats, handle };
+  };
+
+  test("a sender let in by an empty list cannot approve or deny, and the reply says why", async () => {
+    const { decisions, chats, handle } = setup();
+    for (const allowListed of [false, undefined]) {
+      expect(await handle(message("approve 1a2b3c4d", allowListed))).toBe(channelDecisionNeedsAllowList("discord"));
+      expect(await handle(message("deny 1a2b3c4d", allowListed))).toBe(channelDecisionNeedsAllowList("discord"));
+    }
+    expect(decisions).toEqual([]);
+    // Refused outright, not handed to the agent as chat either.
+    expect(chats).toEqual([]);
+  });
+
+  test("a sender the list names decides as before", async () => {
+    const { decisions, handle } = setup();
+    expect(await handle(message("approve 1a2b3c4d", true))).toBe("decided");
+    expect(decisions).toEqual([["approve", "1a2b3c4d", "discord"]]);
+  });
+
+  test("ordinary chat from the same sender still works", async () => {
+    const { decisions, chats, handle } = setup();
+    expect(await handle(message("what is on my calendar", false))).toBe("chat reply");
+    expect(chats).toEqual(["what is on my calendar"]);
+    expect(decisions).toEqual([]);
+  });
+});
+
+/**
+ * #810. The id is the whole word after the verb. It used to be the longest
+ * hex run at the start of it, so ordinary English named an id.
+ */
+describe("#810: channelDecisionCommand", () => {
+  test("ordinary sentences no longer carry a one-letter id", () => {
+    // Each of these used to parse, with the id shown, and decide whichever
+    // pending request first started with it.
+    for (const text of ["approve all of them", "Approve anything you like", "deny deadline extension", "approve everything"]) {
+      expect(channelDecisionCommand(text)).toBeNull();
+    }
+  });
+
+  test("a whole hex word is an id attempt, whatever its length, so a short one is refused rather than chatted", () => {
+    expect(channelDecisionCommand("approve a")).toEqual({ action: "approve", shortId: "a" });
+    expect(channelDecisionCommand("deny add")).toEqual({ action: "deny", shortId: "add" });
+  });
+
+  test("the card's reply still parses, with case, outer space, punctuation and trailing words", () => {
+    expect(channelDecisionCommand("approve 1a2b3c4d")).toEqual({ action: "approve", shortId: "1a2b3c4d" });
+    expect(channelDecisionCommand("  APPROVE 1A2B3C4D.  ")).toEqual({ action: "approve", shortId: "1a2b3c4d" });
+    expect(channelDecisionCommand("deny 1a2b3c4d please")).toEqual({ action: "deny", shortId: "1a2b3c4d" });
+  });
+
+  test("a long run of punctuation costs nothing to parse (#810 review)", () => {
+    // Measured: the old `/[.,;:!?]+$/` took 1851ms on this input, the scan 0.002ms.
+    const t0 = performance.now();
+    expect(channelDecisionCommand(`approve ${".".repeat(65_536)}x`)).toBeNull();
+    expect(performance.now() - t0).toBeLessThan(50);
+  });
+
+  test("anything else is chat", () => {
+    expect(channelDecisionCommand("approve the email")).toBeNull();
+    expect(channelDecisionCommand("approved 1a2b3c4d")).toBeNull();
+    expect(channelDecisionCommand("please approve 1a2b3c4d")).toBeNull();
+    expect(channelDecisionCommand("approve")).toBeNull();
+  });
+});
+
+/**
+ * #852. The broadcast recipient was saved for every sender before any
+ * allow-list check, so with an empty list whoever messaged last received
+ * every approval card.
+ */
+describe("#852: only a sender the allow-list names becomes the broadcast recipient", () => {
+  const msg = (channel: "telegram" | "discord", userId: string | number, chat: string, senderAllowListed: boolean, inPrivate = true): ChannelMessage => ({
+    id: "m", channel, from: "someone", text: "hello", timestamp: 0,
+    metadata: channel === "telegram"
+      ? { chatId: chat, userId, chatType: inPrivate ? "private" : "supergroup" }
+      : { channelId: chat, userId, isDM: inPrivate, guildId: inPrivate ? null : "g1" },
+    senderAllowListed,
+  });
+  type LiveConfig = { channels: { telegram: { allowed_users: number[] }; discord: { allowed_users: string[] } } };
+  const setup = async (lists: { telegram?: number[]; discord?: string[] }) => {
+    const config = allowListConfig(lists) as unknown as LiveConfig;
+    const agent = { handleThreadMessage: async () => "chat reply" };
+    const svc = new ChannelService(config as never, agent as never);
+    await svc.start();
+    const telegram = new FakeAdapter({ connected: true, name: "telegram" });
+    const discord = new FakeAdapter({ connected: true, name: "discord" });
+    svc.getManager().register(telegram);
+    svc.getManager().register(discord);
+    const handle = (m: ChannelMessage) =>
+      (svc as unknown as { handleChannelMessage(m: ChannelMessage): Promise<string> }).handleChannelMessage(m);
+    return { svc, config, telegram, discord, handle };
+  };
+
+  test("with an empty list, a stranger who messages gets a reply but no approval card, and nothing is saved", async () => {
+    initDatabase(":memory:");
+    const { svc, telegram, discord, handle } = await setup({});
+    expect(await handle(msg("telegram", 999, "999", false))).toBe("chat reply");
+    expect(await handle(msg("discord", STRANGER, "guild-channel", false))).toBe("chat reply");
+
+    await svc.broadcastToAll("approval card", { literal: true });
+
+    expect(telegram.sent).toEqual([]);
+    expect(discord.sent).toEqual([]);
+    expect(svc.getBroadcastRecipient("telegram")).toBeNull();
+    expect(svc.getBroadcastRecipient("discord")).toBeNull();
+    expect(getSetting("channel.lastRecipient.telegram")).toBeNull();
+    expect(getSetting("channel.lastRecipient.discord")).toBeNull();
+  });
+
+  test("a listed sender becomes the recipient, and an unlisted one after them does not take it over", async () => {
+    initDatabase(":memory:");
+    const { svc, discord, handle } = await setup({ discord: [OWNER] });
+    await handle(msg("discord", OWNER, "owner-dm", true));
+    await handle(msg("discord", STRANGER, "stranger-dm", false));
+
+    await svc.broadcastToAll("approval card");
+
+    expect(discord.sent).toEqual([{ to: "owner-dm", text: "approval card" }]);
+    expect(JSON.parse(getSetting("channel.lastRecipient.discord")!)).toEqual({ to: "owner-dm", userId: OWNER });
+  });
+
+  test("removing the recipient from the list stops their copies at once, with no restart", async () => {
+    initDatabase(":memory:");
+    const { svc, config, telegram, handle } = await setup({ telegram: [42] });
+    await handle(msg("telegram", 42, "42", true));
+    await svc.broadcastToAll("first");
+    expect(telegram.sent).toEqual([{ to: "42", text: "first" }]);
+
+    config.channels.telegram.allowed_users = [];
+    await svc.broadcastToAll("second");
+    expect(telegram.sent).toEqual([{ to: "42", text: "first" }]);
+    const routed = await svc.tryBroadcastToChannels(["telegram"], "third");
+    expect(routed.delivered).toEqual([]);
+    expect(routed.failed[0]?.error).toMatch(/no known recipient/);
+    expect(svc.getBroadcastRecipient("telegram")).toBeNull();
+  });
+
+  test("#852 review: a listed user writing in a group or server channel does not send the cards there", async () => {
+    initDatabase(":memory:");
+    const { svc, telegram, discord, handle } = await setup({ telegram: [42], discord: [OWNER] });
+    await handle(msg("telegram", 42, "42", true));
+    await handle(msg("discord", OWNER, "owner-dm", true));
+    // Then the same users write in a group and a guild channel.
+    expect(await handle(msg("telegram", 42, "-100123", true, false))).toBe("chat reply");
+    expect(await handle(msg("discord", OWNER, "guild-channel", true, false))).toBe("chat reply");
+
+    await svc.broadcastToAll("approval card");
+
+    expect(telegram.sent).toEqual([{ to: "42", text: "approval card" }]);
+    expect(discord.sent).toEqual([{ to: "owner-dm", text: "approval card" }]);
+  });
+
+  test("#852 review: with only group messages, there is no recipient at all", async () => {
+    initDatabase(":memory:");
+    const { svc, telegram, handle } = await setup({ telegram: [42] });
+    await handle(msg("telegram", 42, "-100123", true, false));
+    await svc.broadcastToAll("approval card");
+    expect(telegram.sent).toEqual([]);
+    expect(getSetting("channel.lastRecipient.telegram")).toBeNull();
+  });
+
+  test("isPrivateChat reads each channel's own marker, and anything unknown is not private", () => {
+    const m = (channel: string, metadata: Record<string, unknown>) => isPrivateChat({ channel, metadata });
+    expect(m("telegram", { chatType: "private" })).toBe(true);
+    for (const chatType of ["group", "supergroup", "channel", undefined]) expect(m("telegram", { chatType })).toBe(false);
+    expect(m("discord", { isDM: true })).toBe(true);
+    expect(m("discord", { isDM: false })).toBe(false);
+    expect(m("discord", {})).toBe(false);
+    expect(m("fake", { chatType: "private", isDM: true })).toBe(false);
+  });
+
+  test("a stranger saved by an older version is not restored on an empty-list channel", async () => {
+    initDatabase(":memory:");
+    // Bare chat ids are what the old code saved for whoever messaged last.
+    setSetting("channel.lastRecipient.telegram", "999");
+    setSetting("channel.lastRecipient.discord", "guild-channel");
+    const { svc, telegram, discord } = await setup({});
+
+    await svc.broadcastToAll("approval card");
+
+    expect(telegram.sent).toEqual([]);
+    expect(discord.sent).toEqual([]);
+  });
+
+  test("an older bare Telegram private-chat id is kept for that user while the list names them", async () => {
+    initDatabase(":memory:");
+    setSetting("channel.lastRecipient.telegram", "42");
+    // A Discord channel id names no user, so it cannot be checked and is dropped.
+    setSetting("channel.lastRecipient.discord", "owner-dm");
+    const { svc, telegram, discord } = await setup({ telegram: [42], discord: [OWNER] });
+
+    await svc.broadcastToAll("approval card");
+
+    expect(telegram.sent).toEqual([{ to: "42", text: "approval card" }]);
+    expect(discord.sent).toEqual([]);
+  });
+});
+
+describe("#852: parsePersistedRecipient", () => {
+  test("reads the current form, and keeps an older value only when it names its sender", () => {
+    expect(parsePersistedRecipient("discord", JSON.stringify({ to: "c", userId: "u" }))).toEqual({ to: "c", userId: "u" });
+    expect(parsePersistedRecipient("telegram", "42")).toEqual({ to: "42", userId: "42" });
+    // A group chat (negative id), a Discord channel, or junk names nobody.
+    expect(parsePersistedRecipient("telegram", "-100123")).toBeNull();
+    expect(parsePersistedRecipient("discord", "123456789")).toBeNull();
+    expect(parsePersistedRecipient("telegram", JSON.stringify({ to: "42" }))).toBeNull();
+    expect(parsePersistedRecipient("telegram", JSON.stringify({ to: "", userId: "42" }))).toBeNull();
+    expect(parsePersistedRecipient("telegram", "null")).toBeNull();
+  });
+});
+
+/**
+ * #860. Removing a user from a channel's allow-list must stop them deciding at
+ * once. A save already rebuilds the adapters (the `channels` settings applier
+ * stops and starts this service); these pin that, and the check that does not
+ * depend on the adapter being fresh.
+ */
+describe("#860: a user removed from the allow-list cannot decide", () => {
+  const approve = (userId: string | number, senderAllowListed: boolean): ChannelMessage => ({
+    id: "m", channel: "telegram", from: "someone", text: "approve 1a2b3c4d", timestamp: 0,
+    metadata: { chatId: String(userId), userId },
+    senderAllowListed,
+  });
+
+  test("the list as configured now decides, not the list the adapter was built with", async () => {
+    initDatabase(":memory:");
+    const config = allowListConfig({ telegram: [42] }) as unknown as { channels: { telegram: { allowed_users: number[] } } };
+    const decisions: unknown[][] = [];
+    const svc = new ChannelService(config as never, {} as never);
+    svc.setApprovalHandler(async (...args) => { decisions.push(args); return "decided"; });
+    const handle = (m: ChannelMessage) =>
+      (svc as unknown as { handleChannelMessage(m: ChannelMessage): Promise<string> }).handleChannelMessage(m);
+
+    expect(await handle(approve(42, true))).toBe("decided");
+    config.channels.telegram.allowed_users = [];
+    // An adapter still holding the old list says the sender is listed.
+    expect(await handle(approve(42, true))).toBe(channelDecisionNeedsAllowList("telegram"));
+    expect(decisions).toEqual([["approve", "1a2b3c4d", "telegram"]]);
+    // A sender the adapter saw as listed but the config does not name is
+    // never the recipient either.
+    expect(svc.getBroadcastRecipient("telegram")).toBeNull();
+  });
+
+  test("end to end through a real Telegram adapter: a save's stop and start applies the new list", async () => {
+    initDatabase(":memory:");
+    const config = {
+      channels: { telegram: { enabled: true, bot_token: "t", allowed_users: [42] as number[] } },
+    };
+    const queue: unknown[] = [];
+    const replies: string[] = [];
+    let nextUpdateId = 1;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      const body = (init?.body ? JSON.parse(String(init.body)) : {}) as { text?: string };
+      if (url.endsWith("/getMe")) return Response.json({ ok: true, result: { username: "bot" } });
+      if (url.endsWith("/sendMessage")) { replies.push(body.text ?? ""); return Response.json({ ok: true }); }
+      if (url.endsWith("/getUpdates")) {
+        await Bun.sleep(5);
+        return Response.json({ ok: true, result: queue.splice(0) });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    }) as typeof fetch;
+    const send = (fromId: number) => queue.push({
+      update_id: nextUpdateId++,
+      message: { message_id: nextUpdateId, from: { id: fromId, first_name: "A" }, chat: { id: fromId, type: "private" }, date: 0, text: "approve 1a2b3c4d" },
+    });
+    const until = async (cond: () => boolean) => {
+      for (let i = 0; i < 400 && !cond(); i++) await Bun.sleep(10);
+      expect(cond()).toBe(true);
+    };
+    const decisions: unknown[][] = [];
+    const svc = new ChannelService(config as never, {} as never);
+    svc.setApprovalHandler(async (...args) => { decisions.push(args); return "decided"; });
+    try {
+      await svc.start();
+      send(42);
+      await until(() => replies.length === 1);
+      expect(replies).toEqual(["decided"]);
+
+      // What POST /api/config/channels does: replace the section on the live
+      // config, then the `channels` applier stops and starts the service.
+      //
+      // 42 is REMOVED and 7 is left, rather than emptying the list. This test
+      // used to EMPTY it and then assert 42 got the "not on the allow-list"
+      // refusal. That scenario no longer exists, for two reasons that compound:
+      //
+      //   - #908 forbids an enabled channel with an empty list, so it is not
+      //     started at all -- at the default authority level an unlisted
+      //     sender's turn gets run_command with no approval.
+      //   - With a NON-empty list, telegram.ts:369 drops a non-listed sender
+      //     before the decision path is reached at all.
+      //
+      // So "can chat but cannot decide" only ever existed in the empty-list
+      // state. Removing 42 while keeping 7 gives the stronger guarantee that
+      // #860 was reaching for: 42 is not refused, it is not heard. Both
+      // directions are asserted, so this cannot pass by everything being
+      // broken.
+      config.channels = { telegram: { ...config.channels.telegram, allowed_users: [7] } };
+      await svc.stop();
+      await svc.start();
+      // Let the old adapter's last poll finish, so the update below can only
+      // reach the new one.
+      await Bun.sleep(50);
+
+      // The removed user is dropped: no reply, no decision.
+      send(42);
+      await Bun.sleep(150);
+      expect(replies).toEqual(["decided"]);
+      expect(decisions).toEqual([["approve", "1a2b3c4d", "telegram"]]);
+
+      // The control, proving the restart applied the new list rather than
+      // breaking the channel: the user it now names IS heard.
+      send(7);
+      await until(() => replies.length === 2);
+      expect(replies[1]).toBe("decided");
+      expect(decisions).toEqual([
+        ["approve", "1a2b3c4d", "telegram"],
+        ["approve", "1a2b3c4d", "telegram"],
+      ]);
+    } finally {
+      await svc.stop();
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+/**
+ * #860 review. A workflow notify step fixes its recipient before approval and
+ * sends after it, possibly hours later; removing that user from the list in
+ * between must stop it.
+ */
+describe("#860 review: a workflow notification checks its recipient again when it sends", () => {
+  const setupWorkflow = async () => {
+    initDatabase(":memory:");
+    const config = allowListConfig({ telegram: [42] }) as unknown as { channels: { telegram: { allowed_users: number[] } } };
+    const svc = new ChannelService(config as never, { handleThreadMessage: async () => "ok" } as never);
+    await svc.start();
+    const telegram = new FakeAdapter({ connected: true, name: "telegram" });
+    svc.getManager().register(telegram);
+    await (svc as unknown as { handleChannelMessage(m: ChannelMessage): Promise<string> }).handleChannelMessage({
+      id: "m", channel: "telegram", from: "owner", text: "hi", timestamp: 0,
+      metadata: { chatId: "42", userId: 42, chatType: "private" }, senderAllowListed: true,
+    });
+    return { svc, config, telegram };
+  };
+
+  test("it sends while the recipient resolved before approval is still the allow-listed one", async () => {
+    const { svc, telegram } = await setupWorkflow();
+    const approved = svc.getBroadcastRecipient("telegram");
+    expect(approved).toBe("42");
+    await svc.sendWorkflowNotification("telegram", approved, "workflow done");
+    expect(telegram.sent).toEqual([{ to: "42", text: "workflow done" }]);
+  });
+
+  test("it refuses once that user is removed from the list, though the step was approved earlier", async () => {
+    const { svc, config, telegram } = await setupWorkflow();
+    const approved = svc.getBroadcastRecipient("telegram");
+    config.channels.telegram.allowed_users = [];
+    await expect(svc.sendWorkflowNotification("telegram", approved, "workflow done"))
+      .rejects.toThrow("no longer an allow-listed recipient");
+    expect(telegram.sent).toEqual([]);
+  });
+
+  test("it refuses a recipient that is not this channel's recipient at all", async () => {
+    const { svc, telegram } = await setupWorkflow();
+    await expect(svc.sendWorkflowNotification("telegram", "999", "workflow done"))
+      .rejects.toThrow("no longer an allow-listed recipient");
+    expect(telegram.sent).toEqual([]);
+  });
+});
+
+/**
+ * #883. The live-list check compared `String(id) === String(userId)`, so a
+ * quoted Telegram id or an unquoted Discord one named a user here that the
+ * adapter turned away, and a recipient could be kept for someone who could not
+ * even message the bot. One parser now gives both the same answer.
+ */
+describe("#883: the live allow-list check reads the list the way the adapters do", () => {
+  const approve = (channel: "telegram" | "discord", userId: string | number): ChannelMessage => ({
+    id: "m", channel, from: "someone", text: "approve 1a2b3c4d", timestamp: 0,
+    metadata: channel === "telegram" ? { chatId: String(userId), userId, chatType: "private" } : { channelId: "dm", userId, isDM: true },
+    senderAllowListed: true,
+  });
+
+  test("an entry that is not a valid id for the channel names nobody", async () => {
+    initDatabase(":memory:");
+    const config = { channels: {
+      telegram: { enabled: false, bot_token: "", allowed_users: ["42"] },
+      discord: { enabled: false, bot_token: "", allowed_users: [123456789012345678] },
+    } };
+    const decisions: unknown[][] = [];
+    const svc = new ChannelService(config as never, {} as never);
+    svc.setApprovalHandler(async (...args) => { decisions.push(args); return "decided"; });
+    const handle = (m: ChannelMessage) =>
+      (svc as unknown as { handleChannelMessage(m: ChannelMessage): Promise<string> }).handleChannelMessage(m);
+
+    expect(await handle(approve("telegram", 42))).toBe(channelDecisionNeedsAllowList("telegram"));
+    expect(await handle(approve("discord", "123456789012345680"))).toBe(channelDecisionNeedsAllowList("discord"));
+    expect(decisions).toEqual([]);
+    expect(svc.getBroadcastRecipient("telegram")).toBeNull();
+    expect(svc.getBroadcastRecipient("discord")).toBeNull();
+  });
+
+  test("start() says which entries name nobody, and that a list of only those locks the channel", async () => {
+    initDatabase(":memory:");
+    const originalFetch = globalThis.fetch;
+    const originalWarn = console.warn;
+    const warnings: string[] = [];
+    globalThis.fetch = (async (url: string) => {
+      if (url.endsWith("/getMe")) return Response.json({ ok: true, result: { username: "bot" } });
+      await Bun.sleep(5);
+      return Response.json({ ok: true, result: [] });
+    }) as typeof fetch;
+    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+    const svc = new ChannelService({ channels: { telegram: { enabled: true, bot_token: "t", allowed_users: "12345" } } } as never, {} as never);
+    try {
+      await svc.start();
+      expect(warnings).toEqual([
+        '[ChannelService] telegram allowed_users: allowed_users must be a list of IDs, but it is "12345". Nobody may use the channel until it is fixed.',
+        "[ChannelService] telegram allowed_users names nobody, so nobody can message the bot. Fix it in Settings > Channels.",
+      ]);
+    } finally {
+      await svc.stop();
+      console.warn = originalWarn;
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+/**
+ * #890. Since #852 broadcasts go only to a listed user's private chat, so after
+ * a revocation, or before any listed user has messaged, there is no recipient
+ * and broadcasts were skipped with only a log line.
+ */
+describe("#890: whether each channel has anywhere to send approval requests", () => {
+  const dm = (userId: string | number, senderAllowListed: boolean): ChannelMessage => ({
+    id: "m", channel: "telegram", from: "someone", text: "hello", timestamp: 0,
+    metadata: { chatId: String(userId), userId, chatType: "private" },
+    senderAllowListed,
+  });
+
+  test("empty list, listed but silent, recipient, revoked, and a disconnected channel left out", async () => {
+    initDatabase(":memory:");
+    const config = allowListConfig({}) as unknown as { channels: { telegram: { allowed_users: number[] } } };
+    const svc = new ChannelService(config as never, { handleThreadMessage: async () => "ok" } as never);
+    svc.getManager().register(new FakeAdapter({ connected: true, name: "telegram" }));
+    svc.getManager().register(new FakeAdapter({ connected: false, name: "discord" }));
+    const handle = (m: ChannelMessage) =>
+      (svc as unknown as { handleChannelMessage(m: ChannelMessage): Promise<string> }).handleChannelMessage(m);
+
+    expect(svc.getRecipientStatus()).toEqual({ telegram: { hasRecipient: false, reason: "empty_list" } });
+
+    config.channels.telegram.allowed_users = [42];
+    expect(svc.getRecipientStatus()).toEqual({ telegram: { hasRecipient: false, reason: "no_direct_message" } });
+
+    await handle(dm(42, true));
+    expect(svc.getRecipientStatus()).toEqual({ telegram: { hasRecipient: true } });
+
+    // Revoked: 42 is replaced by 7, who has not messaged.
+    config.channels.telegram.allowed_users = [7];
+    expect(svc.getRecipientStatus()).toEqual({ telegram: { hasRecipient: false, reason: "no_direct_message" } });
+    config.channels.telegram.allowed_users = [];
+    expect(svc.getRecipientStatus()).toEqual({ telegram: { hasRecipient: false, reason: "empty_list" } });
+    // A list of only invalid entries names nobody either (#883).
+    (config.channels.telegram as { allowed_users: unknown }).allowed_users = ["abc"];
+    expect(svc.getRecipientStatus()).toEqual({ telegram: { hasRecipient: false, reason: "empty_list" } });
+  });
+
+  test("recipientWarning names each channel without one, and says nothing when all have one", () => {
+    expect(recipientWarning({ telegram: { hasRecipient: true } })).toBeNull();
+    expect(recipientWarning({})).toBeNull();
+    expect(recipientWarning({
+      telegram: { hasRecipient: false, reason: "empty_list" },
+      discord: { hasRecipient: false, reason: "no_direct_message" },
+    })).toBe("Telegram will not receive approval requests or notifications: no user ID is listed for it. Discord will not receive approval requests or notifications until a listed user sends the bot a direct message (again, if they did before).");
   });
 });

@@ -8,6 +8,8 @@
 import type { ServerWebSocket } from 'bun';
 import type { RPCRequest, SidecarEvent } from './protocol.ts';
 import type { EventScheduler } from './scheduler.ts';
+import type { BinarySpool } from './binary-spool.ts';
+import { SPOOL_THRESHOLD_BYTES } from './binary-spool.ts';
 import { validateEvent, validateBinaryFrame, MAX_JSON_SIZE } from './validator.ts';
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -29,17 +31,25 @@ export class SidecarConnection {
   private missedPongs = 0;
   private alive = true;
   private onDisconnect: () => void;
+  private binarySpool: BinarySpool | null;
 
   constructor(
     sidecarId: string,
     ws: ServerWebSocket<unknown>,
     scheduler: EventScheduler,
     onDisconnect: () => void,
+    binarySpool?: BinarySpool,
   ) {
     this.sidecarId = sidecarId;
     this.ws = ws;
     this.scheduler = scheduler;
     this.onDisconnect = onDisconnect;
+    this.binarySpool = binarySpool ?? null;
+  }
+
+  /** Whether ws is this connection's socket (a newer one may have replaced it). */
+  ownsSocket(ws: ServerWebSocket<unknown>): boolean {
+    return this.ws === ws;
   }
 
   /** Send an RPC request to the sidecar */
@@ -88,7 +98,14 @@ export class SidecarConnection {
         // consume event.binary.data; rpc_result consumers read the descriptor set
         // on the inner result by SidecarManager), and a base64 + Buffer pair held
         // both at once doubled the resident size of every ref binary (up to 50 MB).
-        event.binary = {
+        // Large payloads go to disk: base64 of a 50MB capture is ~66MB of
+        // heap, and it would sit on the queued event until the scheduler
+        // drains. The spooled descriptor keeps the same shape — `data` reads
+        // the file back on access.
+        const spooled = binaryPayload.length > SPOOL_THRESHOLD_BYTES
+          ? this.binarySpool?.spool(binaryPayload, mimeType)
+          : null;
+        event.binary = spooled ?? {
           type: 'inline',
           mime_type: mimeType,
           data: binaryPayload.toString('base64'),
@@ -160,8 +177,12 @@ export class SidecarConnection {
     }
   }
 
-  /** Close connection and clean up */
-  close(): void {
+  /**
+   * Close connection and clean up. Pass a WS close code + reason for a graceful
+   * "going away" (1001) on drain, so the sidecar sees a clean planned-restart
+   * signal rather than an ambiguous drop (it reconnects either way).
+   */
+  close(code?: number, reason?: string): void {
     this.stopHeartbeat();
 
     // Reject all pending binary waits
@@ -172,7 +193,8 @@ export class SidecarConnection {
     this.pendingBinary.clear();
 
     try {
-      this.ws.close();
+      if (code !== undefined) this.ws.close(code, reason);
+      else this.ws.close();
     } catch {
       // Already closed
     }

@@ -264,6 +264,53 @@
 
 .v2-ws__card-port { color: var(--ok); }
 
+/* #523: the "Git off" chip on a card; its reason is the tooltip. */
+.v2-ws__git-issue {
+  display: inline-flex;
+  align-items: center;
+  cursor: help;
+}
+
+/* #523: the same, in full, under the project header. */
+.v2-ws__git-issue-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--s-2);
+  padding: var(--s-3) var(--s-6);
+  border-bottom: var(--hair-soft);
+  background: color-mix(in srgb, var(--listen) 6%, var(--paper-2));
+  flex-shrink: 0;
+}
+
+.v2-ws__git-issue-text {
+  margin: 0;
+  max-width: 72ch;
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+
+.v2-ws__git-issue-fix {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--s-2);
+  max-width: 100%;
+}
+
+.v2-ws__git-issue-cmd {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.v2-ws__git-issue-copy {
+  min-height: 32px;
+  padding: 0 var(--s-3);
+}
+
 .v2-ws__dirty {
   color: var(--warn);
   font-size: 14px;
@@ -415,14 +462,6 @@
      dark-theme tokens with hardcoded inline styles. Remapping the
      variables in this scope re-skins them onto the v2 bone palette
      without editing a single legacy component. */
-  --j-bg: var(--paper);
-  --j-surface: var(--paper-2);
-  --j-border: var(--rule);
-  --j-text: var(--ink);
-  --j-text-dim: var(--ink-2);
-  --j-text-muted: var(--ink-3);
-  --j-accent: var(--ink);
-  --j-success: var(--ok);
   --j-warning: var(--warn);
   --j-error: var(--accent);
 }
@@ -529,3 +568,13 @@
 }
 
 .v2-ws--inline .v2-ws__card { padding: var(--s-2) var(--s-3); }
+
+/* ════════════ Brand Book III / Monochrome Lab ════════════
+   The roster already re-palettes via Phase 0 aliases; fix the asymmetric
+   drop corner + Familjen (not Fraunces) on the room's native surfaces. */
+.v2-ws__stat, .v2-ws__card { border-radius: var(--corner); }
+.v2-ws__card-icon { border-radius: var(--corner-sm); }
+.v2-ws__stat-value, .v2-ws__project-name, .v2-ws__card-name { font-family: var(--sans); font-weight: 700; letter-spacing: -0.015em; }
+/* running port reads green (workspaces §01) */
+.v2-ws__port { color: var(--ok-tx); font-family: var(--mono); }
+.v2-ws__dirty { color: var(--hold-tx); }

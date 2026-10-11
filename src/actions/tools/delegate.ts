@@ -97,13 +97,26 @@ export function createDelegateTool(deps: DelegateToolDeps): ToolDefinition {
 
       try {
         // Run the sub-agent (sync — blocks until complete)
+        // The sub-agent runs under the parent's authority engine and the
+        // parent's effective profile (static restrictions plus the taint of
+        // the turn that delegated), so delegation is not a way around the
+        // gate: governed actions are denied outright in a sub-agent.
         const result = await runSubAgent({
           agent: subAgent,
           task,
           context,
           llmManager: deps.llmManager,
           toolRegistry: scopedRegistry,
+          // Provider kinds for the relevance filter's eligibility gate, so a
+          // sub-agent classifies its model the way the parent loop does.
+          toolFilterProviders: deps.orchestrator.getToolFilterProviders?.(),
           onProgress: deps.onProgress,
+          authorityEngine: deps.orchestrator.getAuthorityEngine() ?? undefined,
+          auditTrail: deps.orchestrator.getAuditTrail() ?? undefined,
+          emergencyController: deps.orchestrator.getEmergencyController() ?? undefined,
+          temporaryGrants: deps.orchestrator.getTemporaryGrants(),
+          profile: deps.orchestrator.getEffectiveProfile(),
+          taintGating: deps.orchestrator.getTaintGating(),
         });
 
         // Terminate sub-agent after completion

@@ -8,11 +8,21 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { closeWorkflowDb, initWorkflowDb } from "../../db";
 import { CredentialResolver } from "../../credentials/adapter";
 import { SandboxApi } from "../../sandbox-api/server";
+import { workflowLogsBase } from "../../sandbox-api/config";
+import { DEFAULT_IDS } from "../../db/schema";
+import { createFlow } from "../../db/repos/flow";
+import {
+  createDraftVersion,
+  getFlowVersion,
+  lockVersion,
+  updateDraftVersion,
+} from "../../db/repos/flow-version";
+import { createFlowRun } from "../../db/repos/flow-run";
 import {
   ENGINE_BUILD_PATHS,
   buildEngineBundle,
@@ -48,7 +58,7 @@ describe("EngineRuntime pool", () => {
     if (buildOptIn) await buildAllJarvisPieces();
     runtime = new EngineRuntime({
       api,
-      bundlePath: cached.bundlePath,
+      bundlePath: cached.bundlePath, expectedDigest: cached.digest,
       pool: true,
     });
   });
@@ -68,7 +78,7 @@ describe("EngineRuntime pool", () => {
       if (!cached) cached = await buildEngineBundle();
       const ttlRuntime = new EngineRuntime({
         api,
-        bundlePath: cached.bundlePath,
+        bundlePath: cached.bundlePath, expectedDigest: cached.digest,
         pool: true,
         // 300ms TTL: long enough that a slow CI doesn't accidentally
         // expire the engine before the "still alive" assertion below
@@ -109,7 +119,7 @@ describe("EngineRuntime pool", () => {
       if (!cached) cached = await buildEngineBundle();
       const ttlRuntime = new EngineRuntime({
         api,
-        bundlePath: cached.bundlePath,
+        bundlePath: cached.bundlePath, expectedDigest: cached.digest,
         pool: true,
         poolIdleTtlMs: 300,
       });
@@ -151,25 +161,92 @@ describe("EngineRuntime pool", () => {
       const pid1 = h1.pid;
       await h1.release();
 
-      const h2 = await runtime!.acquire({
-        runId: "run_pool_2",
-        projectId: "jrv_proj_default",
-      });
-      // Same engine: same sandboxId, same pid.
-      expect(h2.sandboxId).toBe(sandbox1);
-      expect(h2.pid).toBe(pid1);
-      // But rebound to the new run.
-      expect(h2.runId).toBe("run_pool_2");
-      // Registry agrees.
-      expect(api.registry.byRunId("run_pool_2")?.sandboxId).toBe(sandbox1);
-      expect(api.registry.byRunId("run_pool_1")).toBeNull();
-      await h2.release();
-
-      // shutdown() reaps the warm engine.
-      await runtime!.shutdown();
+      // An assertion throwing between acquire and release used to abandon a
+      // live engine that nothing would ever reclaim -- shutdown() only knew
+      // about the PARKED one. Both halves are covered now, but the finally
+      // still belongs here: a leaked engine should not depend on the guard.
+      try {
+        const h2 = await runtime!.acquire({
+          runId: "run_pool_2",
+          projectId: "jrv_proj_default",
+        });
+        try {
+          // Same engine: same sandboxId, same pid.
+          expect(h2.sandboxId).toBe(sandbox1);
+          expect(h2.pid).toBe(pid1);
+          // But rebound to the new run.
+          expect(h2.runId).toBe("run_pool_2");
+          // Registry agrees.
+          expect(api.registry.byRunId("run_pool_2")?.sandboxId).toBe(sandbox1);
+          expect(api.registry.byRunId("run_pool_1")).toBeNull();
+        } finally {
+          await h2.release();
+        }
+      } finally {
+        // shutdown() reaps the warm engine.
+        await runtime!.shutdown();
+      }
       // After shutdown the registry record is terminated.
       expect(api.registry.get(sandbox1)).toBeNull();
     },
     60_000,
+  );
+
+  // The engine PUTs its zstd run-log backup to a URL with the engineToken
+  // baked into the query string, built at EXECUTE_FLOW time. Now that the
+  // sandbox API refuses a token the sandbox is no longer running under, that
+  // URL has to be rebuilt on every acquire or the second and every later run
+  // through a warm engine would silently lose its run log to a 401. Two real
+  // flows through one pooled process, both backups on disk.
+  test.skipIf(skipBundleTests)(
+    "a run through the rebound warm engine still uploads its run log",
+    async () => {
+      // Its own pooled runtime: the shared one is shut down by the test
+      // above, and this test needs a live warm slot across two acquires.
+      let cached = findCachedBundle();
+      if (!cached) cached = await buildEngineBundle();
+      const pooled = new EngineRuntime({ api, bundlePath: cached.bundlePath, expectedDigest: cached.digest, pool: true });
+      const trigger = { name: "trigger", type: "EMPTY" as const, settings: {} };
+      const runIds: string[] = [];
+      let sandbox: string | null = null;
+      try {
+        for (const label of ["warm-logs-1", "warm-logs-2"]) {
+          const flow = createFlow({ projectId: DEFAULT_IDS.project });
+          const v = createDraftVersion({ flowId: flow.id, displayName: label, trigger });
+          updateDraftVersion(v.id, { trigger, valid: true });
+          lockVersion(v.id);
+          const run = createFlowRun({
+            flowId: flow.id,
+            flowVersionId: v.id,
+            environment: "TESTING",
+          });
+          runIds.push(run.id);
+          const handle = await pooled.acquire({
+            runId: run.id,
+            projectId: DEFAULT_IDS.project,
+          });
+          // Same warm process across both runs -- otherwise this test is not
+          // exercising the rebind at all.
+          if (sandbox === null) sandbox = handle.sandboxId;
+          else expect(handle.sandboxId).toBe(sandbox);
+          try {
+            await handle.executeFlow({ flowVersion: getFlowVersion(v.id)! });
+          } finally {
+            await handle.release();
+          }
+        }
+        for (const runId of runIds) {
+          const backup = resolve(workflowLogsBase(), `${runId}.bin`);
+          expect(existsSync(backup)).toBe(true);
+          expect(readFileSync(backup).byteLength).toBeGreaterThan(0);
+        }
+      } finally {
+        await pooled.shutdown();
+        for (const runId of runIds) {
+          rmSync(resolve(workflowLogsBase(), `${runId}.bin`), { force: true });
+        }
+      }
+    },
+    120_000,
   );
 });

@@ -14,6 +14,11 @@ package main
 // The implementation lives in pebble_overlay_<os>.go behind build tags. This
 // file is the cross-platform interface + state types only.
 
+import (
+	"sync/atomic"
+	"time"
+)
+
 // PebbleState mirrors the React state machine used in the design mock.
 type PebbleState string
 
@@ -23,6 +28,9 @@ const (
 	PebbleThinking  PebbleState = "thinking"
 	PebbleSpeaking  PebbleState = "speaking"
 	PebbleWorking   PebbleState = "working"
+	PebbleAsking    PebbleState = "asking" // amber — waiting on your approval/authority
+	PebbleDone      PebbleState = "done"   // green flash — job landed
+	PebbleMuted     PebbleState = "muted"  // mic muted — quiet, no chroma
 )
 
 // PebbleSpec configures the overlay at spawn time.
@@ -34,12 +42,26 @@ type PebbleSpec struct {
 	CursorOffsetY int `json:"cursor_offset_y"`
 
 	// SummonHotkey, if non-empty, registers a global hotkey that toggles
-	// listening/idle and shows/hides the bubble. Default "ctrl+space".
+	// listening/idle and shows/hides the bubble.
+	//
+	// There is NO default here: the sidecar registers exactly what it is given
+	// and empty means "no global hotkey". The default lives on the daemon side
+	// (PEBBLE_DEFAULT_SUMMON_HOTKEY in src/config/pebble-hotkeys.ts, overridable
+	// via `pebble.summon_hotkey` in config.yaml), because that is where the
+	// user's config is read. Naming a default in this comment was wrong even
+	// before #563 moved it.
+	//
+	// Parsed by startHotkeyListener via the shared grammar in
+	// hotkeys_keyspec.go; see docs/PEBBLE_HOTKEYS.md.
 	SummonHotkey string `json:"summon_hotkey"`
 
 	// PaletteHotkey, if non-empty, registers a second global hotkey that
-	// fires the OnPalette callback. Used by the Cmd+K / Ctrl+K palette to
-	// open a fuzzy room picker at the cursor. Default "ctrl+k".
+	// fires the OnPalette callback, opening a fuzzy room picker at the cursor.
+	// Same "no default here" rule as SummonHotkey.
+	//
+	// NOTE: on Windows this value also gates the Ctrl+middle-click palette
+	// gesture (pebble_overlay_windows.go), so empty turns off the mouse hook
+	// too. Deliberate, and documented in docs/PEBBLE_HOTKEYS.md.
 	PaletteHotkey string `json:"palette_hotkey"`
 }
 
@@ -94,7 +116,7 @@ type PebbleService interface {
 	Close() error
 
 	// OnSummon registers a callback fired each time the user triggers the
-	// summon hotkey (Ctrl+Space). The callback runs on whatever goroutine
+	// summon hotkey. The callback runs on whatever goroutine
 	// the hotkey listener uses; receivers should not block.
 	//
 	// The pebble itself does NOT change state on summon — it leaves that
@@ -105,7 +127,7 @@ type PebbleService interface {
 	OnSummon(callback func())
 
 	// OnPalette registers a callback fired when the user triggers the
-	// palette hotkey (Ctrl+K). Same threading and non-blocking contract as
+	// palette hotkey. Same threading and non-blocking contract as
 	// OnSummon. The callback drives the daemon's palette open/close flow.
 	OnPalette(callback func())
 
@@ -119,6 +141,51 @@ type PebbleService interface {
 	// the answer id that SetAnswerOverflow was called with. Threading:
 	// runs on a fresh goroutine.
 	OnAnswerOpen(callback func(answerID string))
+}
+
+// mutedNudgeGen serializes claims on the bubble text: a nudge only clears the
+// text it wrote, and any later writer (another nudge, or the brain via
+// pebble.set_state) takes ownership by bumping the counter.
+var mutedNudgeGen atomic.Int64
+
+// mutedNudgeDur is how long the "muted" explanation stays in the bubble before
+// the state's default copy comes back. A var so tests can shrink it.
+var mutedNudgeDur = 2500 * time.Millisecond
+
+// flashMutedPebble is the visible consequence of a mic request turned away by
+// mute. Re-asserting the muted state alone is invisible when the pebble is
+// already showing it, so the bubble carries the reason for a moment — a
+// silently ignored hotkey is indistinguishable from a broken one.
+// invalidateMutedNudge takes the bubble text away from any pending muted nudge.
+// Callers that set bubble text through some other route must call it, or a
+// nudge armed moments earlier will blank their text when it expires.
+func invalidateMutedNudge() { mutedNudgeGen.Add(1) }
+
+func flashMutedPebble(p PebbleService) {
+	flashPebbleNudge(p, PebbleMuted, "Microphone muted — unmute from the tray menu")
+}
+
+// flashPebbleNudge is the general form: assert `state` and hold `text` in the
+// bubble for mutedNudgeDur, then hand the bubble back to the state's default
+// copy. Used for every "your key press went nowhere, and here is why" moment:
+// mute, and a live-voice session the server would not open. Silence there is
+// indistinguishable from a broken hotkey, which is precisely how a refused
+// realtime dial used to read.
+func flashPebbleNudge(p PebbleService, state PebbleState, text string) {
+	if p == nil {
+		return
+	}
+	gen := mutedNudgeGen.Add(1)
+	_ = p.SetText(text)
+	_ = p.SetState(state)
+	go func() {
+		time.Sleep(mutedNudgeDur)
+		// Only the most recent claim clears the text; if anything else has
+		// written to the bubble since (invalidateMutedNudge), it owns it now.
+		if mutedNudgeGen.Load() == gen {
+			_ = p.SetText("") // back to the per-state default copy
+		}
+	}()
 }
 
 // NewPebbleService returns the platform-specific implementation. Defined in

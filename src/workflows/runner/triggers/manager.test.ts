@@ -1,3 +1,13 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { setEncryptionKey } from '../../db/encryption';
+import { listRuns } from '../../db/repos/flow-run';
+import { upsertConnection, deleteConnection } from '../../db/repos/app-connection';
+import { getFlow } from '../../db/repos/flow';
+import { configureWorkflowReadiness } from '../../db/repos/flow-readiness';
+import { PieceCatalog } from '../../runtime/piece-catalog';
+import { getWorkflowDb } from '../../db';
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { closeWorkflowDb, initWorkflowDb } from "../../db/index";
 import {
@@ -14,6 +24,10 @@ const silent = () => undefined;
 
 beforeEach(() => {
   initWorkflowDb(":memory:");
+  configureWorkflowReadiness({ pieces: new PieceCatalog([
+    { name: 'jarvis-trigger', displayName: '', description: '', actions: {}, triggers: { on_event: { name: 'on_event', displayName: '', description: '', inputSchema: { fields: [{ name: 'eventType', label: '', type: 'string', required: true }] } } } },
+    { name: 'vendored-webhook', displayName: '', description: '', actions: {}, triggers: { on_message: { name: 'on_message', displayName: '', description: '' } } },
+  ]) });
 });
 
 afterEach(() => {
@@ -28,6 +42,14 @@ function publishFlowWithTrigger(displayName: string, trigger: Record<string, unk
   setPublishedVersion(flow.id, v.id);
   updateFlowStatus(flow.id, "ENABLED");
   return { flowId: flow.id, versionId: v.id };
+}
+
+// Simulate an old database containing invalid enabled graphs. New publication
+// is deliberately forbidden; startup must decline their subscriptions safely.
+function seedLegacyFlow(displayName: string, trigger: Record<string, unknown>) {
+  const flow = createFlow();
+  const version = createDraftVersion({ flowId: flow.id, displayName, trigger });
+  getWorkflowDb().run("UPDATE flow SET status = 'ENABLED', published_version_id = ? WHERE id = ?", [version.id, flow.id]);
 }
 
 describe("TriggerManager: lifecycle", () => {
@@ -137,7 +159,7 @@ describe("TriggerManager: jarvis-trigger on_event", () => {
   });
 
   test("malformed eventType is logged and skipped (no throw, no sub)", async () => {
-    publishFlowWithTrigger("bad event", {
+    seedLegacyFlow("bad event", {
       name: "trigger",
       type: "PIECE_TRIGGER",
       settings: { pieceName: "jarvis-trigger", triggerName: "on_event", input: {} },
@@ -151,7 +173,7 @@ describe("TriggerManager: jarvis-trigger on_event", () => {
   });
 
   test("non-on_event triggerName is skipped", async () => {
-    publishFlowWithTrigger("wrong name", {
+    seedLegacyFlow("wrong name", {
       name: "trigger",
       type: "PIECE_TRIGGER",
       settings: { pieceName: "jarvis-trigger", triggerName: "polling", input: {} },
@@ -318,7 +340,7 @@ describe("TriggerManager: schedule", () => {
   });
 
   test("missing cron expression is logged and skipped", async () => {
-    publishFlowWithTrigger("no cron", {
+    seedLegacyFlow("no cron", {
       name: "trigger",
       type: "PIECE_TRIGGER",
       settings: { pieceName: "schedule", input: {} },
@@ -332,7 +354,7 @@ describe("TriggerManager: schedule", () => {
   });
 
   test("invalid cron expression is logged but does not destabilize start()", async () => {
-    publishFlowWithTrigger("bad cron", {
+    seedLegacyFlow("bad cron", {
       name: "trigger",
       type: "PIECE_TRIGGER",
       settings: { pieceName: "schedule", input: { cron_expression: "not a cron" } },
@@ -355,7 +377,7 @@ describe("TriggerManager: schedule", () => {
 
 describe("TriggerManager: unknown trigger kinds", () => {
   test("PIECE_TRIGGER with unknown pieceName is skipped", async () => {
-    publishFlowWithTrigger("unknown piece", {
+    seedLegacyFlow("unknown piece", {
       name: "trigger",
       type: "PIECE_TRIGGER",
       settings: { pieceName: "gmail", triggerName: "new_email", input: {} },
@@ -369,7 +391,7 @@ describe("TriggerManager: unknown trigger kinds", () => {
   });
 
   test("unknown trigger.type is skipped", async () => {
-    publishFlowWithTrigger("alien type", {
+    seedLegacyFlow("alien type", {
       name: "trigger",
       type: "ALIEN",
       settings: {},
@@ -783,10 +805,236 @@ describe("TriggerManager: engine-managed triggers (Phase J)", () => {
       engineRuntime: fakeEngine,
       cronScheduler: new FakeCronScheduler() as unknown as import("./cron").CronScheduler,
       log: (line) => logs.push(line),
+      // No retries: this test asserts the immediate failure handling.
+      enableRetryDelaysMs: [],
     });
 
     await tm.start();
     expect(tm.list()).toEqual([]);
     expect(logs.some((l) => l.includes("engine ON_ENABLE failed"))).toBe(true);
+    await tm.stop();
   });
+
+  test("a transient ON_ENABLE failure is retried on the backoff and the flow ends up registered", async () => {
+    const { flowId } = publishFlowWithTrigger("engine-flaky", {
+      name: "trigger",
+      type: "PIECE_TRIGGER",
+      settings: {
+        pieceName: "jarvis-trigger",
+        triggerName: "on_event",
+        input: { eventType: "observer.clipboard_changed" },
+      },
+    });
+
+    // Fails the first acquire (host too loaded to hand back an engine), then
+    // recovers -- exactly the shape of the engine-handshake timeout.
+    let acquires = 0;
+    const fakeEngine = {
+      acquire: async () => {
+        acquires++;
+        if (acquires === 1) {
+          throw new Error("EngineRuntime.acquire failed: engine abc did not connect within 30000ms");
+        }
+        return {
+          async executeTriggerHook() {
+            return { scheduleOptions: { cronExpression: "* * * * *" } };
+          },
+          async release() {},
+        };
+      },
+    } as unknown as import("../engine-runtime/engine-runtime").EngineRuntime;
+
+    const cron = new FakeCronScheduler();
+    const logs: string[] = [];
+    const tm = new TriggerManager({
+      eventBus: new WorkflowEventBus(),
+      engineRuntime: fakeEngine,
+      cronScheduler: cron as unknown as import("./cron").CronScheduler,
+      log: (line) => logs.push(line),
+      enableRetryDelaysMs: [10, 20],
+    });
+
+    await tm.start();
+    // First attempt failed: nothing registered yet, but a retry is armed.
+    expect(tm.list()).toEqual([]);
+    expect(logs.some((l) => l.includes("retrying in"))).toBe(true);
+
+    await settle(120);
+    expect(acquires).toBe(2);
+    expect(tm.list()).toEqual([{ flowId, kind: "engine" }]);
+    expect(cron.has(`flow:${flowId}`)).toBe(true);
+    await tm.stop();
+  });
+
+  test("retries stop once the schedule is exhausted, and a disabled flow cancels its pending retry", async () => {
+    const { flowId } = publishFlowWithTrigger("engine-dead", {
+      name: "trigger",
+      type: "PIECE_TRIGGER",
+      settings: {
+        pieceName: "jarvis-trigger",
+        triggerName: "on_event",
+        input: { eventType: "observer.clipboard_changed" },
+      },
+    });
+
+    let acquires = 0;
+    const fakeEngine = {
+      acquire: async () => {
+        acquires++;
+        throw new Error("engine down");
+      },
+    } as unknown as import("../engine-runtime/engine-runtime").EngineRuntime;
+
+    const logs: string[] = [];
+    const tm = new TriggerManager({
+      eventBus: new WorkflowEventBus(),
+      engineRuntime: fakeEngine,
+      cronScheduler: new FakeCronScheduler() as unknown as import("./cron").CronScheduler,
+      log: (line) => logs.push(line),
+      enableRetryDelaysMs: [10, 10],
+    });
+
+    await tm.start();
+    await settle(150);
+    // Initial attempt + two retries, then it gives up loudly.
+    expect(acquires).toBe(3);
+    expect(logs.some((l) => l.includes("giving up after 2 retries"))).toBe(true);
+
+    // A flow disabled while a retry is pending must not be resurrected.
+    updateFlowStatus(flowId, "DISABLED");
+    await tm.refresh(flowId);
+    const before = acquires;
+    await settle(60);
+    expect(acquires).toBe(before);
+    await tm.stop();
+  });
+});
+
+
+describe('review: durable readiness refusals', () => {
+  beforeEach(() => setEncryptionKey(Buffer.alloc(32, 0x71)));
+  afterEach(() => setEncryptionKey(null));
+  function authenticatedFlow(pieceName = 'schedule') {
+    configureWorkflowReadiness({ pieces: new PieceCatalog([
+      { name: 'private-piece', displayName: '', description: '', auth: { type: 'SECRET_TEXT' }, actions: { send: { name: 'send', displayName: '', description: '' } } },
+      { name: 'jarvis-trigger', displayName: '', description: '', actions: {}, triggers: { on_event: { name: 'on_event', displayName: '', description: '' } } },
+    ]) });
+    const save = () => upsertConnection({ externalId: 'account', pieceName: 'private-piece', displayName: 'Synthetic', pieceVersion: '1', type: 'SECRET_TEXT', value: { secret_text: 'synthetic' } });
+    const connection = save();
+    const flow = publishFlowWithTrigger('Bound action', { name: 'trigger', type: 'PIECE_TRIGGER', settings: { pieceName, triggerName: 'on_event', input: { cron_expression: '* * * * *', eventType: 'test.evt' } }, nextAction: { name: 'send', type: 'PIECE', settings: { pieceName: 'private-piece', actionName: 'send', input: { auth: '{{connections.account}}' } } } });
+    return { ...flow, connection, save };
+  }
+
+  test('a live cron refusal records a failed run and the next fire can recover', async () => {
+    const { flowId, versionId, connection, save } = authenticatedFlow();
+    const cron = new FakeCronScheduler();
+    const manager = new TriggerManager({ eventBus: new WorkflowEventBus(), cronScheduler: cron as any, log: silent });
+    try {
+      await manager.start();
+      deleteConnection(connection.id);
+      cron.fire(`flow:${flowId}`);
+      const runs = listRuns({ flowId });
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ flowVersionId: versionId, status: 'FAILED', triggeredBy: 'trigger:cron', projectId: getFlow(flowId)!.project_id });
+      expect(runs[0]!.finishTime).toBeNumber();
+      expect(runs[0]!.failedStep?.errorMessage).toContain('Connection is missing');
+      expect(JSON.stringify(runs[0]!.steps)).toContain('CONNECTION_BINDING');
+      expect(queueStats().queued).toBe(0);
+      expect(getFlow(flowId)!.status).toBe('ENABLED');
+      save();
+      cron.fire(`flow:${flowId}`);
+      expect(listRuns({ flowId })).toHaveLength(2);
+      expect(queueStats().queued).toBe(1);
+    } finally { await manager.stop(); }
+  });
+
+  test('startup refuses visibly once and can register after the binding is repaired', async () => {
+    const { flowId, connection, save } = authenticatedFlow();
+    deleteConnection(connection.id);
+    const notices: unknown[] = [];
+    const manager = new TriggerManager({ eventBus: new WorkflowEventBus(), log: silent, enableRetryDelaysMs: [], onRegistrationBlocked: notice => notices.push(notice) });
+    try {
+      await manager.start();
+      await manager.refresh(flowId);
+      expect(manager.list()).toEqual([]);
+      expect(notices).toHaveLength(1);
+      expect(listRuns({ flowId })).toHaveLength(1);
+      expect(listRuns({ flowId })[0]).toMatchObject({ status: 'FAILED', triggeredBy: 'trigger:registration' });
+      save();
+      await manager.refresh(flowId);
+      expect(manager.list()).toEqual([{ flowId, kind: 'cron' }]);
+    } finally { await manager.stop(); }
+  });
+
+  test('polling refusal is recorded before consuming events and recovers on the next tick', async () => {
+    const { flowId, connection, save } = authenticatedFlow('jarvis-trigger');
+    let polls = 0;
+    const cron = new FakeCronScheduler();
+    const engine = { acquire: async () => ({ release: async () => {}, executeTriggerHook: async (hook: string) => {
+      if (hook === 'ON_ENABLE') return { listeners: [], scheduleOptions: { cronExpression: '* * * * *' } };
+      if (hook === 'RUN') { polls++; return { output: [{ event: 'one' }] }; }
+      return {};
+    } }) };
+    const manager = new TriggerManager({ eventBus: new WorkflowEventBus(), cronScheduler: cron as any, engineRuntime: engine as any, log: silent });
+    try {
+      await manager.start();
+      deleteConnection(connection.id);
+      cron.fire(`flow:${flowId}`); await settle();
+      expect(polls).toBe(0);
+      expect(listRuns({ flowId })[0]).toMatchObject({ status: 'FAILED', triggeredBy: 'trigger:engine' });
+      expect(queueStats().queued).toBe(0);
+      save();
+      cron.fire(`flow:${flowId}`); await settle();
+      expect(polls).toBe(1);
+      expect(queueStats().queued).toBe(1);
+    } finally { await manager.stop(); }
+  });
+
+  test('review R2: readiness lost during polling retains every consumed payload after restart without retrying it', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'jarvis-readiness-poll-'));
+    const path = join(directory, 'workflow.db');
+    closeWorkflowDb(); initWorkflowDb(path);
+    const { flowId, versionId, connection, save } = authenticatedFlow('jarvis-trigger');
+    const payloads = [{ id: 'evt-one', payload: { businessId: 'one' } }, { id: 'evt-two', payload: { businessId: 'two' } }];
+    let finishPoll!: () => void;
+    let started!: () => void;
+    let polls = 0;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const pending = new Promise<void>(resolve => { finishPoll = resolve; });
+    const cron = new FakeCronScheduler();
+    const engine = { acquire: async () => ({ release: async () => {}, executeTriggerHook: async (hook: string) => {
+      if (hook === 'ON_ENABLE') return { listeners: [], scheduleOptions: { cronExpression: '* * * * *' } };
+      if (hook === 'RUN' && ++polls === 1) {
+        started(); await pending;
+        // A real polling hook advances its cursor before returning these items.
+        return { output: payloads };
+      }
+      return { output: [] };
+    } }) };
+    const manager = new TriggerManager({ eventBus: new WorkflowEventBus(), cronScheduler: cron as any, engineRuntime: engine as any, log: silent });
+    try {
+      await manager.start();
+      cron.fire(`flow:${flowId}`); await entered;
+      deleteConnection(connection.id);
+      finishPoll(); await settle();
+      const runs = listRuns({ flowId });
+      expect(runs).toHaveLength(2);
+      expect(queueStats().queued).toBe(0);
+      for (const run of runs) expect(run).toMatchObject({ status: 'FAILED', flowVersionId: versionId, triggeredBy: 'trigger:engine' });
+      save();
+      cron.fire(`flow:${flowId}`); await settle();
+      expect(listRuns({ flowId })).toHaveLength(2);
+      expect(queueStats().queued).toBe(0);
+      await manager.stop();
+      closeWorkflowDb(); initWorkflowDb(path);
+      const recoveries = listRuns({ flowId }).map(run => (run.steps!['<readiness>'] as any).output.recovery);
+      expect(recoveries).toEqual(expect.arrayContaining(payloads.map(payload => ({ payload, executeTrigger: false, requiresDecision: true }))));
+      expect(queueStats().queued).toBe(0);
+    } finally {
+      finishPoll(); await manager.stop(); closeWorkflowDb();
+      rmSync(directory, { recursive: true, force: true });
+      initWorkflowDb(':memory:');
+    }
+  });
+
 });

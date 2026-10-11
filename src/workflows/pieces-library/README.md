@@ -78,6 +78,60 @@ Docker: `~/.jarvis` should be mounted as a persistent volume. The manifest
 re-runs `bun install` on startup if any catalog-installed piece is missing
 from `node_modules`.
 
+## Managed installs: the host owns the catalog
+
+Everything above describes a **self-managed** install, where the user picks
+pieces one at a time. A multi-tenant host inverts that: it builds the WHOLE
+catalog once per brain version into a root-owned read-only tree and points
+every tenant at it with `workflows.pieces_dir` (or
+`JARVIS_SHARED_PIECES_DIR`). `piecesManagedByHost()` in `shared.ts` is the
+switch, and a configured shared dir is the whole condition — the question the
+Library asks is "does something other than this user decide which pieces
+exist here?", and that setting IS the deployment's answer.
+
+When it is set:
+
+- `GET /api/workflows/pieces/library` returns `managed: true` and the whole
+  catalog as plain entries — id, package, name, description, tier. No install
+  state (everything is installed, so the badge would be noise on every row)
+  and none of the install-decision detail: version, vetted date, size,
+  license, source. Those are dropped from the PAYLOAD, not hidden by the
+  client, so a stale cached bundle can't put them back.
+- `POST .../:id/install` and `DELETE .../:id` answer **403**, before touching
+  disk.
+
+The 403 is the guarantee, not the hidden button. The tenant's own
+`~/.jarvis/pieces` is still writable and still shadows the shared tree
+(engine-bootstrap orders the roots user-first), so without the guard a
+hand-rolled POST would happily shadow a reviewed shared piece with an
+unreviewed npm copy and spend the tenant's disk quota doing it.
+
+The agent side follows the same switch. A managed daemon passes the composer
+no library index, which drops its `search_library` tool and the
+"suggest installs" wording from both prompts — otherwise the assistant would
+answer "install Discord from the Library page first" on an install whose
+Library has no button and whose install API answers 403.
+
+Two known rough edges:
+
+- A piece installed into `~/.jarvis/pieces` BEFORE the instance became managed
+  keeps shadowing the shared copy and can no longer be uninstalled through the
+  product. Clearing one is an SSH-level chore. This wants no migration and no
+  startup pruning: the managed Library shipped before the hosted product had
+  users, so the only installs that can predate it are a developer's own. Do
+  not add a reconciler pass that deletes from a manifest the user did not ask
+  you to touch.
+- Managedness rides on the RESOLVED dir, so it fails OPEN if the path cannot
+  be resolved. A host writes `pieces_dir: /opt/jarvis-pieces/${version}`, and
+  `resolveSharedRuntimePaths` refuses to expand `${version}` unless
+  `JARVIS_VERSION` names a concrete version — which it does not if the
+  per-instance env file is missing and systemd falls back to its
+  `JARVIS_VERSION=current` default. That instance reads as self-managed: full
+  detail, working install API, bun installing into the tenant's own quota. It
+  degrades to the pre-feature status quo rather than breaking, and such a host
+  is already badly broken (it is also running the wrong brain), but the only
+  announcement is a `[shared-runtime] WARNING` in the daemon log.
+
 ## Catalog entry schema
 
 ```ts
@@ -205,28 +259,65 @@ at the verification path.
    pieces (165MB+) deserve the heads-up. Omitting the field hides the
    badge; not wrong, just less helpful.
 
-8. **Record what you tested.** In the PR description, paste:
+8. **Land a governed adapter.** A verified piece's effects have to be
+   reviewable, so add an entry to `GOVERNED_PIECE_ADAPTERS` in
+   `src/workflows/runtime/piece-effects.ts` in the same PR:
+   - An Authority category for EVERY action the vetted version exposes.
+     Enumerate them with the spike from step 2
+     (`Object.keys(piece._actions)`), and classify each by what it does to
+     the remote account, not by what it is called.
+   - `unknownActionCategory`: the most severe category the piece can reach.
+     An action added by a later upstream release falls back to it, so it must
+     never be `read_data`. `custom_api_call` is always mapped there too.
+   - `targetProps`: the input props that identify the recipient, file or
+     endpoint. They are what the approval card shows.
+   - A deny case and an approve case in
+     `src/workflows/runtime/governed-pieces.test.ts`.
+   - Record the installed version's manifest:
+     `bun run scripts/sync-pieces-catalog.ts --manifests-only` (this downloads
+     and runs the verified pieces' code locally). `governed-pieces.test.ts`
+     fails until every action in it is mapped.
+
+   A piece WITHOUT an adapter is still installable and runnable; it just is
+   not governed. Verified means vetted AND governed.
+
+9. **Record what you tested.** In the PR description, paste:
    - The Bun version (`bun --version`)
    - The resolved piece version (`bun pm ls | grep <name>`)
    - The first 5-10 lines of the EXTRACT_PIECE_METADATA output
 
-9. **Update `BRANCH_SUMMARY.md`** if relevant and the project changelog.
+10. **Update `BRANCH_SUMMARY.md`** if relevant and the project changelog.
 
 ## Updating versions
 
-**When the range stays the same** (bun re-resolves within the existing
-caret/tilde to a newer version):
+**Verified pieces move with the weekly sync, when their adapter still covers
+them.** The sync's `inspect` job reads the new version's actions inside a
+container (see `.github/workflows/sync-pieces-catalog.yml`), and the bump is
+taken when every action is mapped in the governed adapter, no existing
+action's upstream `classification` got more severe, and no existing action
+lost props (`scripts/lib/verified-upgrade.ts`). Anything else stays at the
+installed version and is listed in the open `verified-piece-review` issue,
+which says why and what clears it:
 
-- Re-run steps 2 + 5 from "Adding a new piece" against the new version.
-- Bump `vettedVersion` and `vettedAt`. `versionRange` stays.
-- This is the common case -- activepieces patches a bug, we re-vet.
+- Unmapped actions: map them in `GOVERNED_PIECE_ADAPTERS`.
+- A raised classification or removed props: check the adapter still fits,
+  then add `"<id>": "<version>"` to `VERIFIED_UPGRADE_REVIEWED` in
+  `catalog-overrides.ts`. Later releases are then compared from that version.
+
+Land either in its own PR to main; the next sync run takes the bump. Do not
+commit to the bot's `chore/sync-pieces-catalog` branch, which every run
+rebuilds. `vettedAt` records the promotion checklist, not each bump.
+
+**Community pieces** (bun re-resolves within the existing caret/tilde to a
+newer version) move with the sync too, with no check of their actions.
 
 **When the range needs to widen** (upstream went `0.12.x` -> `0.13.x` and
 we want to allow that):
 
 - Treat this like adding a new piece. Pre-1.0 minor bumps may include
   breaking changes.
-- Bump `versionRange`, `vettedVersion`, `vettedAt`.
+- Bump `versionRange`, `vettedVersion`, `vettedAt` (a verified piece: also
+  re-run `--manifests-only` and map anything new).
 - If schema changes affect existing user flows, document migration in the
   changelog. The reconciler reports a warning when a user's resolved
   version differs from `vettedVersion`.

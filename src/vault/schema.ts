@@ -1,4 +1,7 @@
 import { Database } from "bun:sqlite";
+import { ensureSuggestionSchema } from './suggestion-schema.ts';
+import { ensureGoalEventSchema } from './goal-event-schema.ts';
+import { ensureFactSchema } from './fact-schema.ts';
 
 let dbInstance: Database | null = null;
 
@@ -54,6 +57,14 @@ export function initDatabase(dbPath: string = ":memory:", opts?: { quiet?: boole
     // Enable foreign key constraints
     dbInstance.exec("PRAGMA foreign_keys=ON");
 
+    // Wait rather than fail on a locked write. This file is written by MORE
+    // than the daemon: `jarvis enroll` and `jarvis revoke` run in their own
+    // processes against the same WAL database. Without a busy timeout a
+    // collision surfaces as an immediate SQLITE_BUSY throw, and a write that
+    // is swallowed by a best-effort path (panel_sessions teardown) would leave
+    // a row on disk that a later start reads back as a live session.
+    dbInstance.exec("PRAGMA busy_timeout=5000");
+
     // Create all tables
     createTables(dbInstance);
 
@@ -63,6 +74,33 @@ export function initDatabase(dbPath: string = ":memory:", opts?: { quiet?: boole
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to initialize database: ${message}`);
   }
+}
+
+/** Upgrade text-only plans without inventing goal, execution or completion claims. */
+function backfillPlannedWork(db: Database): void {
+  const plans = db.query<{ id: string; actions_planned: string | null; created_at: number }, []>(
+    "SELECT id, actions_planned, created_at FROM goal_check_ins WHERE type = 'morning_plan'",
+  ).all();
+  const exists = db.query('SELECT work_id FROM commitment_work WHERE plan_id = ? AND action_index = ?');
+  db.transaction(() => {
+    for (const plan of plans) {
+      let actions: unknown;
+      try { actions = JSON.parse(plan.actions_planned ?? '[]'); } catch { continue; }
+      if (!Array.isArray(actions)) continue;
+      for (const [index, title] of actions.entries()) {
+        if (typeof title !== 'string' || !title.trim() || exists.get(plan.id, index)) continue;
+        const id = generateId();
+        db.run(
+          "INSERT INTO commitments (id, what, priority, status, created_from, created_at) VALUES (?, ?, 'normal', 'pending', ?, ?)",
+          [id, title, `goal_check_in:${plan.id}`, plan.created_at],
+        );
+        db.run(
+          'INSERT INTO commitment_work (work_id, plan_id, action_index, updated_at) VALUES (?, ?, ?, ?)',
+          [id, plan.id, index, plan.created_at],
+        );
+      }
+    }
+  })();
 }
 
 /**
@@ -113,6 +151,7 @@ function createTables(db: Database): void {
   db.run(`
     CREATE INDEX IF NOT EXISTS idx_facts_predicate ON facts(predicate)
   `);
+  ensureFactSchema(db);
 
   // Relationships table: edges between entities
   db.run(`
@@ -153,12 +192,21 @@ function createTables(db: Database): void {
       created_at INTEGER NOT NULL,
       completed_at INTEGER,
       result TEXT,
-      sort_order INTEGER DEFAULT 0
+      sort_order INTEGER DEFAULT 0,
+      scope_id TEXT
     )
   `);
 
   // Migration: add sort_order to existing databases
   try { db.run('ALTER TABLE commitments ADD COLUMN sort_order INTEGER DEFAULT 0'); } catch {}
+
+  // Migration: the tool scope of the turn that created this commitment (#571).
+  // A commitment is the one in-scope tool whose whole effect is to schedule a
+  // LATER turn, and the scope is per-turn, so the executor's turn never
+  // carried it. Recording it is the half that can be done safely today; see
+  // daemon/commitment-executor.ts for why the executor does not yet RUN under
+  // it and what that would take.
+  try { db.run('ALTER TABLE commitments ADD COLUMN scope_id TEXT'); } catch {}
 
   db.run(`
     CREATE INDEX IF NOT EXISTS idx_commitments_status ON commitments(status)
@@ -251,9 +299,16 @@ function createTables(db: Database): void {
       last_message_at INTEGER NOT NULL,
       message_count INTEGER DEFAULT 0,
       metadata TEXT,
+      sender TEXT,
       CHECK(message_count >= 0)
     )
   `);
+  // Migration: whose conversation this is within its channel (#884), for
+  // external channels, where each sender has their own. A column, not a key
+  // in `metadata`: an index or a WHERE over json_extract throws on a single
+  // malformed metadata value, which would stop the daemon starting, or stop
+  // every message on the channel being answered.
+  try { db.run('ALTER TABLE conversations ADD COLUMN sender TEXT'); } catch { /* already present */ }
 
   db.run(`
     CREATE INDEX IF NOT EXISTS idx_conversations_agent ON conversations(agent_id)
@@ -261,6 +316,15 @@ function createTables(db: Database): void {
 
   db.run(`
     CREATE INDEX IF NOT EXISTS idx_conversations_channel ON conversations(channel)
+  `);
+
+  // One conversation per channel sender (#884), looked up on every inbound
+  // message by sender and recency. Without this the lookup scanned every
+  // conversation the channel ever had, which anyone who can message the bot
+  // grows: 42ms per message at 200k rows, measured.
+  db.run(`
+    CREATE INDEX IF NOT EXISTS idx_conversations_sender
+      ON conversations(channel, sender, last_message_at)
   `);
 
   // Conversation messages table: individual chat messages
@@ -370,6 +434,51 @@ function createTables(db: Database): void {
   // approve endpoints only flip the status. 'deferred' keeps the legacy
   // execute-on-approve behavior.
   try { db.run(`ALTER TABLE approval_requests ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'deferred'`); } catch {}
+  // Migration: execution claim and receipt. The claim columns record that one
+  // executor took the approved request before dispatch, so a second caller or
+  // a restarted daemon cannot run it again. `execution_outcome` qualifies the
+  // receipt (committed, failed, blocked) or, after a restart, the reconciled
+  // state of an approved row that never got one (not_started, unknown) and
+  // the user's resolution of it (closed). Old rows read as unclaimed.
+  //
+  // The columns and the one-time closure below go in together or not at all.
+  // They are separate writes, and a crash between them would leave a database
+  // with the columns but no closure, which the next boot reads as already
+  // migrated: every pre-upgrade approved row would then reconcile to
+  // `not_started` and the dashboard would offer to run months-old arguments.
+  // SQLite rolls DDL back with the rest of a transaction, so the marker for
+  // "already migrated" (the columns existing) can never outlive the closure.
+  const approvalColumns = (db.query(`PRAGMA table_info(approval_requests)`).all() as Array<{ name: string }>)
+    .map((column) => column.name);
+  const receiptsIntroduced = !approvalColumns.includes('execution_outcome');
+  db.transaction(() => {
+    try { db.run(`ALTER TABLE approval_requests ADD COLUMN execution_claimed_at INTEGER`); } catch {}
+    try { db.run(`ALTER TABLE approval_requests ADD COLUMN execution_claimed_by TEXT`); } catch {}
+    try { db.run(`ALTER TABLE approval_requests ADD COLUMN execution_boot_id TEXT`); } catch {}
+    try { db.run(`ALTER TABLE approval_requests ADD COLUMN execution_outcome TEXT`); } catch {}
+    try { db.run(`ALTER TABLE approval_requests ADD COLUMN resolved_at INTEGER`); } catch {}
+    try { db.run(`ALTER TABLE approval_requests ADD COLUMN resolved_by TEXT`); } catch {}
+    try { db.run(`ALTER TABLE approval_requests ADD COLUMN resolution_note TEXT`); } catch {}
+    // Rows approved before receipts existed cannot be told apart: the old code
+    // wrote no claim, so whether one of them ran is unknowable. They are closed
+    // once, here, rather than offered as runnable with months-old arguments on
+    // the first boot after the upgrade. Only rows approved from now on are
+    // reconciled at startup.
+    if (!receiptsIntroduced) return;
+    const closed = db.run(
+      `UPDATE approval_requests
+         SET execution_outcome = 'closed', resolved_at = ?, resolved_by = 'migration',
+             resolution_note = 'Approved before execution receipts existed; whether it ran is unknown, so it was not run again'
+       WHERE status = 'approved' AND execution_mode != 'workflow'`,
+      [Date.now()]
+    ).changes;
+    // Say so once, on stderr, so the closure is not an invisible state change.
+    // Stdout belongs to the CLIs that parse it; this runs in whichever process
+    // opens the vault first after the upgrade, daemon or CLI.
+    if (closed > 0) {
+      console.warn(`[Vault] Closed ${closed} approval(s) that were approved before execution receipts existed. Whether they ran is unknown, so none were run again; they read as closed in Authority.`);
+    }
+  })();
 
   // Authority: Audit trail
   db.run(`
@@ -429,8 +538,10 @@ function createTables(db: Database): void {
       created_at INTEGER NOT NULL
     )
   `);
-  // OCR moved to sidecar; thumbnails are no longer generated.
-  try { db.run('ALTER TABLE screen_captures DROP COLUMN thumbnail_path'); } catch { /* already dropped or never present */ }
+  // OCR moved to sidecar; thumbnails are no longer generated. Re-added as a
+  // nullable column below (~line 448) in the same boot, so a rolled-back reader
+  // still finds thumbnail_path.
+  try { db.run('ALTER TABLE screen_captures DROP COLUMN thumbnail_path'); } catch { /* expand-contract-ok: re-added nullable below */ }
   // Track which sidecar owns the capture file so the brain can route
   // fetch_capture RPCs correctly (sidecars may run on different hosts).
   try { db.run('ALTER TABLE screen_captures ADD COLUMN sidecar_id TEXT'); } catch { /* already present */ }
@@ -486,6 +597,34 @@ function createTables(db: Database): void {
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_suggestions_type ON awareness_suggestions(type)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_suggestions_created ON awareness_suggestions(created_at)`);
+
+  // C6: bounded observation ledger survives short capture retention. Proposals
+  // extend suggestion identity so C7 can attach drafts without another ID map.
+  db.run(`CREATE TABLE IF NOT EXISTS opportunity_observations (
+    capture_id TEXT NOT NULL, kind TEXT NOT NULL, observed_at INTEGER NOT NULL,
+    app TEXT NOT NULL, cue TEXT NOT NULL, PRIMARY KEY (capture_id, kind)
+  )`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_opportunity_observations_time ON opportunity_observations(observed_at)`);
+  db.run(`CREATE TABLE IF NOT EXISTS opportunity_hypotheses (
+    suggestion_id TEXT PRIMARY KEY REFERENCES awareness_suggestions(id) ON DELETE CASCADE,
+    pattern_key TEXT NOT NULL UNIQUE, hypothesis TEXT NOT NULL,
+    validation TEXT, created_at INTEGER NOT NULL
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS opportunity_feedback (
+    id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL REFERENCES opportunity_hypotheses(suggestion_id) ON DELETE CASCADE,
+    request_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('validate', 'dismiss', 'outcome')),
+    payload TEXT NOT NULL, work_ref TEXT, created_at INTEGER NOT NULL,
+    UNIQUE(opportunity_id, request_id), UNIQUE(opportunity_id, work_ref)
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS opportunity_delivery (
+    opportunity_id TEXT PRIMARY KEY REFERENCES opportunity_hypotheses(suggestion_id) ON DELETE CASCADE,
+    delivered_at INTEGER, channel TEXT, next_attempt_at INTEGER NOT NULL DEFAULT 0,
+    lease_token TEXT, lease_until INTEGER NOT NULL DEFAULT 0
+  )`);
+  // Old delivered flags were written before the notification callback. They
+  // cannot establish delivery; recover unacknowledged proposals conservatively.
+  db.run(`INSERT OR IGNORE INTO opportunity_delivery (opportunity_id)
+    SELECT suggestion_id FROM opportunity_hypotheses`);
 
   // ── Workflows (M14): Automation engine ──
 
@@ -653,6 +792,39 @@ function createTables(db: Database): void {
   db.run(`CREATE INDEX IF NOT EXISTS idx_gci_type ON goal_check_ins(type)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_gci_created ON goal_check_ins(created_at)`);
 
+  ensureGoalEventSchema(db);
+
+  // Additive review audit: the exact bounded inputs and rejected score proposals.
+  db.run(`CREATE TABLE IF NOT EXISTS goal_review_evidence (
+    check_in_id TEXT PRIMARY KEY REFERENCES goal_check_ins(id) ON DELETE CASCADE,
+    record TEXT NOT NULL
+  )`);
+
+  // A work item extends a commitment: its public ID is the commitment ID.
+  // Workflow IDs remain durable references even if run history is deleted.
+  // No workflow-table FK: independent goal rhythms also run without that schema.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS commitment_work (
+      work_id TEXT PRIMARY KEY REFERENCES commitments(id) ON DELETE CASCADE,
+      plan_id TEXT REFERENCES goal_check_ins(id),
+      action_index INTEGER,
+      goal_id TEXT,
+      mode TEXT NOT NULL DEFAULT 'manual' CHECK(mode IN ('manual', 'workflow')),
+      workflow_id TEXT,
+      workflow_version_id TEXT,
+      input TEXT NOT NULL DEFAULT '{}',
+      decision TEXT,
+      run_id TEXT UNIQUE,
+      blocker TEXT,
+      result_check TEXT,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(plan_id, action_index)
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_work_plan ON commitment_work(plan_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_work_goal ON commitment_work(goal_id)`);
+  backfillPlannedWork(db);
+
   // Sidecars table: enrolled sidecar processes
   db.run(`
     CREATE TABLE IF NOT EXISTS sidecars (
@@ -671,6 +843,39 @@ function createTables(db: Database): void {
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_sidecars_name ON sidecars(name)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_sidecars_token_id ON sidecars(token_id)`);
+
+  // Panel webview sessions (src/sidecar/panel-sessions.ts). Persisted rather
+  // than held only in memory because the brain is RESTARTED routinely -- every
+  // hosted update does `systemctl restart` on the instance unit -- and an
+  // in-memory-only session would strand every open panel on a permanent 401
+  // that nothing in the page could recover from. That is the same failure this
+  // whole change exists to remove, arriving from a different direction: the
+  // access-token cookie it replaces survived a restart, because the key that
+  // signs it is loaded from disk.
+  //
+  // Times are epoch ms (not the datetime('now') text the older tables use), so
+  // an age check is integer arithmetic instead of string parsing on the
+  // authentication path.
+  //
+  // ON DELETE CASCADE (foreign_keys is ON above) is what makes this table
+  // self-cleaning across PROCESSES: `jarvis revoke` deletes the sidecars row
+  // from its own process, which the daemon only learns about by looking, and
+  // the cascade closes that device's panel rows in the same transaction rather
+  // than leaving them to be read back as live sessions on the next start.
+  // Nothing legitimate inserts without an enrolled row -- openPanelSession
+  // checks enrollment first -- so the constraint refuses no real create except
+  // in one harmless race: a CLI revoke landing between that check and the
+  // INSERT fails the FK, which the store's best-effort persist swallows,
+  // leaving an in-memory session that the next request refuses anyway.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS panel_sessions (
+      id TEXT PRIMARY KEY,
+      sidecar_id TEXT NOT NULL REFERENCES sidecars(id) ON DELETE CASCADE,
+      created_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_panel_sessions_sidecar ON panel_sessions(sidecar_id)`);
   // Sidecar's own (brain-decoupled) version, reported on register. Added later;
   // ALTER in try/catch is the migration pattern used throughout this file.
   try { db.run('ALTER TABLE sidecars ADD COLUMN version TEXT'); } catch { /* already present */ }
@@ -685,6 +890,20 @@ function createTables(db: Database): void {
       value TEXT NOT NULL,
       updated_at INTEGER NOT NULL DEFAULT (unixepoch())
     )
+  `);
+
+  // Backfill for the first-run dashboard intro (src/sidecar/first-run.ts): a
+  // brain that has ALREADY had a sidecar connect is not a first run, so pre-set
+  // the flag rather than popping an unannounced window on an established
+  // install's next connect. A fresh brain has an empty sidecars table, inserts
+  // nothing, and lets the first real connection claim the intro. Runs at DB
+  // open — before any connection can be served — and INSERT OR IGNORE keeps it
+  // idempotent across daemon restarts. Must stay after the sidecars table above
+  // so the subquery resolves.
+  db.run(`
+    INSERT OR IGNORE INTO settings (key, value)
+    SELECT 'sidecar.dashboard_intro_shown', '1'
+    WHERE EXISTS (SELECT 1 FROM sidecars WHERE last_seen_at IS NOT NULL)
   `);
 
   // Documents table: vault-stored documents created by JARVIS
@@ -727,6 +946,40 @@ function createTables(db: Database): void {
   if (!webappCols.some((c) => c.name === 'keywords')) {
     db.run(`ALTER TABLE webapp_templates ADD COLUMN keywords TEXT NOT NULL DEFAULT '[]'`);
   }
+
+  // Skills: parameterized, verified, replayable procedures. The structural-
+  // runtime replacement for markdown webapp_templates: steps address elements
+  // by durable SemanticRef and carry postconditions. `match`, `params`, and
+  // `steps` are JSON blobs (see src/skills/types.ts). `content_mac` binds the
+  // reviewed content to the row (see src/vault/skills.ts); a row without one
+  // is listed but never run.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS skills (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      app TEXT NOT NULL DEFAULT '',
+      description TEXT NOT NULL DEFAULT '',
+      match_json TEXT NOT NULL DEFAULT '{}',
+      params_json TEXT NOT NULL DEFAULT '[]',
+      steps_json TEXT NOT NULL DEFAULT '[]',
+      provenance TEXT NOT NULL DEFAULT 'authored'
+        CHECK(provenance IN ('recorded', 'authored', 'marketplace')),
+      version INTEGER NOT NULL DEFAULT 1,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      content_mac TEXT,
+      success_count INTEGER NOT NULL DEFAULT 0,
+      run_count INTEGER NOT NULL DEFAULT 0,
+      verified_at INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      CHECK(enabled IN (0, 1))
+    )
+  `);
+  // Migration: sign rows written by a pre-release build of this table.
+  try { db.run('ALTER TABLE skills ADD COLUMN content_mac TEXT'); } catch {}
+  db.run(`CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_skills_enabled ON skills(enabled)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_skills_app ON skills(app)`);
 
   // Recent objects: cross-device LRU of palette picks. The dashboard primarily
   // reads `picked_at` desc and dedupes on (object_type, object_id) so the same
@@ -814,9 +1067,19 @@ function createTables(db: Database): void {
       updated_at INTEGER NOT NULL,
       result_json TEXT,
       question TEXT,
-      paused_conversation TEXT
+      paused_conversation TEXT,
+      context_key TEXT
     )
   `);
+  // Migration: WHICH CHAT created this task (#571) -- `site:<projectId>` for a
+  // project-scoped site chat, null for the ordinary main chat. A task can
+  // pause on ask_for_clarification and be resumed after a daemon restart, at
+  // which point this row is the only memory it has of where it came from. A
+  // chat identity, not a policy: the scope a resumed task RUNS under always
+  // comes from the live turn, and this is only ever compared for equality, so
+  // an unrecognised key refuses rather than widening.
+  try { db.run('ALTER TABLE tasks ADD COLUMN context_key TEXT'); } catch { /* already present */ }
   db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status, updated_at DESC)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated_at DESC)`);
+  ensureSuggestionSchema(db);
 }

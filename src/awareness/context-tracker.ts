@@ -5,11 +5,14 @@
  * error patterns, and manages activity sessions.
  */
 
+import { AWARENESS_ACTIVITY_SCHEMA_VERSION, type SessionEndedEvent } from './activity-events.ts';
 import type { AwarenessConfig } from '../config/types.ts';
 import type { ScreenContext, AwarenessEvent } from './types.ts';
-import { createSession, endSession, incrementSessionCaptureCount, updateSession } from '../vault/awareness.ts';
-import { generateId } from '../vault/schema.ts';
+import { createSession, incrementSessionCaptureCount, updateSession } from '../vault/awareness.ts';
 import { StruggleDetector } from './struggle-detector.ts';
+
+// A capture gap longer than this starts a new session.
+const IDLE_RETURN_MS = 5 * 60 * 1000;
 
 // Strong error indicators — always trigger (rare in normal output)
 const STRONG_ERROR_PATTERN = /\b(traceback|segfault|SIGSEGV|SIGABRT|panic|undefined is not|cannot read prop|stack overflow|out of memory|unhandled rejection|uncaught exception|TypeError:|ReferenceError:|SyntaxError:|RangeError:|ModuleNotFoundError|ImportError|FileNotFoundError|PermissionError|ConnectionRefusedError|ECONNREFUSED|ENOTFOUND|EPERM|Build failed|Compilation error|npm ERR!)\b/i;
@@ -35,12 +38,19 @@ export class ContextTracker {
   private previousContext: ScreenContext | null = null;
   private currentSessionId: string | null = null;
   private currentSessionApps: Set<string> = new Set();
+  private currentSessionLastObservedAt = 0;
   private sameWindowSince: number = 0;
   private lastOcrTextHash: string = '';
   private lastActivityTimestamp: number = 0;
   private lastErrorText: string = '';
   private lastErrorTimestamp: number = 0;
-  private pendingWindowInfo: { appName: string; windowTitle: string } | null = null;
+  private stuckReported: boolean = false;
+  /** Full-text OCR hash, used only for redundancy (see processCapture). */
+  private lastFullOcrHash: string = '';
+  // Explicit window events are hints, never edits to a processed capture.
+  // Scope metadata to its source so another computer cannot supply its title.
+  private pendingWindowInfo = new Map<string, { appName: string; windowTitle: string; timestamp: number }>();
+  private capturedWindowInfo = new Map<string, { appName: string; windowTitle: string; timestamp: number }>();
   private struggleDetector: StruggleDetector;
 
   constructor(config: AwarenessConfig) {
@@ -54,21 +64,45 @@ export class ContextTracker {
   /**
    * Process a new screen capture. Returns the context and any detected events.
    */
-  processCapture(captureId: string, ocrText: string, rawWindowTitle?: string, capturedAt?: number): {
+  processCapture(captureId: string, ocrText: string, rawWindowTitle?: string, capturedAt?: number,
+    source: { appName?: string; sidecarId?: string } = {}): {
     context: ScreenContext;
     events: AwarenessEvent[];
+    /**
+     * True when this capture told us nothing new: same window, byte-identical
+     * OCR text, no events. The sidecar only sends captures whose pixels moved,
+     * so these are cursor blinks, clocks and video frames — real screen churn
+     * with no change in what the user is doing. Callers skip the derived
+     * writes (entity graph, observation log, suggestion eval) for these.
+     */
+    isRedundant: boolean;
   } {
     const now = capturedAt ?? Date.now();
     const events: AwarenessEvent[] = [];
+    const priorFullOcrHash = this.lastFullOcrHash;
+    const fullOcrHash = simpleHash(ocrText, ocrText.length);
 
-    // Use pending window info from sidecar context_changed if no rawWindowTitle provided
-    const effectiveWindowTitle = rawWindowTitle || this.pendingWindowInfo?.windowTitle;
-    if (this.pendingWindowInfo && !rawWindowTitle) {
-      this.pendingWindowInfo = null; // consumed
-    }
-
-    // Parse app name and details from window title or OCR
-    const { appName, windowTitle, url, filePath } = this.parseWindowInfo(ocrText, effectiveWindowTitle);
+    const sourceKey = source.sidecarId ?? '';
+    const pending = this.pendingWindowInfo.get(sourceKey);
+    const hint = pending && pending.timestamp <= now ? pending : undefined;
+    // A capture supersedes hints up to its timestamp, including conflicting
+    // hints. Future hints wait for a later capture instead of changing history.
+    if (hint) this.pendingWindowInfo.delete(sourceKey);
+    // Hints can be partial too. Combine only non-conflicting supplied fields,
+    // then fill remaining gaps from a compatible confirmed snapshot.
+    const usableHint = hint &&
+      (!source.appName || !hint.appName || source.appName === hint.appName) &&
+      (!rawWindowTitle || !hint.windowTitle || rawWindowTitle === hint.windowTitle) ? hint : undefined;
+    const observedApp = source.appName || usableHint?.appName;
+    const observedTitle = rawWindowTitle || usableHint?.windowTitle;
+    const last = this.capturedWindowInfo.get(sourceKey);
+    const fallback = last &&
+      (!observedApp || observedApp === last.appName) &&
+      (!observedTitle || observedTitle === last.windowTitle) ? last : undefined;
+    const parsed = this.parseWindowInfo(ocrText, observedTitle || fallback?.windowTitle);
+    // Native app identity is authoritative. Title parsing is a legacy fallback.
+    const appName = observedApp || fallback?.appName || parsed.appName;
+    const { windowTitle, url, filePath } = parsed;
 
     // Detect context change
     const isAppChange = this.currentContext !== null &&
@@ -76,31 +110,42 @@ export class ContextTracker {
 
     const isSignificantChange = isAppChange || this.currentContext === null;
 
+    // A narrower signal than isSignificantChange: the *application* changed,
+    // not just its window title. Title churn (browser tabs, editor files,
+    // media players) makes isSignificantChange true on nearly every capture,
+    // which is useless as a "something happened" gate.
+    const isAppSwitch = this.currentContext === null ||
+      this.currentContext.appName !== appName;
+
     // Session management
     const idleGap = this.lastActivityTimestamp > 0 ? (now - this.lastActivityTimestamp) : 0;
-    const isIdleReturn = idleGap > 5 * 60 * 1000; // 5 min idle
+    const isIdleReturn = idleGap > IDLE_RETURN_MS;
 
     if (isAppChange || isIdleReturn || !this.currentSessionId) {
-      // End previous session if it exists
-      if (this.currentSessionId && isAppChange) {
-        this.endCurrentSession();
-        events.push({
-          type: 'session_ended',
-          data: { sessionId: this.currentSessionId, apps: Array.from(this.currentSessionApps) },
-          timestamp: now,
-        });
-      }
+      // Close before replacing the session, including a return to the same
+      // window after a capture gap. A repeated close produces no second event.
+      // After a capture gap the session ended somewhere inside the gap, so
+      // count at most the idle threshold of it (as activity analytics caps a
+      // long gap) instead of stretching it to the returning capture.
+      const closeAt = isIdleReturn ? Math.min(now, this.currentSessionLastObservedAt + IDLE_RETURN_MS) : now;
+      const ended = this.endCurrentSession(closeAt);
+      if (ended) events.push(ended);
 
       // Start new session
       const session = createSession({ startedAt: now, apps: [appName] });
       this.currentSessionId = session.id;
       this.currentSessionApps = new Set([appName]);
+      this.currentSessionLastObservedAt = now;
       events.push({
         type: 'session_started',
         data: { sessionId: session.id, appName },
         timestamp: now,
       });
     }
+
+    // Captures keep their source timestamps and processing order. A late
+    // observation must not move this session's end bound backward.
+    this.currentSessionLastObservedAt = Math.max(this.currentSessionLastObservedAt, now);
 
     // Track app in current session
     if (this.currentSessionId && appName) {
@@ -112,6 +157,7 @@ export class ContextTracker {
     if (isAppChange) {
       events.push({
         type: 'context_changed',
+        schemaVersion: AWARENESS_ACTIVITY_SCHEMA_VERSION,
         data: {
           fromApp: this.currentContext?.appName ?? 'unknown',
           toApp: appName,
@@ -122,6 +168,7 @@ export class ContextTracker {
       });
       this.sameWindowSince = now;
       this.lastOcrTextHash = '';
+      this.stuckReported = false;
       this.struggleDetector.reset();
     }
 
@@ -136,23 +183,35 @@ export class ContextTracker {
       const ocrHash = simpleHash(ocrText);
       const textUnchanged = ocrHash === this.lastOcrTextHash;
 
+      // Fire once per stuck episode, not once per capture. Without this the
+      // event repeats on every capture for as long as the window stays put,
+      // and because stuck is an escalation signal that means a billed vision
+      // call every cooldown — indefinitely, for a screen that is merely
+      // showing a video or a progress bar.
       if (sameWindowDuration > this.config.stuck_threshold_ms && textUnchanged) {
-        events.push({
-          type: 'stuck_detected',
-          data: {
-            windowTitle,
-            appName,
-            durationMs: sameWindowDuration,
-            ocrPreview: ocrText.slice(0, 200),
-          },
-          timestamp: now,
-        });
+        if (!this.stuckReported) {
+          this.stuckReported = true;
+          events.push({
+            type: 'stuck_detected',
+            data: {
+              windowTitle,
+              appName,
+              durationMs: sameWindowDuration,
+              ocrPreview: ocrText.slice(0, 200),
+            },
+            timestamp: now,
+          });
+        }
+      } else if (!textUnchanged) {
+        // The user did something — the next stall is a new episode.
+        this.stuckReported = false;
       }
 
       this.lastOcrTextHash = ocrHash;
     } else {
       this.sameWindowSince = now;
       this.lastOcrTextHash = simpleHash(ocrText);
+      this.stuckReported = false;
     }
 
     // Struggle detection (behavioral analysis beyond simple stuck)
@@ -221,14 +280,27 @@ export class ContextTracker {
       ocrText,
       sessionId: this.currentSessionId!,
       isSignificantChange,
+      isAppSwitch,
     };
 
     // Update state
     this.previousContext = this.currentContext;
     this.currentContext = context;
+    this.capturedWindowInfo.set(sourceKey, { appName, windowTitle, timestamp: now });
     this.lastActivityTimestamp = now;
 
-    return { context, events };
+    // Hashed in full, not through simpleHash: that one samples the first 2000
+    // characters, which for an IDE sidebar, a persistent nav or a long
+    // document header is fixed chrome. Treating those captures as redundant
+    // would drop the body the user is actually reading out of the entity graph
+    // and the observation log.
+    const isRedundant = !isAppChange &&
+      priorFullOcrHash !== '' &&
+      priorFullOcrHash === fullOcrHash &&
+      events.length === 0;
+    this.lastFullOcrHash = fullOcrHash;
+
+    return { context, events, isRedundant };
   }
 
   getCurrentContext(): ScreenContext | null {
@@ -249,28 +321,17 @@ export class ContextTracker {
   }
 
   /**
-   * Get the last known window title (set by updateWindowInfo from sidecar events).
+   * Cache an explicit context event until a capture confirms the observation.
+   * Only processCapture compares/commits snapshots and emits context_changed;
+   * repeating a hint before or after that capture cannot create a second event.
    */
-  getLastWindowTitle(): string | undefined {
-    return this.currentContext?.windowTitle ?? undefined;
-  }
-
-  /**
-   * Update cached window info from a sidecar context_changed event.
-   * Called externally when the sidecar pushes a window change.
-   */
-  updateWindowInfo(appName: string, windowTitle: string): void {
-    if (!this.currentContext) {
-      // No capture processed yet — store as pending info for the first processCapture call
-      this.pendingWindowInfo = { appName, windowTitle };
-      return;
-    }
-    // Directly update current context's window info
-    this.currentContext = {
-      ...this.currentContext,
-      appName: appName || this.currentContext.appName,
-      windowTitle: windowTitle || this.currentContext.windowTitle,
-    };
+  updateWindowInfo(appName: string, windowTitle: string, timestamp = Date.now(), sidecarId?: string): void {
+    const sourceKey = sidecarId ?? '';
+    const captured = this.capturedWindowInfo.get(sourceKey);
+    const pending = this.pendingWindowInfo.get(sourceKey);
+    if (captured && timestamp <= captured.timestamp) return;
+    if (pending && timestamp < pending.timestamp) return;
+    this.pendingWindowInfo.set(sourceKey, { appName, windowTitle, timestamp });
   }
 
   /**
@@ -285,18 +346,27 @@ export class ContextTracker {
     }
   }
 
-  endCurrentSession(): void {
-    if (this.currentSessionId) {
-      try {
-        // Update session apps before ending
-        updateSession(this.currentSessionId, {
-          apps: Array.from(this.currentSessionApps),
-        });
-        endSession(this.currentSessionId);
-      } catch { /* session may not exist in test environments */ }
-      this.currentSessionId = null;
-      this.currentSessionApps.clear();
-    }
+  endCurrentSession(timestamp = Date.now()): SessionEndedEvent | null {
+    if (!this.currentSessionId) return null;
+    const endedAt = Math.max(timestamp, this.currentSessionLastObservedAt);
+    const event: SessionEndedEvent = Object.freeze({
+      type: 'session_ended',
+      schemaVersion: AWARENESS_ACTIVITY_SCHEMA_VERSION,
+      data: Object.freeze({
+        sessionId: this.currentSessionId,
+        apps: Object.freeze(Array.from(this.currentSessionApps)),
+      }),
+      timestamp: endedAt,
+    });
+    try {
+      // Persist the same snapshot in one write. Ending must not erase an
+      // already stored topic/summary, and event/row timestamps must agree.
+      updateSession(event.data.sessionId, { apps: [...event.data.apps], ended_at: endedAt });
+    } catch { /* DB may already be closed during shutdown */ }
+    this.currentSessionId = null;
+    this.currentSessionApps.clear();
+    this.currentSessionLastObservedAt = 0;
+    return event;
   }
 
   /**
@@ -337,9 +407,9 @@ export class ContextTracker {
 /**
  * Simple string hash for quick comparison (not cryptographic).
  */
-function simpleHash(str: string): string {
+function simpleHash(str: string, sampleLength: number = 2000): string {
   let hash = 0;
-  const sample = str.slice(0, 2000); // Only hash first 2000 chars
+  const sample = str.slice(0, sampleLength);
   for (let i = 0; i < sample.length; i++) {
     const char = sample.charCodeAt(i);
     hash = ((hash << 5) - hash) + char;

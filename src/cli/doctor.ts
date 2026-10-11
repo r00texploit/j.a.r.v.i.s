@@ -11,6 +11,7 @@ import {
   c, printBanner, printOk, printWarn, printErr, printInfo, startSpinner, closeRL,
 } from './helpers.ts';
 import { detectInstallMethod, describeInstallMethod, getMethodCommands } from './install-method.ts';
+import { describeDashboard, resolveDashboardTarget } from './lifecycle.ts';
 
 const JARVIS_DIR = join(homedir(), '.jarvis');
 const CONFIG_PATH = join(JARVIS_DIR, 'config.yaml');
@@ -27,6 +28,20 @@ export async function runDoctor(): Promise<void> {
   console.log(c.bold('Running system diagnostics...\n'));
 
   const results: CheckResult[] = [];
+
+  // Where the dashboard actually is, for every message below that points at it:
+  // JARVIS_PORT or `daemon.port` make a hardcoded localhost:3142 wrong, and in
+  // unix-socket mode there is no localhost URL at all (#544).
+  const target = resolveDashboardTarget();
+  const dashboard = describeDashboard(target);
+  // Branching on the REASON, not on openUrl being null: a config the daemon
+  // refuses also has no URL, and telling that user about a unix-socket proxy
+  // they do not have sends them somewhere there is nothing to find (#550).
+  const setupHint = dashboard.reason === 'url'
+    ? `finish setup at ${dashboard.openUrl}`
+    : dashboard.reason === 'invalid-config'
+      ? `fix your config first (${dashboard.problem}), then finish setup in the dashboard`
+      : 'finish setup through the proxy in front of daemon.listen';
 
   // ── Check 1: Bun Version ──────────────────────────────────────────
 
@@ -53,7 +68,7 @@ export async function runDoctor(): Promise<void> {
   if (existsSync(JARVIS_DIR)) {
     results.push({ name: 'Data Directory', status: 'ok', message: JARVIS_DIR });
   } else {
-    results.push({ name: 'Data Directory', status: 'warn', message: `${JARVIS_DIR} not found. Run: jarvis start (then finish setup at http://localhost:3142)` });
+    results.push({ name: 'Data Directory', status: 'warn', message: `${JARVIS_DIR} not found. Run: jarvis start (then ${setupHint})` });
   }
 
   // ── Check 3: Config File ──────────────────────────────────────────
@@ -69,7 +84,7 @@ export async function runDoctor(): Promise<void> {
       results.push({ name: 'Config File', status: 'fail', message: `Invalid YAML: ${err}` });
     }
   } else {
-    results.push({ name: 'Config File', status: 'fail', message: 'Not found. Run: jarvis start (then finish setup at http://localhost:3142)' });
+    results.push({ name: 'Config File', status: 'fail', message: `Not found. Run: jarvis start (then ${setupHint})` });
   }
 
   // ── Check 4: LLM API Key ─────────────────────────────────────────
@@ -85,7 +100,7 @@ export async function runDoctor(): Promise<void> {
     const { mergeLLMSettingsIntoConfig } = await import('../daemon/llm-settings.ts');
     llmConfig = await loadConfig();
     initDatabase(llmConfig.daemon.db_path);
-    mergeLLMSettingsIntoConfig(llmConfig);
+    mergeLLMSettingsIntoConfig(llmConfig, { persistMigrations: false });
     llmProviderNames = Object.keys(llmConfig.llm.providers ?? {});
   } catch (err) {
     results.push({ name: 'LLM Provider', status: 'fail', message: `Could not load LLM settings: ${String(err).slice(0, 80)}` });
@@ -93,9 +108,15 @@ export async function runDoctor(): Promise<void> {
 
   if (llmConfig) {
     if (llmProviderNames.length === 0) {
-      results.push({ name: 'LLM Provider', status: 'fail', message: 'No providers configured. Add one in Settings > LLM (http://localhost:3142).' });
+      results.push({ name: 'LLM Provider', status: 'fail', message: `No providers configured. Add one in Settings > LLM (${dashboard.label}).` });
     } else {
-      const tiers = llmConfig.llm.tiers ?? {};
+      // The ROUTING view, not the persisted one: on a hosted install the
+      // uj-* tier defaults live only in the binding view (they are
+      // deliberately never written to config.llm, so silence stays silent).
+      // Reading config.llm.tiers directly would report "no model assigned"
+      // for an install that routes perfectly well.
+      const { effectiveLlmForBinding } = await import('../daemon/usejarvis-ai.ts');
+      const tiers = effectiveLlmForBinding(llmConfig).tiers ?? {};
       const tierSummary = Object.entries(tiers).map(([t, v]) => `${t}=${v}`).join(', ');
       const mode = tierSummary ? `tiers: ${tierSummary}` : (llmConfig.llm.default ? `default: ${llmConfig.llm.default}` : 'no model assigned');
       results.push({ name: 'LLM Provider', status: 'ok', message: `${llmProviderNames.length} provider(s): ${llmProviderNames.join(', ')} (${mode})` });
@@ -109,9 +130,11 @@ export async function runDoctor(): Promise<void> {
     try {
       const { LLMManager } = await import('../llm/index.ts');
       const { registerLLMProviders, configureLLMTiers } = await import('../llm/config-binding.ts');
+      const { effectiveLlmForBinding } = await import('../daemon/usejarvis-ai.ts');
       const manager = new LLMManager();
       registerLLMProviders(manager, llmConfig.llm.providers ?? {});
-      configureLLMTiers(manager, llmConfig.llm);
+      // Same routing view the daemon binds — see Check 4.
+      configureLLMTiers(manager, effectiveLlmForBinding(llmConfig));
       // manager.chat() routes through the medium tier (with fall-up) when a
       // tier/default is configured, else the first registered provider.
       const resp = await manager.chat(
@@ -149,13 +172,19 @@ export async function runDoctor(): Promise<void> {
 
   // ── Check 7: Port Availability ────────────────────────────────────
 
-  const port = config?.daemon?.port ?? 3142;
-  try {
-    const server = Bun.serve({ port, fetch: () => new Response('') });
-    server.stop(true);
-    results.push({ name: 'Port', status: 'ok', message: `${port} is available` });
-  } catch {
-    results.push({ name: 'Port', status: 'warn', message: `${port} is in use (daemon may already be running)` });
+  // `target`, resolved once at the top: the port the daemon would bind, in the
+  // same precedence it uses -- not `daemon.port` alone, which misses JARVIS_PORT
+  // and reports on a port nothing will listen on.
+  if (target.port === null) {
+    results.push({ name: 'Port', status: 'skip', message: 'unix-socket mode (daemon.listen): no TCP port to check' });
+  } else {
+    try {
+      const server = Bun.serve({ port: target.port, fetch: () => new Response('') });
+      server.stop(true);
+      results.push({ name: 'Port', status: 'ok', message: `${target.port} is available` });
+    } catch {
+      results.push({ name: 'Port', status: 'warn', message: `${target.port} is in use (daemon may already be running)` });
+    }
   }
 
   // ── Check 8: SQLite ───────────────────────────────────────────────
@@ -180,9 +209,15 @@ export async function runDoctor(): Promise<void> {
 
   if (config?.stt?.provider) {
     const sttProv = config.stt.provider;
+    const { hasUsejarvisAi } = await import('../daemon/usejarvis-ai.ts');
     const hasKey = sttProv === 'ollama' || sttProv === 'local'
       || (sttProv === 'openai' && config.stt.openai?.api_key)
-      || (sttProv === 'groq' && config.stt.groq?.api_key);
+      || (sttProv === 'groq' && config.stt.groq?.api_key)
+      || (sttProv === 'sarvam' && config.stt.sarvam?.api_key)
+      // Hosted STT rides the system-owned usejarvis_ai credentials, not a
+      // cfg.stt key — "API key missing" here was a false alarm on every
+      // working hosted install.
+      || (sttProv === 'usejarvis' && hasUsejarvisAi(config));
     results.push({
       name: 'STT',
       status: hasKey ? 'ok' : 'warn',
@@ -232,7 +267,7 @@ export async function runDoctor(): Promise<void> {
   console.log(`  ${c.green(`${okCount} passed`)}  ${c.yellow(`${warnCount} warnings`)}  ${c.red(`${failCount} failed`)}`);
 
   if (failCount > 0) {
-    console.log(c.red('\nSome checks failed. Run "jarvis start" and finish setup at http://localhost:3142 to fix configuration.\n'));
+    console.log(c.red(`\nSome checks failed. Run "jarvis start" and ${setupHint} to fix configuration.\n`));
   } else if (warnCount > 0) {
     console.log(c.yellow('\nAll critical checks passed, but some optional features need setup.\n'));
   } else {

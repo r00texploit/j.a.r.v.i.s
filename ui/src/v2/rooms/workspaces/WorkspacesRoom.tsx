@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { confirmDialog } from "../../ui/ConfirmDialog";
 import {
   ArrowLeft,
   Box,
@@ -33,14 +34,72 @@ import { SiteTopBar } from "../../../components/sites/SiteTopBar";
 import { SiteLeftPanel } from "../../../components/sites/SiteLeftPanel";
 import { SiteRightPanel } from "../../../components/sites/SiteRightPanel";
 import { SiteNewProjectModal } from "../../../components/sites/SiteNewProjectModal";
+import { StatusChip, type Tone } from "../../ui/roomkit";
 import "./WorkspacesRoom.css";
 
-const STATUS_TONE: Record<ProjectStatus, "ok" | "neutral" | "warn" | "accent"> = {
-  stopped: "neutral",
-  starting: "warn",
+// Status remap (workspaces §01): starting → blue (in-motion), not amber
+// (amber is reserved for "needs you"); stopped neutral, running green, error red.
+const STATUS_TONE: Record<ProjectStatus, Tone> = {
+  stopped: "mut",
+  starting: "run",
   running: "ok",
-  error: "accent",
+  error: "fail",
 };
+
+type GitIssue = Project["gitConfigIssue"];
+
+/**
+ * The daemon refuses to run git in a project whose own git config holds a
+ * setting it does not allow (#523). On a card, a chip whose tooltip (and
+ * screen-reader text) is the reason; the project header shows it in full.
+ */
+function GitConfigIssue({ issue }: { issue?: GitIssue }) {
+  if (!issue) return null;
+  return (
+    <span className="v2-ws__git-issue" title={issue.message}>
+      <StatusChip tone="fail">Git off</StatusChip>
+      <span className="v2-sr-only">{issue.message}</span>
+    </span>
+  );
+}
+
+/**
+ * The same, in full, below the project header: the reason as visible text
+ * and the fix as a selectable command with a copy button, so it is reachable
+ * by keyboard and touch, not only by hovering.
+ */
+function GitConfigIssuePanel({ issue }: { issue?: GitIssue }) {
+  const [copied, setCopied] = useState<"idle" | "ok" | "fail">("idle");
+  if (!issue) return null;
+  // Only the commands go on the clipboard, one per line, so a paste into a
+  // shell runs exactly them.
+  const script = issue.commands.join("\n");
+  const copy = () => {
+    // navigator.clipboard is undefined outside secure contexts (plain-HTTP
+    // LAN dashboards); the commands stay selectable either way.
+    if (!navigator.clipboard) {
+      setCopied("fail");
+      return;
+    }
+    navigator.clipboard.writeText(script).then(() => setCopied("ok"), () => setCopied("fail"));
+  };
+  return (
+    <div className="v2-ws__git-issue-panel" role="status">
+      <StatusChip tone="fail">Git off</StatusChip>
+      <p className="v2-ws__git-issue-text">{issue.message}</p>
+      {issue.commands.length > 0 && (
+        <div className="v2-ws__git-issue-fix">
+          <span className="v2-ws__git-issue-text">To fix it, run this in the project directory:</span>
+          <code className="v2-ws__git-issue-cmd">{script}</code>
+          <button type="button" className="v2-ws__git-issue-copy" onClick={copy}>
+            {copied === "ok" ? "Copied" : copied === "fail" ? "Select to copy" : "Copy"}
+          </button>
+        </div>
+      )}
+      {issue.note && <p className="v2-ws__git-issue-text">{issue.note}</p>}
+    </div>
+  );
+}
 
 const STATUS_LABEL: Record<ProjectStatus, string> = {
   stopped: "Stopped",
@@ -254,9 +313,8 @@ export function WorkspacesRoomBody({ mode }: { mode: RoomBodyMode }) {
           </button>
           <div className="v2-ws__detail-title">
             <span className="v2-ws__project-name">{activeProject.name}</span>
-            <Chip tone={STATUS_TONE[activeProject.status]} dot>
-              {STATUS_LABEL[activeProject.status]}
-            </Chip>
+            <StatusChip tone={STATUS_TONE[activeProject.status]} dot>
+              {STATUS_LABEL[activeProject.status]}</StatusChip>
             {activeProject.gitBranch && (
               <span className="v2-ws__branch">
                 <Icon icon={GitBranch} size="sm" />
@@ -269,6 +327,7 @@ export function WorkspacesRoomBody({ mode }: { mode: RoomBodyMode }) {
             )}
           </div>
         </div>
+        <GitConfigIssuePanel key={activeProject.id} issue={activeProject.gitConfigIssue} />
         <div className="v2-ws__detail-ide">
           <SiteTopBar
             openTabs={openTabs}
@@ -405,7 +464,7 @@ export function WorkspacesRoomBody({ mode }: { mode: RoomBodyMode }) {
                   setToast({ text: r.message, tone: r.ok ? "ok" : "warn" });
                 }}
                 onDelete={async () => {
-                  if (!confirm(`Delete "${p.name}"? Cannot be undone.`)) return;
+                  if (!await confirmDialog(`Delete "${p.name}"? Cannot be undone.`)) return;
                   const r = await data.deleteProject(p.id);
                   setToast({ text: r.message, tone: r.ok ? "ok" : "warn" });
                 }}
@@ -495,9 +554,8 @@ function ProjectCard({
           </button>
           <div className="v2-ws__card-meta">
             <span className="v2-ws__framework">{project.framework}</span>
-            <Chip tone={STATUS_TONE[project.status]} dot>
-              {STATUS_LABEL[project.status]}
-            </Chip>
+            <StatusChip tone={STATUS_TONE[project.status]} dot>
+              {STATUS_LABEL[project.status]}</StatusChip>
           </div>
         </div>
       </div>
@@ -513,6 +571,7 @@ function ProjectCard({
         {project.devPort && isRunning && (
           <span className="v2-ws__card-port">localhost:{project.devPort}</span>
         )}
+        <GitConfigIssue issue={project.gitConfigIssue} />
         {project.githubUrl && (
           <a
             className="v2-ws__card-github"

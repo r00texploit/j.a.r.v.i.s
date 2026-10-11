@@ -15,6 +15,10 @@
  */
 
 import { json, err, parseJsonObject, type RouteContext, type RouteHandler } from "./shared";
+import { cancellableWorkflowService } from "../../runtime/cancellation";
+import { CODE_STEPS_REFUSAL_CODE } from "../../db/repos/flow-code-steps";
+import { workflowEffectContext } from './effect-context';
+import type { WorkflowEffectContext, WorkflowApprovalPending } from '../../runtime/effect-context';
 
 export interface WorkflowsStartRequest {
   flowId: string;
@@ -22,7 +26,8 @@ export interface WorkflowsStartRequest {
 }
 
 export interface WorkflowsStartResponse {
-  runId: string;
+  runId: string | null;
+  approval?: WorkflowApprovalPending;
 }
 
 /**
@@ -41,7 +46,7 @@ export interface WorkflowsStartResponse {
  */
 export type WorkflowsStartFn = (
   req: WorkflowsStartRequest,
-  ctx: { runId: string; projectId: string },
+  ctx: WorkflowEffectContext,
 ) => Promise<WorkflowsStartResponse>;
 
 export interface JarvisWorkflowsRouteDeps {
@@ -68,10 +73,7 @@ export function createJarvisWorkflowsStartRoute(
       out.payload = raw.payload as Record<string, unknown>;
     }
     try {
-      const reply = await deps.workflowsStart(out, {
-        runId: ctx.claims.runId,
-        projectId: ctx.claims.projectId,
-      });
+      const reply = await cancellableWorkflowService(deps.workflowsStart)(out, workflowEffectContext(ctx));
       return json(reply);
     } catch (e) {
       // Typed errors from JarvisWorkflowRunnerAdapter carry a `code`
@@ -85,8 +87,13 @@ export function createJarvisWorkflowsStartRoute(
         const message = e instanceof Error ? e.message : String(e);
         if (code === "FLOW_NOT_FOUND") return err(message, 404);
         if (code === "SELF_RECURSION") return err(message, 409);
+        if (code === "WORKFLOW_NOT_READY") return err(message, 422);
         if (code === "VERSION_MISSING") return err(message, 422);
         if (code === "MISSING_REF") return err(message, 400);
+        // The per-flow CODE opt-in is missing on the target flow. A permission
+        // answer, so 403 rather than the generic 500 -- the piece surfaces the
+        // message, which names the flow and the grant it needs.
+        if (code === CODE_STEPS_REFUSAL_CODE) return err(message, 403);
       }
       throw e;
     }

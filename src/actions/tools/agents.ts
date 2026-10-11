@@ -96,6 +96,11 @@ export async function assignPersistentAgentTask(
   if (deps.taskManager.isAgentBusy(agentId)) {
     throw new HttpError(409, `Agent "${agent.agent.role.name}" is already running a task.`);
   }
+  // The manager enforces the same cap; asking first gives the caller a
+  // sentence instead of a stack trace from inside launch().
+  if (!deps.taskManager.canLaunch()) {
+    throw new HttpError(429, 'Too many agent tasks are already running. Wait for one to finish, then assign this one.');
+  }
 
   const scopedRegistry = agentRegistries.get(agentId);
   if (!scopedRegistry) {
@@ -109,6 +114,8 @@ export async function assignPersistentAgentTask(
     data: `[Assigning task to ${agent.agent.role.name}...]`,
   });
 
+  // Same authority engine and effective profile as the parent (see
+  // delegate.ts): a background sub-agent is not a way around the gate.
   const taskId = deps.taskManager.launch({
     agent,
     task,
@@ -117,6 +124,15 @@ export async function assignPersistentAgentTask(
     toolRegistry: scopedRegistry,
     onProgress: deps.onProgress,
     onComplete: deps.onTaskComplete,
+    toolFilterProviders: deps.orchestrator.getToolFilterProviders?.(),
+    authority: {
+      authorityEngine: deps.orchestrator.getAuthorityEngine() ?? undefined,
+      auditTrail: deps.orchestrator.getAuditTrail() ?? undefined,
+      emergencyController: deps.orchestrator.getEmergencyController() ?? undefined,
+      temporaryGrants: deps.orchestrator.getTemporaryGrants(),
+      profile: deps.orchestrator.getEffectiveProfile(),
+      taintGating: deps.orchestrator.getTaintGating(),
+    },
   });
 
   console.log(`[ManageAgents] Assigned task ${taskId} to ${agent.agent.role.name}`);

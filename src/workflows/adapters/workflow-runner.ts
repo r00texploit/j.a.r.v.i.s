@@ -21,11 +21,15 @@ import type {
   PieceWorkflowStartInput,
   PieceWorkflowStartResult,
 } from "../jarvis-pieces/types";
-import { getFlow } from "../db/repos/flow";
+import { DEFAULT_IDS } from "../db";
+import { getFlowInProject } from "../db/repos/flow";
 import { getFlowVersion, getLatestDraft } from "../db/repos/flow-version";
 import { createFlowRun, getFlowRun } from "../db/repos/flow-run";
 import { enqueue } from "../db/repos/job-queue";
 import { RUN_FLOW } from "../runner/handler";
+import { assertRunNotCanceled } from "../runtime/cancellation";
+import { assertVersionReady } from '../db/repos/flow-readiness';
+import { assertCodeStepsAllowed } from "../db/repos/flow-code-steps";
 
 /**
  * Upper bound on how far up the parent-run chain we walk when checking
@@ -61,11 +65,29 @@ export class JarvisWorkflowRunnerAdapter implements PieceWorkflowRunner {
   async start(
     input: PieceWorkflowStartInput,
     callerRunId?: string,
+    /**
+     * The caller's project. The target is found in that project only, and a
+     * flow in another one answers exactly as a missing one does. The workflow
+     * backend always passes it; see `childVersion` there.
+     *
+     * Optional in the SIGNATURE but never unscoped in EFFECT: an absent value
+     * means `DEFAULT_IDS.project`, the same answer `callerProjectId` gives in
+     * api/routes.ts and manage-workflow.ts, and never an unscoped `getFlow`.
+     * That distinction is the whole point of #843's review finding -- this
+     * method starts the target under the TARGET's project token, so an
+     * unscoped lookup here lets a flow in one project drive another project's
+     * flow with that project's store and connections. An omitted argument must
+     * therefore narrow the search, not widen it. #762 is the precedent: there a
+     * missing expectation made a per-spawn digest check SKIP rather than fail,
+     * which is the same shape of fail-open.
+     */
+    callerProjectId?: string,
   ): Promise<PieceWorkflowStartResult> {
+    if (callerRunId) assertRunNotCanceled(callerRunId);
     if (!input.flowId) {
       throw new WorkflowRunnerError("MISSING_REF", "flowId is required");
     }
-    const flow = getFlow(input.flowId);
+    const flow = getFlowInProject(callerProjectId ?? DEFAULT_IDS.project, input.flowId);
     if (!flow) {
       throw new WorkflowRunnerError("FLOW_NOT_FOUND", `flow not found: ${input.flowId}`);
     }
@@ -107,6 +129,13 @@ export class JarvisWorkflowRunnerAdapter implements PieceWorkflowRunner {
     if (!getFlowVersion(versionId)) {
       throw new WorkflowRunnerError("VERSION_MISSING", `flow version ${versionId} missing`);
     }
+    // A nested `run_workflow` step is a third way to reach a version without
+    // publishing it -- the target resolves to `published ?? latest draft` just
+    // like the direct-run routes -- so the CODE gate applies here too. It can
+    // only ever refuse an unpublished draft: publish already requires the
+    // grant, so a published child flow carries it and keeps running.
+    assertCodeStepsAllowed(flow.id, versionId, "run");
+    assertVersionReady(flow.id, versionId);
     const run = createFlowRun({
       flowId: flow.id,
       flowVersionId: versionId,

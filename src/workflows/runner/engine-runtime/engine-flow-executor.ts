@@ -20,11 +20,12 @@ import type {
   FlowExecutorResult,
 } from "../handler";
 import { FlowExecutionError } from "../handler";
-import { getFlowRun, type FlowRunStatus } from "../../db/repos/flow-run";
+import { ensureRunExecutionConfig, getFlowRun, type FlowRunStatus } from "../../db/repos/flow-run";
 import type { FlowTriggerNode } from "../../db/repos/flow-version";
 import { DEFAULT_IDS } from "../../db/schema";
-import type { EngineRuntime } from "./engine-runtime";
+import type { EngineHandle, EngineRuntime } from "./engine-runtime";
 import { loadExecutionStateFromLog } from "./execution-state-loader";
+import { abortable } from "../../runtime/cancellation";
 
 /**
  * Statuses where the engine is finished writing the run row and we can
@@ -53,6 +54,14 @@ const NON_SUCCESS_STATUSES = new Set<FlowRunStatus>([
   "MEMORY_LIMIT_EXCEEDED",
   "SCHEDULE_FAILURE",
 ]);
+
+/**
+ * Engine-acquire attempts per run, and the pause between them. Three tries
+ * about a second apart rides out a spawn that lost a race with a loaded host
+ * without keeping a queue worker busy for long when the engine is really down.
+ */
+const ACQUIRE_ATTEMPTS = 3;
+const ACQUIRE_RETRY_DELAY_MS = 1_000;
 
 /**
  * How long the executor waits for the engine's `uploadRunLog` to flip the
@@ -114,12 +123,62 @@ export class EngineFlowExecutor implements FlowExecutor {
     this.loaderBaseDir = opts.loaderBaseDir;
   }
 
-  async execute(ctx: FlowExecutorContext): Promise<FlowExecutorResult> {
-    const handle = await this.runtime.acquire({
+  /**
+   * Acquire an engine, retrying a couple of times on failure.
+   *
+   * Getting an engine is side-effect free -- no step has run, nothing has been
+   * sent anywhere -- so unlike a mid-flow failure this is safe to retry, and
+   * the failures worth retrying (handshake timeout on a loaded host, engine
+   * killed mid-spawn) are exactly the transient kind. The alternative is what
+   * the user sees today: a run marked FAILED with no per-step trace because
+   * the engine never came up.
+   *
+   * Deliberately short and bounded: RUN_FLOW jobs are queued, so a genuinely
+   * dead engine should fail the job quickly rather than tie up a worker slot.
+   */
+  private async acquireWithRetry(ctx: FlowExecutorContext): Promise<EngineHandle> {
+    const opts = {
       runId: ctx.run.id,
       projectId: ctx.run.projectId ?? DEFAULT_IDS.project,
-    });
+    };
+    let lastError: unknown;
+    for (let attempt = 0; attempt < ACQUIRE_ATTEMPTS; attempt++) {
+      ctx.signal?.throwIfAborted();
+      let acquired: EngineHandle | undefined;
+      try {
+        // A spawn may finish after cancellation. Destroy that handle without
+        // ever sending EXECUTE_FLOW, even if this worker already moved on.
+        const acquiring = this.runtime.acquire(opts).then(async handle => {
+          acquired = handle;
+          if (ctx.signal?.aborted) {
+            await handle.killAndTerminate();
+            ctx.signal.throwIfAborted();
+          }
+          return handle;
+        });
+        return await abortable(acquiring, ctx.signal);
+      } catch (e) {
+        if (ctx.signal?.aborted && acquired) await acquired.killAndTerminate();
+        ctx.signal?.throwIfAborted();
+        lastError = e;
+        if (attempt === ACQUIRE_ATTEMPTS - 1) break;
+        console.warn(
+          `[engine-executor] run ${ctx.run.id}: engine acquire failed ` +
+            `(attempt ${attempt + 1}/${ACQUIRE_ATTEMPTS}): ${(e as Error).message}`,
+        );
+        await abortable(new Promise((r) => setTimeout(r, ACQUIRE_RETRY_DELAY_MS)), ctx.signal);
+      }
+    }
+    throw lastError;
+  }
+
+  async execute(ctx: FlowExecutorContext): Promise<FlowExecutorResult> {
+    const executionType = ctx.job.payload.executionType ?? "BEGIN";
+    const executionConfig = ensureRunExecutionConfig(ctx.run.id,
+      executionType === 'BEGIN' ? ctx.job.payload : undefined);
+    const handle = await this.acquireWithRetry(ctx);
     try {
+      ctx.signal?.throwIfAborted();
       // streamStepProgress: WEBSOCKET makes the engine emit per-step
       // `updateRunProgress({ step })` calls to the daemon -- the
       // worker-handler accumulates each step's output onto `flow_run.steps`
@@ -144,7 +203,7 @@ export class EngineFlowExecutor implements FlowExecutor {
           ? "NONE"
           : "WEBSOCKET";
       // Apply per-step sample input overrides BEFORE building flowOpts.
-      // The override lives on the job payload (see route enqueue) and
+      // The override is frozen on the run before BEGIN and
       // replaces the named step's `settings.input` for this run only.
       // Tests-from-here use this to exercise a step with curated
       // parameters without rewriting the production-bound input. We
@@ -152,7 +211,7 @@ export class EngineFlowExecutor implements FlowExecutor {
       // and other concurrent reads (catalog UI, list endpoint) aren't
       // observed mutating.
       let flowVersionForEngine = ctx.version;
-      const overrides = ctx.job.payload.sampleInputOverride;
+      const overrides = executionConfig.sampleInputOverride;
       if (overrides && Object.keys(overrides).length > 0) {
         flowVersionForEngine = {
           ...ctx.version,
@@ -164,7 +223,11 @@ export class EngineFlowExecutor implements FlowExecutor {
         runEnvironment: env,
         streamStepProgress,
       };
-      const executionType = ctx.job.payload.executionType ?? "BEGIN";
+      // A resumed preview is still exactly one step, with its original sample outputs.
+      if (executionConfig.stepNameToTest) {
+        flowOpts.stepNameToTest = executionConfig.stepNameToTest;
+        if (executionConfig.sampleData) flowOpts.sampleData = executionConfig.sampleData;
+      }
       if (executionType === "RESUME") {
         // Resume a paused run: engine picks up at the waitpointed step,
         // delivers `resumePayload` to it, and resumes walking the chain.
@@ -181,30 +244,21 @@ export class EngineFlowExecutor implements FlowExecutor {
       } else {
         flowOpts.triggerPayload = ctx.payload;
         flowOpts.executeTrigger = ctx.job.payload.executeTrigger ?? false;
-        // Per-step preview: when stepNameToTest is set, engine runs only that
-        // step + records its output. The run still terminates SUCCEEDED on
-        // success; the dashboard reads `flow_run.steps[stepNameToTest]` for
-        // the result.
-        if (ctx.job.payload.stepNameToTest) {
-          flowOpts.stepNameToTest = ctx.job.payload.stepNameToTest;
-          // sampleData is meaningful only when stepNameToTest is set --
-          // production runs walk the real chain and ignore it. Forward
-          // when the route supplied one (the version's persisted map).
-          if (ctx.job.payload.sampleData) {
-            flowOpts.sampleData = ctx.job.payload.sampleData;
-          }
-        }
       }
-      await handle.executeFlow(flowOpts);
+      ctx.signal?.throwIfAborted();
+      await abortable(handle.executeFlow(flowOpts), ctx.signal);
     } finally {
-      await handle.release();
+      // A canceled engine must never re-enter the warm pool, including when
+      // its RPC happened to finish at the same time as cancellation.
+      if (ctx.signal?.aborted) await handle.killAndTerminate();
+      else await handle.release();
     }
 
     // Wait for the engine's `uploadRunLog` to settle. `executeOperation` and
     // `uploadRunLog` are independent socket.io messages; the run row may
     // still be RUNNING / QUEUED for a brief window after `executeFlow`
     // resolves. Poll briefly for a terminal status.
-    const persisted = await this.waitForTerminalStatus(ctx.run.id);
+    const persisted = await abortable(this.waitForTerminalStatus(ctx.run.id, ctx.signal), ctx.signal);
 
     const stepsRecord = (persisted.steps ?? {}) as Record<string, unknown>;
     const stepsCount =
@@ -226,7 +280,7 @@ export class EngineFlowExecutor implements FlowExecutor {
       );
     }
 
-    return { steps: stepsRecord, stepsCount };
+    return { status: persisted.status === "PAUSED" ? "PAUSED" : "SUCCEEDED", steps: stepsRecord, stepsCount };
   }
 
   /**
@@ -252,10 +306,12 @@ export class EngineFlowExecutor implements FlowExecutor {
 
   private async waitForTerminalStatus(
     runId: string,
+    signal?: AbortSignal,
   ): Promise<NonNullable<ReturnType<typeof getFlowRun>>> {
     const deadline = Date.now() + this.terminalTimeoutMs;
     let lastSeenStatus: FlowRunStatus | null = null;
     while (Date.now() < deadline) {
+      signal?.throwIfAborted();
       const persisted = getFlowRun(runId);
       if (!persisted) {
         throw new Error(`flow_run ${runId} disappeared after engine executeFlow`);

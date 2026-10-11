@@ -15,6 +15,7 @@
  */
 
 import React, { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { confirmDialog } from "../../ui/ConfirmDialog";
 import { createPortal } from "react-dom";
 import {
   ReactFlow,
@@ -51,7 +52,9 @@ import { useLibrary, type LibraryEntry as InstallableLibraryEntry } from "./useL
 import type { ConnectionMeta } from "./useConnections";
 import { useFlowRuns } from "./useFlowRuns";
 import type { FlowRun, FlowRunStatus } from "./useWorkflowsData";
+import { CANCELED_EFFECT_WARNING } from "./useWorkflowsData";
 import "./WorkflowEditor.css";
+import { modKey } from "../../ui/platform";
 
 // Horizontal flow layout. Each step in the flattened chain advances the
 // cursor rightward by NODE_X_STEP; nested branches (loop body / router
@@ -218,14 +221,14 @@ export function WorkflowEditor({ flowId, onClose }: WorkflowEditorProps): React.
   // stray keystroke doesn't lose work.
   const editorDirty = editor.dirty;
   useEffect(() => {
-    const onKey = (e: KeyboardEvent): void => {
+    const onKey = async (e: KeyboardEvent): Promise<void> => {
       if (e.key !== "Escape") return;
       // Don't hijack Esc when the user is typing in an input/textarea/select
       // -- React Flow listens too, and form fields commonly use Esc to revert.
       const target = e.target as HTMLElement | null;
       const tag = target?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
-      if (editorDirty && !window.confirm("Discard unsaved changes?")) return;
+      if (editorDirty && !await confirmDialog("Discard unsaved changes?")) return;
       onClose();
     };
     window.addEventListener("keydown", onKey);
@@ -261,7 +264,7 @@ export function WorkflowEditor({ flowId, onClose }: WorkflowEditorProps): React.
         .map((g) => `  - ${g.stepDisplayName}: ${g.fieldLabel}`)
         .join("\n");
       const more = editor.validationGaps.length > 6 ? `\n  ...and ${editor.validationGaps.length - 6} more` : "";
-      const proceed = window.confirm(
+      const proceed = await confirmDialog(
         `${editor.validationGaps.length} required field${editor.validationGaps.length === 1 ? "" : "s"} empty:\n\n${summary}${more}\n\nSave anyway? Runs will fail at the missing step.`,
       );
       if (!proceed) return;
@@ -586,7 +589,7 @@ export function WorkflowEditor({ flowId, onClose }: WorkflowEditorProps): React.
   const handleRun = useCallback(async (): Promise<void> => {
     if (!flowId) return;
     if (editor.dirty) {
-      const proceed = window.confirm(
+      const proceed = await confirmDialog(
         "You have unsaved changes. Running will use the last SAVED version, not your current edits. Continue?",
       );
       if (!proceed) return;
@@ -676,7 +679,7 @@ export function WorkflowEditor({ flowId, onClose }: WorkflowEditorProps): React.
             disabled={!editor.canUndo}
             title={
               editor.canUndo
-                ? `Undo: ${editor.undoLabel ?? "last destructive change"} (Ctrl+Z)`
+                ? `Undo: ${editor.undoLabel ?? "last destructive change"} (${modKey("Z")})`
                 : "Nothing to undo"
             }
           >
@@ -899,6 +902,7 @@ export function WorkflowEditor({ flowId, onClose }: WorkflowEditorProps): React.
           anchor={libraryPicker.screen}
           catalog={editor.catalog}
           library={library.entries}
+          managed={library.managed}
           installingId={pendingInstall?.id ?? null}
           onPick={onPickFromLibrary}
           onClose={closeLibraryPicker}
@@ -1008,8 +1012,8 @@ export function WorkflowEditor({ flowId, onClose }: WorkflowEditorProps): React.
               const created = editor.insertStepAfter(selectedStep.name);
               if (created) setSelectedStepName(created);
             }}
-            onDelete={() => {
-              if (window.confirm(`Delete step "${selectedStep.displayName ?? selectedStep.name}"?`)) {
+            onDelete={async () => {
+              if (await confirmDialog(`Delete step "${selectedStep.displayName ?? selectedStep.name}"?`)) {
                 editor.deleteStep(selectedStep.name);
                 closePopover();
               }
@@ -2348,6 +2352,7 @@ function PieceLibraryPopover({
   anchor,
   catalog,
   library,
+  managed,
   installingId,
   onPick,
   onClose,
@@ -2362,6 +2367,15 @@ function PieceLibraryPopover({
    * safe fallback when the library endpoint is still loading.
    */
   library: InstallableLibraryEntry[];
+  /**
+   * True when a host owns the catalog. Suppresses the "installable" layer
+   * entirely: the whole catalog is already in the shared tree, so every piece
+   * that has usable metadata is already in `catalog` above WITH its actions,
+   * which is strictly more useful than a piece-level Install row. A leftover
+   * row here could only be a piece whose extraction failed on the host, and
+   * picking it would POST to an install route that answers 403.
+   */
+  managed: boolean;
   /**
    * Id of the piece currently being installed via this popover, or null
    * when no install is in flight. The row matching this id renders as a
@@ -2382,6 +2396,7 @@ function PieceLibraryPopover({
   //   1. Control-flow built-ins (top -- always-available, always visible)
   //   2. Installed pieces' actions (one row per action)
   //   3. Uninstalled curated pieces (one row per piece, "Install" chip)
+  //      -- self-managed only; see the `managed` prop.
   //
   // Installed pieces are matched against the library catalog by piece name
   // (`@activepieces/piece-<id>` vs the engine's piece.name). Any installed
@@ -2396,15 +2411,17 @@ function PieceLibraryPopover({
       }
     }
     const uninstalledEntries: LibraryEntry[] = [];
-    for (const lib of library) {
-      // Library ids are bare ("gmail"); the engine's piece.name is the
-      // full npm spec ("@activepieces/piece-gmail"). Match on the latter.
-      if (installedNames.has(lib.npmPackage)) continue;
-      if (lib.installed) continue; // belt + suspenders -- the library hook also tracks this
-      uninstalledEntries.push({ kind: "piece-uninstalled", catalogEntry: lib });
+    if (!managed) {
+      for (const lib of library) {
+        // Library ids are bare ("gmail"); the engine's piece.name is the
+        // full npm spec ("@activepieces/piece-gmail"). Match on the latter.
+        if (installedNames.has(lib.npmPackage)) continue;
+        if (lib.installed) continue; // belt + suspenders -- the library hook also tracks this
+        uninstalledEntries.push({ kind: "piece-uninstalled", catalogEntry: lib });
+      }
     }
     return [...CONTROL_FLOW_ENTRIES, ...pieceEntries, ...uninstalledEntries];
-  }, [catalog, library]);
+  }, [catalog, library, managed]);
 
   // Apply the category filter and search query. Same lowercased q is
   // reused across every entry so we don't pay for the per-iteration call.
@@ -3699,7 +3716,7 @@ function SampleInputSection({
   };
 
   const handleClear = async (): Promise<void> => {
-    if (!window.confirm("Clear this step's sample input override?")) return;
+    if (!await confirmDialog("Clear this step's sample input override?")) return;
     setBusy("clear");
     try {
       const r = await onSetSampleInput(null);
@@ -3847,7 +3864,7 @@ function SampleDataSection({
   };
 
   const handleClear = async (): Promise<void> => {
-    if (!window.confirm("Clear this step's sample data?")) return;
+    if (!await confirmDialog("Clear this step's sample data?")) return;
     setBusy("clear");
     try {
       const r = await onSetSampleData(null);
@@ -5019,8 +5036,8 @@ function RouterEditor({
                       <button
                         type="button"
                         className="wf-props__input-remove"
-                        onClick={() => {
-                          if (window.confirm(`Remove branch "${b?.branchName ?? idx}"?`)) {
+                        onClick={async () => {
+                          if (await confirmDialog(`Remove branch "${b?.branchName ?? idx}"?`)) {
                             onRemoveRouterBranch(idx);
                           }
                         }}
@@ -5609,11 +5626,20 @@ function OverlayBanner({
       </span>
       <span className="wf-editor__overlay-banner-text">
         Viewing run {startedAt} -- <strong>{run.status}</strong>
+        {run.cancellation?.inFlightMayHaveCompleted ? <span className="wf-editor__overlay-banner-reason">{CANCELED_EFFECT_WARNING}</span> : null}
         {run.failedStep ? <> at <code>{run.failedStep.displayName}</code></> : null}
         {!hasOverlayData ? (
           <em className="wf-editor__overlay-banner-note">
             {" "}-- no per-step trace recorded for this run
           </em>
+        ) : null}
+        {/* Without this the only clue to a run that died before any step ran
+            (engine never came up, RPC timeout) is the daemon log. The reason
+            is already persisted on the run -- show it. */}
+        {run.failedStep?.errorMessage ? (
+          <span className="wf-editor__overlay-banner-reason" title={run.failedStep.errorMessage}>
+            {run.failedStep.errorMessage}
+          </span>
         ) : null}
       </span>
       <button

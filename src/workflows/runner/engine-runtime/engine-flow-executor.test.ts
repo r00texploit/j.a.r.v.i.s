@@ -13,12 +13,14 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { closeWorkflowDb, initWorkflowDb } from "../../db/index";
 import { createFlow } from "../../db/repos/flow";
 import { createDraftVersion, lockVersion, type FlowVersion } from "../../db/repos/flow-version";
-import { createFlowRun, updateRun, getFlowRun, type FlowRunStatus } from "../../db/repos/flow-run";
+import { createFlowRun, ensureRunExecutionConfig, updateRun, getFlowRun, type FlowRunStatus } from "../../db/repos/flow-run";
 import { DEFAULT_IDS } from "../../db/schema";
 import { FlowExecutionError } from "../handler";
 import type { Job } from "../../db/repos/job-queue";
 import { EngineFlowExecutor } from "./engine-flow-executor";
 import type { EngineHandle, EngineRuntime } from "./engine-runtime";
+import { watchRunCancellation } from "../../runtime/cancellation";
+import { cancelFlowRun } from "../../db/repos/run-cancellation";
 
 beforeEach(() => initWorkflowDb(":memory:"));
 afterEach(() => closeWorkflowDb());
@@ -86,6 +88,72 @@ function setupRun(): { runId: string; ctx: Parameters<EngineFlowExecutor["execut
 }
 
 describe("EngineFlowExecutor", () => {
+  test("the engine is acquired in the run's flow's project, not the default (#843)", async () => {
+    // The acquire's projectId is what the sandbox engine token is minted with,
+    // and that token scopes store and connection access. It is read off the
+    // run row, which before #843 always said DEFAULT_IDS.project.
+    const other = "proj_other_843";
+    const flow = createFlow({ projectId: other });
+    const v = createDraftVersion({ flowId: flow.id, displayName: "test", trigger: { name: "trigger", type: "EMPTY" } });
+    lockVersion(v.id);
+    const run = createFlowRun({ flowId: flow.id, flowVersionId: v.id, environment: "TESTING" });
+    const acquired: string[] = [];
+    const runtime = { async acquire(args: { runId: string; projectId: string }) {
+      acquired.push(args.projectId);
+      throw new Error("stop after acquire");
+    } } as unknown as EngineRuntime;
+    const ctx = {
+      run: getFlowRun(run.id)!,
+      version: { ...v, trigger: { name: "trigger", type: "EMPTY" } } as FlowVersion,
+      job: { id: "job_x", payload: { runId: run.id } } as unknown as Job<{ runId: string; executeTrigger?: boolean }>,
+      payload: {},
+    };
+    await new EngineFlowExecutor(runtime).execute(ctx).catch(() => undefined);
+    expect(acquired.length).toBeGreaterThan(0);
+    expect(new Set(acquired)).toEqual(new Set([other]));
+  });
+
+  test("cancellation interrupts a pending RPC and destroys rather than releases the handle", async () => {
+    const { runId, ctx } = setupRun();
+    const watch = watchRunCancellation(runId);
+    ctx.signal = watch.signal;
+    let executed!: () => void;
+    const started = new Promise<void>(r => { executed = r; });
+    let killed = 0, released = 0;
+    const runtime = { async acquire() { return {
+      async executeFlow() { executed(); await new Promise(() => {}); },
+      async killAndTerminate() { killed++; }, async release() { released++; },
+    }; } } as unknown as EngineRuntime;
+    try {
+      const result = new EngineFlowExecutor(runtime).execute(ctx);
+      const rejected = result.catch(error => error as Error);
+      await started;
+      cancelFlowRun(runId);
+      expect((await rejected as Error).message).toContain("canceled");
+      expect(killed).toBe(1);
+      expect(released).toBe(0);
+    } finally { watch.dispose(); }
+  });
+
+  test("a handle acquired after cancellation is destroyed without dispatch", async () => {
+    const { runId, ctx } = setupRun();
+    const watch = watchRunCancellation(runId);
+    ctx.signal = watch.signal;
+    let acquire!: (handle: EngineHandle) => void;
+    const pending = new Promise<EngineHandle>(r => { acquire = r; });
+    let calls = 0, killed = 0;
+    const runtime = { acquire: () => pending } as unknown as EngineRuntime;
+    try {
+      const result = new EngineFlowExecutor(runtime).execute(ctx);
+      const rejected = result.catch(error => error as Error);
+      cancelFlowRun(runId);
+      expect((await rejected as Error).message).toContain("canceled");
+      acquire({ async executeFlow() { calls++; }, async killAndTerminate() { killed++; } } as unknown as EngineHandle);
+      await new Promise<void>(r => setImmediate(r));
+      expect(calls).toBe(0);
+      expect(killed).toBe(1);
+    } finally { watch.dispose(); }
+  });
   test("waits for terminal status when uploadRunLog lands AFTER executeFlow resolves", async () => {
     const { runId, ctx } = setupRun();
     const runtime = scriptedRuntime({
@@ -176,10 +244,12 @@ describe("EngineFlowExecutor", () => {
     });
     const result = await exec.execute(ctx);
     expect(result.stepsCount).toBe(0);
+    expect(result).toMatchObject({ status: "PAUSED" });
   });
 
   test("RESUME: passes resumePayload + unwrapped executionState.steps to engine", async () => {
     const { runId, ctx } = setupRun();
+    ensureRunExecutionConfig(runId, {});
     // Seed prior step output in the wrapped envelope shape that
     // worker-handler accumulates into `flow_run.steps`.
     updateRun(runId, {
@@ -265,6 +335,7 @@ describe("EngineFlowExecutor", () => {
     try {
       const { runId, ctx } = setupRun();
       // The DB-side `flow_run.steps` only carries the outer (incomplete) shape.
+      ensureRunExecutionConfig(runId, {});
       // The backup carries the canonical recursive iteration state -- if the
       // executor falls through to flow_run.steps, the LOOP iteration tracker
       // is lost.
@@ -347,6 +418,7 @@ describe("EngineFlowExecutor", () => {
     const loaderBaseDir = mkdtempSync(join(tmpdir(), "jarvis-resume-fallback-"));
     try {
       const { runId, ctx } = setupRun();
+      ensureRunExecutionConfig(runId, {});
       updateRun(runId, {
         status: "PAUSED",
         steps: {
@@ -387,4 +459,51 @@ describe("EngineFlowExecutor", () => {
       rmSync(loaderBaseDir, { recursive: true, force: true });
     }
   });
+});
+
+describe("EngineFlowExecutor: engine acquire", () => {
+  test("a transient acquire failure is retried and the run still executes", async () => {
+    const { runId, ctx } = setupRun();
+    let attempts = 0;
+    const fakeRuntime = {
+      acquire: async () => {
+        attempts++;
+        if (attempts < 3) {
+          throw new Error("EngineRuntime.acquire failed: engine abc did not connect within 30000ms");
+        }
+        return {
+          async executeFlow() {
+            updateRun(runId, { status: "SUCCEEDED" });
+          },
+          async release() {},
+        } as unknown as EngineHandle;
+      },
+    } as unknown as EngineRuntime;
+
+    const exec = new EngineFlowExecutor(fakeRuntime, {
+      terminalTimeoutMs: 2_000,
+      terminalPollIntervalMs: 10,
+    });
+    await exec.execute(ctx);
+    expect(attempts).toBe(3);
+    expect(getFlowRun(runId)?.status).toBe("SUCCEEDED");
+  }, 15_000);
+
+  test("a persistently failing acquire surfaces the engine error", async () => {
+    const { ctx } = setupRun();
+    let attempts = 0;
+    const fakeRuntime = {
+      acquire: async () => {
+        attempts++;
+        throw new Error("EngineRuntime.acquire failed: engine abc did not connect within 30000ms");
+      },
+    } as unknown as EngineRuntime;
+
+    const exec = new EngineFlowExecutor(fakeRuntime, {
+      terminalTimeoutMs: 2_000,
+      terminalPollIntervalMs: 10,
+    });
+    await expect(exec.execute(ctx)).rejects.toThrow("did not connect within 30000ms");
+    expect(attempts).toBe(3);
+  }, 15_000);
 });

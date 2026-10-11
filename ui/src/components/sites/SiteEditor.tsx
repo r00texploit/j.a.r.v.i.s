@@ -86,10 +86,11 @@ export function SiteEditor({ projectId, filePath }: Props) {
     }
   }, []);
 
-  // Keyboard shortcut: Ctrl+S
+  // Keyboard shortcut: Ctrl+S, and ⌘S on a Mac — the handler takes either
+  // modifier and preventDefaults, so the browser's own save dialog never opens.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
         e.preventDefault();
         handleSave();
       }
@@ -195,13 +196,13 @@ export function SiteEditor({ projectId, filePath }: Props) {
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       {/* File header */}
       <div style={headerStyle}>
-        <span style={{ fontSize: "12px", color: "var(--j-text-dim)" }}>
+        <span style={{ fontSize: "12px", color: "var(--ink2)" }}>
           {filePath}
           {isDirty && <span style={{ color: "var(--j-warning)", marginLeft: 4 }}>*</span>}
         </span>
         <div style={{ display: "flex", gap: "6px", marginLeft: "auto", alignItems: "center" }}>
           {message && (
-            <span style={{ fontSize: "11px", color: message.type === "ok" ? "var(--j-success)" : "var(--j-error)" }}>
+            <span style={{ fontSize: "11px", color: message.type === "ok" ? "var(--ok)" : "var(--j-error)" }}>
               {message.text}
             </span>
           )}
@@ -227,7 +228,7 @@ const emptyStyle: React.CSSProperties = {
   alignItems: "center",
   justifyContent: "center",
   height: "100%",
-  color: "var(--j-text-muted)",
+  color: "var(--ink3)",
   fontSize: "12px",
 };
 
@@ -235,8 +236,8 @@ const headerStyle: React.CSSProperties = {
   display: "flex",
   alignItems: "center",
   padding: "6px 12px",
-  borderBottom: "1px solid var(--j-border)",
-  background: "var(--j-bg)",
+  borderBottom: "1px solid var(--rule)",
+  background: "var(--bg)",
 };
 
 const saveBtnStyle: React.CSSProperties = {
@@ -245,6 +246,6 @@ const saveBtnStyle: React.CSSProperties = {
   background: "rgba(0, 212, 255, 0.1)",
   border: "1px solid rgba(0, 212, 255, 0.3)",
   borderRadius: "4px",
-  color: "var(--j-accent)",
+  color: "var(--ink)",
   cursor: "pointer",
 };

@@ -16,6 +16,7 @@ import type { AudioTransport } from '../comms/audio-transport.ts';
 import type { ResolvedRealtimeVoice } from '../config/realtime.ts';
 import type { LLMTool } from '../llm/provider.ts';
 import { recordUsage } from '../llm/usage.ts';
+import { hostedRealtimeError } from '../util/hosted-error.ts';
 
 export type RealtimeVoiceDeps = {
   /** Shared tool schema (same `LLMTool[]` the text providers use). */
@@ -28,12 +29,29 @@ export type RealtimeVoiceDeps = {
    * Always resolves to a string (result or denial marker).
    */
   executeToolCall: (name: string, args: Record<string, unknown>) => Promise<string>;
+  /**
+   * The user has started a new utterance (server VAD), before the model
+   * responds to it: the taint-gating turn boundary for voice. Bind to
+   * `orchestrator.resetRealtimeTaint`.
+   *
+   * REQUIRED, and that is the point. A voice session has no turn objects, so
+   * this event is the only thing that clears the session taint, and
+   * `executeRealtimeToolCall` refuses a taint-gated call outright rather than
+   * auto-approving it. A surface that does not wire it works until the first
+   * `capture_screen` or page read and then refuses every machine-changing
+   * action for the life of the process -- whatever the authority level, since
+   * taint gating is a profile, not a level. The pebble shipped that way
+   * because this was wired out of band, at one of the two call sites only.
+   */
+  onUserTurnStart: () => void;
   /** Transcript sink (UI captions + vault writes). */
   onTranscript?: (t: RealtimeTranscript) => void;
-  /** Error sink. */
+  /** Error sink. Receives text that is safe to show the user: on a hosted
+   *  session it is the shared hosted copy, never the provider's own words. */
   onError?: (err: string) => void;
-  /** Fired when the underlying session closes (for ws-service cleanup). */
-  onClose?: () => void;
+  /** Fired when the underlying session closes (for ws-service cleanup).
+   *  `detail` is the socket's close code/reason when the server gave one. */
+  onClose?: (detail?: string) => void;
   /** Hashed user id for OpenAI abuse monitoring. */
   safetyIdentifier?: string;
   /** Injectable session factory (tests). Defaults to a real `RealtimeSession`. */
@@ -62,23 +80,38 @@ export class RealtimeVoiceSession {
     this.session = deps.sessionFactory ? deps.sessionFactory(opts) : new RealtimeSession(opts);
 
     this.session.onTranscript((t) => this.deps.onTranscript?.(t));
-    this.session.onError((e) => this.deps.onError?.(e));
-    this.session.onClose(() => {
+    // The taint-gating turn boundary, wired HERE rather than by each caller:
+    // it is the same event for every surface, and leaving it to the callers is
+    // what left the pebble without one. Optional call because a test fake of
+    // the inner session may not implement it.
+    this.session.onUserTurnStart?.(() => this.deps.onUserTurnStart());
+    // The one place both realtime surfaces (the dashboard socket in ws-service
+    // and the pebble in pebble-realtime) receive session errors, so the hosted
+    // rule lives here rather than in each of them. The proxy relays upstream
+    // realtime `error` events verbatim (LiteLLM does not rewrite websocket
+    // frames), and the dashboard prints this string into the chat as a system
+    // line: that is how "You have no credits remaining. Add credits..." from
+    // the PLATFORM's upstream account reached a tenant. A BYO key keeps the
+    // provider's own words, since it is that user's account and the text tells
+    // them what to fix.
+    const hosted = resolved.provider === 'usejarvis_ai';
+    this.session.onError((e) => this.deps.onError?.(hosted ? hostedRealtimeError(e) : e));
+    this.session.onClose((detail) => {
       this.closed = true;
-      this.deps.onClose?.();
+      this.deps.onClose?.(detail);
     });
 
     // Fold realtime token usage into the shared llm_usage table so the Usage
     // room reports realtime spend alongside the text tiers. Tier is
     // 'conversation' (realtime is the conversational brain when active) and
-    // subsystem labels the source. Provider name is hardcoded since realtime
-    // only runs against OpenAI; the model id comes from the resolved session.
+    // subsystem labels the source; the provider comes from the resolved
+    // session (openai for BYO keys, usejarvis_ai for the hosted proxy).
     this.session.onUsage((u) => {
       recordUsage({
         tier: 'conversation',
         resolved_tier: 'conversation',
         subsystem: 'realtime_voice',
-        provider: 'openai',
+        provider: resolved.provider,
         model: resolved.model,
         input_tokens: u.input_tokens,
         output_tokens: u.output_tokens,
@@ -101,6 +134,16 @@ export class RealtimeVoiceSession {
 
   connect(): Promise<void> {
     return this.session.connect();
+  }
+
+  /** True while the model is answering (see RealtimeSession.isResponding). */
+  get isResponding(): boolean {
+    return Boolean(this.session.isResponding);
+  }
+
+  /** Stop the current spoken response without closing the conversation. */
+  interrupt(): void {
+    if (!this.closed) this.session.interrupt();
   }
 
   close(): void {

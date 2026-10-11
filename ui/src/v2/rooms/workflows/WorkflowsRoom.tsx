@@ -14,6 +14,7 @@
  */
 
 import React, { useEffect, useMemo, useState } from "react";
+import { confirmDialog } from "../../ui/ConfirmDialog";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -34,6 +35,7 @@ import { RoomShell } from "../RoomShell";
 import { useRoomActions } from "../useRoomActionBus";
 import {
   useWorkflowsData,
+  CANCELED_EFFECT_WARNING,
   type Flow,
   type FlowRun,
   type FlowRunStatus,
@@ -42,6 +44,7 @@ import {
 import "./WorkflowsRoom.css";
 import { ConnectionsPanel } from "./ConnectionsPanel";
 import { LibraryPanel } from "./LibraryPanel";
+import { RoutineRequestsPanel } from "./RoutineRequestsPanel";
 
 const STATUS_TONE: Record<FlowStatus, "ok" | "neutral"> = {
   ENABLED: "ok",
@@ -76,10 +79,14 @@ const TERMINAL_STATUSES = new Set<FlowRunStatus>([
   "SCHEDULE_FAILURE",
 ]);
 
-type RoomTab = "flows" | "connections" | "library";
+type RoomTab = "flows" | "connections" | "library" | "routines";
 
 export function WorkflowsRoomBody(): React.ReactElement {
   const data = useWorkflowsData();
+  useEffect(() => {
+    const flowId = new URLSearchParams(window.location.search).get('workflow');
+    if (flowId) data.setEditingFlowId(flowId);
+  }, [data.setEditingFlowId]);
   const [actionMessage, setActionMessage] = useState<{ tone: "ok" | "warn"; text: string } | null>(null);
   const [tab, setTab] = useState<RoomTab>("flows");
 
@@ -162,6 +169,13 @@ export function WorkflowsRoomBody(): React.ReactElement {
           </button>
           <button
             type="button"
+            className={`wf-room__tab ${tab === "routines" ? "wf-room__tab--active" : ""}`}
+            onClick={() => setTab("routines")}
+          >
+            Routine requests
+          </button>
+          <button
+            type="button"
             className={`wf-room__tab ${tab === "library" ? "wf-room__tab--active" : ""}`}
             onClick={() => setTab("library")}
           >
@@ -192,6 +206,7 @@ export function WorkflowsRoomBody(): React.ReactElement {
 
       {tab === "connections" ? <ConnectionsPanel /> : null}
       {tab === "library" ? <LibraryPanel /> : null}
+      {tab === "routines" ? <RoutineRequestsPanel onReview={data.setEditingFlowId} /> : null}
 
       {tab === "flows" ? (
       <div className="wf-room__layout">
@@ -216,7 +231,7 @@ export function WorkflowsRoomBody(): React.ReactElement {
                     )
                   }
                   onPublish={() => handleAction("Publish", () => data.publishFlow(flow.id))}
-                  onDelete={() => {
+                  onDelete={async () => {
                     // Spell out what disappears: not just the flow row but
                     // every draft on it (including per-step sample data the
                     // user invested time configuring for test-from-here).
@@ -227,7 +242,7 @@ export function WorkflowsRoomBody(): React.ReactElement {
                     const msg = hasDraftOnly
                       ? `Delete "${flow.displayName ?? flow.id}"?\n\nThis flow has no published version -- the draft (including any per-step sample data) will be permanently lost.`
                       : `Delete "${flow.displayName ?? flow.id}"?\n\nThe published version and any draft (including per-step sample data) will be permanently lost.`;
-                    if (window.confirm(msg)) {
+                    if (await confirmDialog(msg)) {
                       void handleAction("Delete", () => data.deleteFlow(flow.id));
                     }
                   }}
@@ -466,6 +481,7 @@ function RunRow({ run, expanded, onToggle, onCancel }: RunRowProps): React.React
             <dd>{run.triggeredBy ?? "manual"}</dd>
           </dl>
           {run.status === "PAUSED" ? <PausedRunCallout runId={run.id} /> : null}
+          {run.cancellation?.inFlightMayHaveCompleted ? <p>{CANCELED_EFFECT_WARNING}</p> : null}
           {run.steps && Object.keys(run.steps).length > 0 ? (
             <details className="wf-runs__steps">
               <summary>Step output JSON</summary>
@@ -556,12 +572,13 @@ function PausedRunCallout({ runId }: { runId: string }): React.ReactElement {
 function EmptyState({ onCreate }: { onCreate: () => void }): React.ReactElement {
   return (
     <div className="wf-empty">
-      <p>No workflows yet.</p>
+      <p>Your first workflow starts with a conversation.</p>
       <p className="wf-empty__hint">
-        Start with a blank canvas and add steps as you go.
+        Open Talk and describe a recurring task. Jarvis can draft the steps with you.
+        Or start with a blank canvas below.
       </p>
       <Button variant="primary" size="sm" onClick={onCreate}>
-        <Icon icon={Plus} size={14} /> New workflow
+        <Icon icon={Plus} size={14} /> Build from scratch
       </Button>
     </div>
   );

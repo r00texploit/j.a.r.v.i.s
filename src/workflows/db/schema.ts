@@ -14,6 +14,8 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { hasCodeStep } from "./flow-graph";
+import type { FlowTriggerNode } from "./repos/flow-version";
 
 export const DEFAULT_IDS = {
   user: "jrv_user_default",
@@ -21,6 +23,30 @@ export const DEFAULT_IDS = {
 } as const;
 
 const STATEMENTS: string[] = [
+  // Authoring provenance, not an execution queue. Never replay on startup.
+  `CREATE TABLE IF NOT EXISTS workflow_composition (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    specification TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('COMPOSING', 'VALIDATED', 'FAILED')),
+    previous_response TEXT,
+    previous_graph TEXT,
+    errors TEXT NOT NULL DEFAULT '[]',
+    created INTEGER NOT NULL,
+    updated INTEGER NOT NULL
+  )`,
+  // Immutable per-run machine and connection generation. No in-place retarget.
+  `CREATE TABLE IF NOT EXISTS workflow_run_machine_binding (
+    run_id TEXT PRIMARY KEY REFERENCES flow_run(id) ON DELETE CASCADE,
+    record TEXT NOT NULL
+  )`,
+  // Cancellation is a durable dispatch fence, separate from effect receipts.
+  `CREATE TABLE IF NOT EXISTS workflow_run_cancellation (
+    run_id TEXT PRIMARY KEY REFERENCES flow_run(id) ON DELETE CASCADE,
+    acknowledged_at INTEGER NOT NULL,
+    status_at_request TEXT NOT NULL,
+    in_flight_may_have_completed INTEGER NOT NULL
+  )`,
   // --- Flow definitions ---
   `CREATE TABLE IF NOT EXISTS flow (
     id TEXT PRIMARY KEY,
@@ -35,12 +61,26 @@ const STATEMENTS: string[] = [
     template_id TEXT,
     time_saved_per_run INTEGER,
     metadata TEXT,
+    -- Per-flow opt-in for CODE steps. A CODE step runs arbitrary JavaScript in
+    -- the engine's child process with this machine's privileges, so a flow
+    -- containing one is refused at publish until the flag is set FOR THAT FLOW
+    -- (see repos/flow-code-steps.ts). Deliberately its own column, not a key
+    -- in metadata: the metadata blob is replaced wholesale by
+    -- PATCH /api/workflows/:id, and a privilege grant must not be something an
+    -- unrelated write can hand out or discard by accident.
+    code_steps_enabled INTEGER NOT NULL DEFAULT 0,
+    -- 'user' when a human turned it on, 'upgrade' when the flag was
+    -- grandfathered onto a flow that was already running CODE before the gate
+    -- existed. Kept so the dashboard can show WHY a flow has the permission
+    -- and the user can take it back.
+    code_steps_grant TEXT,
+    code_steps_granted_at INTEGER,
     created INTEGER NOT NULL,
     updated INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_flow_project ON flow(project_id)`,
   `CREATE INDEX IF NOT EXISTS idx_flow_status ON flow(status)`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS uq_flow_external ON flow(project_id, external_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_flow_external ON flow(project_id, external_id)`, // expand-contract-ok: base-schema index (created with the table)
 
   // Engine-managed trigger state lives in `engine_listeners` (JSON array of
   // AppEventListener `{ events, identifierValue }`, returned by upstream's
@@ -86,6 +126,7 @@ const STATEMENTS: string[] = [
     steps TEXT,
     failed_step TEXT,
     step_name_to_test TEXT,
+    execution_config TEXT,
     start_time INTEGER,
     finish_time INTEGER,
     archived_at INTEGER,
@@ -100,6 +141,30 @@ const STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_flow_run_project ON flow_run(project_id)`,
   `CREATE INDEX IF NOT EXISTS idx_flow_run_started ON flow_run(start_time)`,
   `CREATE INDEX IF NOT EXISTS idx_flow_run_parent ON flow_run(parent_run_id)`,
+
+  // Durable effect identity and dispatch fence, independent of run-log uploads.
+  `CREATE TABLE IF NOT EXISTS workflow_effect (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES flow_run(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    approval_id TEXT,
+    waitpoint_id TEXT,
+    record TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_effect_run ON workflow_effect(run_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_effect_pending ON workflow_effect(status)`,
+
+  // A delegated sub-agent's conversation while its run waits on a tool
+  // approval, and its finished result so a re-run step returns that instead
+  // of starting a new conversation. One row per step instance.
+  `CREATE TABLE IF NOT EXISTS workflow_delegation (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES flow_run(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    record TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_delegation_run ON workflow_delegation(run_id)`,
 
   // --- Credentials per piece (OAuth tokens, API keys, etc.) ---
   // Sensitive `value` is stored as JSON; encryption-at-rest via the keychain
@@ -123,7 +188,7 @@ const STATEMENTS: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_app_connection_project ON app_connection(project_id)`,
   `CREATE INDEX IF NOT EXISTS idx_app_connection_piece ON app_connection(piece_name)`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS uq_app_connection_external ON app_connection(project_id, piece_name, external_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_app_connection_external ON app_connection(project_id, piece_name, external_id)`, // expand-contract-ok: base-schema index (created with the table)
 
   // --- Trigger events: webhook payloads, polling captures, event-bus emissions awaiting flow execution ---
   `CREATE TABLE IF NOT EXISTS trigger_event (
@@ -147,7 +212,7 @@ const STATEMENTS: string[] = [
     created INTEGER NOT NULL,
     updated INTEGER NOT NULL
   )`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS uq_store_entry_project_key ON store_entry(project_id, key)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_store_entry_project_key ON store_entry(project_id, key)`, // expand-contract-ok: base-schema index (created with the table)
 
   // --- Files passed between steps (file-helper, image-helper, etc.) ---
   `CREATE TABLE IF NOT EXISTS workflow_file (
@@ -224,6 +289,35 @@ export function createSchema(db: Database): void {
   db.exec("PRAGMA foreign_keys=ON");
   for (const stmt of STATEMENTS) db.exec(stmt);
   applyAdditiveColumnMigrations(db);
+  backfillRunProjects(db);
+}
+
+/**
+ * Put every run in its flow's project (#843).
+ *
+ * Before #843 `createFlowRun` wrote `DEFAULT_IDS.project` into
+ * `flow_run.project_id` whatever project the flow was in, and that column is
+ * what a run's engine token is minted from on every start AND every resume
+ * (`engine-flow-executor.ts`), so an old run of another project's flow would
+ * keep resuming with the default project's store and connections. #843 fixed
+ * the writer; this fixes the rows it wrote.
+ *
+ * Safe for a run that is PAUSED mid-flight, which is the case that matters: a
+ * resume mints a fresh token from the column as it is then, `effect-context`
+ * and the machine binding compare that token with the same column, an
+ * existing effect record is matched on its digests and never on its
+ * `projectId`, and `waitpoint.project_id` has no reader. It runs here, at
+ * boot, before any engine can hold a token. Data only, no DDL, and harmless
+ * to roll back from: older code reads this column only to mint tokens, and the
+ * flow's project is the right value for that too.
+ *
+ * Idempotent, and a no-op for a store that only ever had one project, which
+ * is every store today. Measured on an in-memory store with every row already
+ * matching: 1.1 ms for 10k runs, 11 ms for 100k, 73 ms for 500k (median of 5).
+ */
+function backfillRunProjects(db: Database): void {
+  db.run(`UPDATE flow_run SET project_id = (SELECT f.project_id FROM flow f WHERE f.id = flow_run.flow_id)
+    WHERE project_id <> (SELECT f.project_id FROM flow f WHERE f.id = flow_run.flow_id)`);
 }
 
 /**
@@ -236,6 +330,7 @@ export function createSchema(db: Database): void {
 function applyAdditiveColumnMigrations(db: Database): void {
   type ColMigration = { table: string; column: string; ddl: string };
   const migrations: ColMigration[] = [
+    { table: "flow_run", column: "execution_config", ddl: "ALTER TABLE flow_run ADD COLUMN execution_config TEXT" },
     { table: "flow_version", column: "engine_listeners", ddl: "ALTER TABLE flow_version ADD COLUMN engine_listeners TEXT" },
     { table: "flow_version", column: "engine_schedule", ddl: "ALTER TABLE flow_version ADD COLUMN engine_schedule TEXT" },
     // sample_data: JSON map { [stepName]: sampleOutput } fed to the engine
@@ -249,10 +344,94 @@ function applyAdditiveColumnMigrations(db: Database): void {
     // exercise a step manually with curated parameters without
     // re-editing the production input. Production runs ignore this map.
     { table: "flow_version", column: "sample_input", ddl: "ALTER TABLE flow_version ADD COLUMN sample_input TEXT" },
+    // code_steps_*: per-flow opt-in for CODE steps (see the flow table above).
+    // The grant defaults to OFF, so a flow authored after this version has to
+    // be opted in explicitly before it can publish.
+    {
+      table: "flow",
+      column: "code_steps_enabled",
+      ddl: "ALTER TABLE flow ADD COLUMN code_steps_enabled INTEGER NOT NULL DEFAULT 0",
+    },
+    { table: "flow", column: "code_steps_grant", ddl: "ALTER TABLE flow ADD COLUMN code_steps_grant TEXT" },
+    { table: "flow", column: "code_steps_granted_at", ddl: "ALTER TABLE flow ADD COLUMN code_steps_granted_at INTEGER" },
   ];
-  for (const m of migrations) {
-    const cols = db.query(`PRAGMA table_info(${m.table})`).all() as Array<{ name: string }>;
-    if (cols.some((c) => c.name === m.column)) continue;
-    db.exec(m.ddl);
+  // One transaction around the ALTERs AND the backfill they key. SQLite DDL is
+  // transactional, and the coupling matters: the backfill is keyed on the
+  // ALTER having fired, so a crash in the window AFTER the last ALTER and
+  // BEFORE the backfill would leave the columns in place, the next boot with
+  // nothing to add, and the grandfathered grants lost for good. Committing
+  // them together means the upgrade either happened or it did not.
+  db.transaction(() => {
+    const added = new Set<string>();
+    for (const m of migrations) {
+      const cols = db.query(`PRAGMA table_info(${m.table})`).all() as Array<{ name: string }>;
+      if (cols.some((c) => c.name === m.column)) continue;
+      db.exec(m.ddl);
+      added.add(`${m.table}.${m.column}`);
+    }
+    // The backfill runs after ALL the ALTERs, never inline with one of them:
+    // it writes three columns and would fail if it ran between two.
+    //
+    // It fires only when THIS transaction introduced the gate's columns, which
+    // can only happen on a database that predates them. A fresh database gets
+    // them from CREATE TABLE, adds nothing, and never backfills -- right,
+    // since it has no flows that predate the gate.
+    const gateColumns = ["code_steps_enabled", "code_steps_grant", "code_steps_granted_at"];
+    if (gateColumns.some((column) => added.has(`flow.${column}`))) grandfatherRunningCodeFlows(db);
+  })();
+}
+
+/**
+ * One-time grandfathering for the CODE-step gate.
+ *
+ * Refusing at publish is the right place for a flow someone is authoring, but
+ * a version bump is not an authoring moment: an automation that has been
+ * running a CODE step on a cron for months must not stop because the daemon
+ * restarted on a newer build, and the user must not silently acquire the new
+ * permission on flows that never used it.
+ *
+ * So the grant is written only for flows that are runnable RIGHT NOW (ENABLED,
+ * or carrying a published version) whose runnable version actually contains a
+ * CODE step -- the exact set that would otherwise break -- and it is stamped
+ * `upgrade` so the dashboard can say the permission was inherited and the user
+ * can revoke it. Every other flow, including one holding an unpublished CODE
+ * draft, starts at OFF and has to be opted in.
+ *
+ * `updated` is deliberately NOT touched: the workflows list orders by
+ * `flow.updated DESC`, and reshuffling someone's list on an upgrade would be a
+ * visible side effect of a migration that is supposed to change nothing.
+ */
+function grandfatherRunningCodeFlows(db: Database): void {
+  const candidates = db
+    .query<{ id: string; version_id: string | null }, []>(
+      `SELECT f.id AS id,
+              COALESCE(f.published_version_id,
+                       (SELECT v.id FROM flow_version v
+                         WHERE v.flow_id = f.id AND v.state = 'DRAFT'
+                         ORDER BY v.updated DESC LIMIT 1)) AS version_id
+         FROM flow f
+        WHERE f.status = 'ENABLED' OR f.published_version_id IS NOT NULL`,
+    )
+    .all();
+  const at = Date.now();
+  for (const candidate of candidates) {
+    if (!candidate.version_id) continue;
+    const row = db
+      .query<{ trigger: string }, [string]>(`SELECT trigger FROM flow_version WHERE id = ?`)
+      .get(candidate.version_id);
+    if (!row) continue;
+    let trigger: FlowTriggerNode | null = null;
+    try {
+      trigger = JSON.parse(row.trigger) as FlowTriggerNode;
+    } catch {
+      // An unparseable trigger cannot be shown to contain a CODE step, and a
+      // migration is the wrong place to fail a boot over one bad row.
+      continue;
+    }
+    if (!hasCodeStep(trigger)) continue;
+    db.run(`UPDATE flow SET code_steps_enabled = 1, code_steps_grant = 'upgrade', code_steps_granted_at = ? WHERE id = ?`, [
+      at,
+      candidate.id,
+    ]);
   }
 }

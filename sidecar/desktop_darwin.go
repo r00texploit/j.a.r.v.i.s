@@ -3,25 +3,31 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
 // ── Element Cache ──────────────────────────────────────────────────────
 
-// elementCache stores the last tree snapshot so click_element / type_text
-// can reference elements by their [id] without re-walking the tree.
-var elementCache struct {
-	mu        sync.Mutex
-	elements  []map[string]any
-	pid       int
-	timestamp time.Time
+// walkDesktopElements is the walk that mints element ids, and the one
+// resolveDesktopElement repeats to confirm one (desktop_element_cache.go).
+var walkDesktopElements = func(pid, depth int, budget time.Duration) ([]any, error) {
+	tree, err := walkDarwinTree(pid, depth, budget)
+	if err != nil {
+		return nil, err
+	}
+	if msg, ok := tree["error"].(string); ok && msg != "" {
+		return nil, errors.New(msg)
+	}
+	elems, _ := tree["elements"].([]any)
+	return elems, nil
 }
 
 // ── list_windows ──────────────────────────────────────────────────────
@@ -71,13 +77,13 @@ end tell`
 		isFG := strings.TrimSpace(parts[7]) == "true"
 
 		windows = append(windows, map[string]any{
-			"title":        title,
-			"pid":          pid,
-			"process_name": procName,
-			"left":         left,
-			"top":          top,
-			"right":        left + width,
-			"bottom":       top + height,
+			"title":         title,
+			"pid":           pid,
+			"process_name":  procName,
+			"left":          left,
+			"top":           top,
+			"right":         left + width,
+			"bottom":        top + height,
 			"is_foreground": isFG,
 		})
 	}
@@ -87,7 +93,23 @@ end tell`
 
 // ── get_window_tree ────────────────────────────────────────────────────
 
+// handleGetWindowTree walks the AX tree through JXA. It deliberately does not
+// read params["semantic"]: durable refs (sig/path/ordinal) are implemented only
+// in the Windows UIA walk, so `semantic: true` is a no-op here and elements come
+// back without refs rather than with an error. Documented in
+// docs/sidecar/SIDECAR_PROTOCOL.md, "Surface Limits"; the shared sig helpers in
+// semantic.go are provider-independent if this walk ever grows them.
 func handleGetWindowTree(params map[string]any) (*RPCResult, error) {
+	// Every path that does not fill the cache retires it instead, so a failed
+	// or empty snapshot leaves no earlier ids live (desktop_element_cache.go,
+	// forget). Deferred so a return added later cannot skip it.
+	filled := false
+	defer func() {
+		if !filled {
+			elementCache.forget()
+		}
+	}()
+
 	pid := 0
 	if v, ok := params["pid"].(float64); ok {
 		pid = int(v)
@@ -111,6 +133,37 @@ func handleGetWindowTree(params map[string]any) (*RPCResult, error) {
 		depth = int(v)
 	}
 
+	tree, err := walkDarwinTree(pid, depth, jxaWalkTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache elements for click/type reference, with the depth that produced
+	// them: a read-back at a different depth walks a different tree and its
+	// indices do not line up (#661).
+	if elems, ok := tree["elements"].([]any); ok {
+		elementCache.fill(elems, pid, depth)
+		filled = true
+	}
+
+	return &RPCResult{Result: tree}, nil
+}
+
+// The JXA walk's budgets (jxaWalkTimeout, jxaTypeReadBackTimeout) and the
+// read-back policies built from them live in desktop_element_action.go, where
+// Linux compiles and tests them too (#712).
+
+// desktopPlatformName names this platform in an unsupported-action refusal.
+const desktopPlatformName = "macOS"
+
+// desktopPointerTargetChecked: dispatchPointer does not check the window under
+// the pointer (see dispatchPointer), and a click's reply says so.
+const desktopPointerTargetChecked = false
+
+// walkDarwinTree runs the JXA accessibility walk for one process. Ids are
+// indices in this walk's depth-first order, so the snapshot and the read-back
+// in resolveDesktopElement must both come through here with the same depth.
+func walkDarwinTree(pid, depth int, timeout time.Duration) (map[string]any, error) {
 	// Use JXA (JavaScript for Automation) to walk the accessibility tree
 	jsScript := fmt.Sprintf(`
 ObjC.import('stdlib')
@@ -154,7 +207,7 @@ try { winTitle = proc.frontWindow ? proc.frontWindow.name() : (wins.length > 0 ?
 JSON.stringify({window_title: winTitle, pid: %d, element_count: elements.length, elements: elements})
 }`, depth, pid, pid, pid)
 
-	out, err := runOsascriptJS(jsScript, 20*time.Second)
+	out, err := runOsascriptJS(jsScript, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("get_window_tree failed: %w", err)
 	}
@@ -163,77 +216,42 @@ JSON.stringify({window_title: winTitle, pid: %d, element_count: elements.length,
 	if err := json.Unmarshal([]byte(out), &tree); err != nil {
 		return nil, fmt.Errorf("parse tree: %w (%s)", err, truncate(out, 200))
 	}
-
-	// Cache elements for click/type reference
-	if elems, ok := tree["elements"].([]any); ok {
-		elementCache.mu.Lock()
-		elementCache.elements = make([]map[string]any, 0, len(elems))
-		for _, e := range elems {
-			if m, ok := e.(map[string]any); ok {
-				elementCache.elements = append(elementCache.elements, m)
-			}
-		}
-		elementCache.pid = pid
-		elementCache.timestamp = time.Now()
-		elementCache.mu.Unlock()
-	}
-
-	return &RPCResult{Result: tree}, nil
+	return tree, nil
 }
 
 // ── click_element ────────────────────────────────────────────────────
 
 func handleClickElement(params map[string]any) (*RPCResult, error) {
-	elemID, ok := params["element_id"].(float64)
-	if !ok {
-		return nil, fmt.Errorf("missing required parameter: element_id")
-	}
-	id := int(elemID)
+	return handleClickElementWith(params, darwinClickReadBack)
+}
 
-	action, _ := params["action"].(string)
-	if action == "" {
-		action = "click"
-	}
-
-	// Look up cached element for its bounding rect
-	elementCache.mu.Lock()
-	var rect map[string]any
-	if id >= 0 && id < len(elementCache.elements) {
-		if r, ok := elementCache.elements[id]["rect"].(map[string]any); ok {
-			rect = r
-		}
-	}
-	elementCache.mu.Unlock()
-
-	if rect == nil {
-		return nil, fmt.Errorf("element [%d] not found in cache — run desktop_snapshot first", id)
-	}
-
-	x := toInt(rect["x"]) + toInt(rect["w"])/2
-	y := toInt(rect["y"]) + toInt(rect["h"])/2
-
+// dispatchPointer performs action at (x, y), for clickElement
+// (desktop_element_action.go), which has already confirmed the element and
+// the action.
+//
+// Unlike Linux and Windows it does NOT first check that the window under the
+// point is the element's (#705). The check here would be an AX hit test or a
+// CGWindowList walk, and macOS draws windows that are listed and on top but
+// click-through -- this sidecar's own pebble overlay among them -- so whether
+// a given window takes the click is exactly what has to be measured on a real
+// Mac before a refusal is trusted. CI has no macOS test runner, and a refusal
+// path that has never executed is the failure #712 describes; a check that
+// fails closed on every click would be worse than the gap. Filed separately.
+func dispatchPointer(id int, action string, x, y, pid int) error {
+	_, _ = id, pid
+	var err error
 	switch action {
-	case "click":
-		if err := clickAtCoords(x, y); err != nil {
-			return nil, fmt.Errorf("click_element failed: %w", err)
-		}
 	case "double_click":
-		if err := doubleClickAtCoords(x, y); err != nil {
-			return nil, fmt.Errorf("double_click failed: %w", err)
-		}
+		err = doubleClickAtCoords(x, y)
 	case "right_click":
-		if err := rightClickAtCoords(x, y); err != nil {
-			return nil, fmt.Errorf("right_click failed: %w", err)
-		}
-	case "focus":
-		if err := clickAtCoords(x, y); err != nil {
-			return nil, fmt.Errorf("focus failed: %w", err)
-		}
-	default:
-		return nil, fmt.Errorf("action '%s' is not supported on macOS (supported: click, double_click, right_click, focus)", action)
+		err = rightClickAtCoords(x, y)
+	default: // click, focus
+		err = clickAtCoords(x, y)
 	}
-
-	return &RPCResult{Result: map[string]any{"success": true, "action": action, "x": x, "y": y}}, nil
+	if err != nil {
+		return fmt.Errorf("%s failed: %w", action, err)
+	}
+	return nil
 }
 
 // clickAtCoords performs a left-click at the given screen coordinates.
@@ -241,7 +259,7 @@ func handleClickElement(params map[string]any) (*RPCResult, error) {
 func clickAtCoords(x, y int) error {
 	// Try cliclick first (brew install cliclick)
 	if _, err := exec.LookPath("cliclick"); err == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), pointerDispatchTimeout)
 		defer cancel()
 		return exec.CommandContext(ctx, "cliclick", fmt.Sprintf("c:%d,%d", x, y)).Run()
 	}
@@ -258,7 +276,7 @@ ev = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, pt, kCGMouseButtonLeft)
 CGEventPost(kCGHIDEventTap, ev)
 `, x, y)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), pointerDispatchTimeout)
 	defer cancel()
 	return exec.CommandContext(ctx, "python3", "-c", pyScript).Run()
 }
@@ -266,32 +284,18 @@ CGEventPost(kCGHIDEventTap, ev)
 // ── type_text ────────────────────────────────────────────────────────
 
 func handleTypeText(params map[string]any) (*RPCResult, error) {
-	text, _ := params["text"].(string)
-	if text == "" {
-		return nil, fmt.Errorf("missing required parameter: text")
-	}
-
-	// If element_id is given, click it first to focus it
-	if elemID, ok := params["element_id"].(float64); ok {
-		if _, err := handleClickElement(map[string]any{"element_id": elemID}); err != nil {
-			return nil, fmt.Errorf("failed to click element before typing: %w", err)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	// Pass the text as an argv item rather than interpolating it into the
-	// script source. osascript args are real arguments (no shell, no string
-	// literal), so newlines/quotes/backslashes in `text` are data and cannot
-	// break out of the keystroke statement -- this is what prevents
-	// AppleScript injection via attacker/LLM-controlled text.
-	script := `on run argv
+	return handleTypeTextWith(params, darwinTypeReadBack, func(text string) error {
+		// Pass the text as an argv item rather than interpolating it into the
+		// script source. osascript args are real arguments (no shell, no string
+		// literal), so newlines/quotes/backslashes in `text` are data and cannot
+		// break out of the keystroke statement -- this is what prevents
+		// AppleScript injection via attacker/LLM-controlled text.
+		script := `on run argv
 	tell application "System Events" to keystroke (item 1 of argv)
 end run`
-	if _, err := runOsascriptArgs(script, 10*time.Second, text); err != nil {
-		return nil, fmt.Errorf("type_text failed: %w", err)
-	}
-
-	return &RPCResult{Result: map[string]any{"success": true}}, nil
+		_, err := runOsascriptArgs(script, keystrokeTimeout, text)
+		return err
+	})
 }
 
 // ── press_keys ───────────────────────────────────────────────────────
@@ -339,9 +343,6 @@ func handleLaunchApp(params map[string]any) (*RPCResult, error) {
 			return nil, fmt.Errorf("launch_app: open -a %q failed: %w", executable, err)
 		}
 
-		// Wait briefly for the app to register, then resolve its PID
-		time.Sleep(500 * time.Millisecond)
-
 		name := executable
 		if strings.HasSuffix(name, ".app") {
 			name = name[:len(name)-4]
@@ -350,13 +351,14 @@ func handleLaunchApp(params map[string]any) (*RPCResult, error) {
 			name = name[idx+1:]
 		}
 
-		pgrepOut, _ := exec.Command("pgrep", "-n", name).Output()
-		pidStr := strings.TrimSpace(string(pgrepOut))
-		pid, _ := strconv.Atoi(pidStr)
+		// Poll for the process AND a visible window instead of a fixed
+		// 500ms sleep — returning before the window exists made the next
+		// tool call fail ("no window found") or, worse, act on the wrong app.
+		pid, probe, probeErr := waitForAppWindowDarwin(name, 0, 5*time.Second)
 		if pid == 0 {
-			return nil, fmt.Errorf("launch_app: open -a %q succeeded but process PID could not be resolved via pgrep %q", executable, name)
+			return nil, fmt.Errorf("launch_app: open -a %q succeeded but no running %s.app process appeared within 5s", executable, name)
 		}
-		return &RPCResult{Result: map[string]any{"success": true, "pid": pid, "name": name}}, nil
+		return launchResultDarwin(pid, name, probe, probeErr), nil
 	}
 
 	// Absolute/relative path to a binary — start detached
@@ -387,7 +389,130 @@ func handleLaunchApp(params map[string]any) (*RPCResult, error) {
 		name = executable[idx+1:]
 	}
 
-	return &RPCResult{Result: map[string]any{"success": true, "pid": pid, "name": name}}, nil
+	_, probe, probeErr := waitForAppWindowDarwin("", pid, 5*time.Second)
+	return launchResultDarwin(pid, name, probe, probeErr), nil
+}
+
+// countWindowsDarwin asks System Events how many windows pid owns.
+//
+// A denied automation prompt is not "zero windows", it is no answer at all,
+// and the two have to stay distinguishable: the caller reports the first as
+// a failed launch and the second as an unverified one.
+func countWindowsDarwin(pid int) (int, error) {
+	script := fmt.Sprintf(`tell application "System Events" to count windows of (first process whose unix id is %d)`, pid)
+
+	// Bounded on purpose: the first automation attempt can raise a consent
+	// dialog, and osascript blocks behind it for as long as the dialog is
+	// up. Without a deadline the whole launch_app RPC would hang there.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "osascript", "-e", script)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return 0, fmt.Errorf("%w: System Events did not answer in time, which usually means an automation consent dialog is waiting to be answered", errWindowCheckUnavailable)
+	}
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if isPermissionErrorDarwin(msg) {
+			return 0, fmt.Errorf("%w: %s", errWindowCheckUnavailable, firstLine(msg))
+		}
+		if msg == "" {
+			msg = err.Error()
+		}
+		// Anything else (the process is not registered with System Events
+		// yet, most often) may still resolve on a later poll.
+		return 0, fmt.Errorf("System Events could not count windows: %s", firstLine(msg))
+	}
+	n, convErr := strconv.Atoi(strings.TrimSpace(string(out)))
+	if convErr != nil {
+		return 0, fmt.Errorf("System Events returned a non-numeric window count %q", strings.TrimSpace(string(out)))
+	}
+	return n, nil
+}
+
+// isPermissionErrorDarwin recognises the AppleScript failures that mean the
+// sidecar will never be allowed to look, rather than that it looked and saw
+// nothing: -1743 (automation not authorized), -25211 (assistive access not
+// granted), and -1728 on System Events itself when it is blocked outright.
+func isPermissionErrorDarwin(stderr string) bool {
+	if stderr == "" {
+		return false
+	}
+	lower := strings.ToLower(stderr)
+	for _, marker := range []string{"-1743", "-25211", "not authorized", "not allowed assistive access", "assistive access"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForAppWindowDarwin polls until the app has a visible window, up to
+// timeout. When pid is 0 it is first resolved from `ps` by app name (see
+// appProcessPid). Returns the pid (0 if the process never appeared), what the
+// window check established, and the last probe error for the caller's note.
+func waitForAppWindowDarwin(name string, pid int, timeout time.Duration) (int, launchProbe, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		if pid == 0 && name != "" {
+			// Re-asked on every poll until it answers: `open -a` returns before
+			// a cold launch has exec'd the app's main process.
+			if out, err := exec.Command("ps", "-axo", "pid=,comm=").Output(); err == nil {
+				pid = appProcessPid(string(out), name)
+			}
+		}
+		if pid != 0 {
+			n, err := countWindowsDarwin(pid)
+			switch {
+			case err == nil && n > 0:
+				return pid, probeWindowFound, nil
+			case errors.Is(err, errWindowCheckUnavailable):
+				// Permission will not appear mid-poll; stop rather than
+				// spend the whole timeout re-asking the same question.
+				return pid, probeUncheckable, err
+			case err != nil:
+				lastErr = err
+			}
+		}
+		if time.Now().After(deadline) {
+			return pid, probeWindowAbsent, lastErr
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+// launchResultDarwin builds the launch_app result with an honest
+// window_visible flag: success means "the app is on screen", not merely
+// "a process was spawned".
+//
+// The unverified case is kept separate from the failed one. Reporting
+// success:false when the automation permission was refused would mark every
+// working launch on an unprompted Mac as a failure, and the model would
+// launch the app again on the strength of it.
+func launchResultDarwin(pid int, name string, probe launchProbe, probeErr error) *RPCResult {
+	res := map[string]any{"pid": pid, "name": name}
+
+	switch probe {
+	case probeWindowFound:
+		res["success"] = true
+		res["window_visible"] = true
+
+	case probeUncheckable:
+		res["success"] = true
+		res["window_visible"] = nil
+		res["note"] = fmt.Sprintf("app started (pid %d) but whether a window opened could NOT be checked: %v. This is not a failure report - the app may well be on screen. Run desktop_list_windows to see what is actually open before interacting, and do not launch it again on the strength of this result.", pid, probeErr)
+
+	default: // probeWindowAbsent
+		res["success"] = false
+		res["window_visible"] = false
+		res["note"] = fmt.Sprintf("process started (pid %d) but no window appeared within 5s - the app may still be starting, be windowless, or have exited. Run desktop_list_windows to check before interacting; do NOT assume it is open.", pid)
+	}
+
+	return &RPCResult{Result: res}
 }
 
 // ── focus_window ─────────────────────────────────────────────────────
@@ -414,7 +539,7 @@ end tell`, pid)
 // doubleClickAtCoords performs a double-click at screen coordinates.
 func doubleClickAtCoords(x, y int) error {
 	if _, err := exec.LookPath("cliclick"); err == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), pointerDispatchTimeout)
 		defer cancel()
 		return exec.CommandContext(ctx, "cliclick", fmt.Sprintf("dc:%d,%d", x, y)).Run()
 	}
@@ -431,7 +556,7 @@ for _ in range(2):
     CGEventPost(kCGHIDEventTap, ev)
     time.sleep(0.05)
 `, x, y)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), pointerDispatchTimeout)
 	defer cancel()
 	return exec.CommandContext(ctx, "python3", "-c", pyScript).Run()
 }
@@ -439,7 +564,7 @@ for _ in range(2):
 // rightClickAtCoords performs a right-click at screen coordinates.
 func rightClickAtCoords(x, y int) error {
 	if _, err := exec.LookPath("cliclick"); err == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), pointerDispatchTimeout)
 		defer cancel()
 		return exec.CommandContext(ctx, "cliclick", fmt.Sprintf("rc:%d,%d", x, y)).Run()
 	}
@@ -453,7 +578,7 @@ time.sleep(0.05)
 ev = CGEventCreateMouseEvent(None, kCGEventRightMouseUp, pt, kCGMouseButtonRight)
 CGEventPost(kCGHIDEventTap, ev)
 `, x, y)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), pointerDispatchTimeout)
 	defer cancel()
 	return exec.CommandContext(ctx, "python3", "-c", pyScript).Run()
 }
@@ -461,8 +586,9 @@ CGEventPost(kCGHIDEventTap, ev)
 // ── find_element ─────────────────────────────────────────────────────
 
 func handleFindElement(params map[string]any) (*RPCResult, error) {
-	// Snapshot the tree to populate the cache, then filter in Go
-	_, err := handleGetWindowTree(params)
+	// Walk (which fills the cache and mints this walk's ids), then filter THAT
+	// walk's reply -- see findInWalk.
+	res, err := handleGetWindowTree(params)
 	if err != nil {
 		return nil, fmt.Errorf("find_element failed: %w", err)
 	}
@@ -472,32 +598,7 @@ func handleFindElement(params map[string]any) (*RPCResult, error) {
 	className, _ := params["class_name"].(string)
 	// automation_id is ignored on macOS (not an accessibility concept)
 
-	elementCache.mu.Lock()
-	defer elementCache.mu.Unlock()
-
-	var matches []map[string]any
-	for _, el := range elementCache.elements {
-		if name != "" {
-			elName, _ := el["name"].(string)
-			if elName != name {
-				continue
-			}
-		}
-		if controlType != "" {
-			elType, _ := el["control_type"].(string)
-			if elType != controlType {
-				continue
-			}
-		}
-		if className != "" {
-			elClass, _ := el["class_name"].(string)
-			if elClass != className {
-				continue
-			}
-		}
-		matches = append(matches, el)
-	}
-
+	matches := findInWalk(res.Result, name, controlType, className)
 	return &RPCResult{Result: map[string]any{
 		"match_count": len(matches),
 		"elements":    matches,
@@ -602,36 +703,36 @@ func convertKeysToOsascript(keys string) string {
 // Returns (keyCode, true) for known special keys, (0, false) otherwise.
 func osascriptKeyCode(key string) (int, bool) {
 	keyCodes := map[string]int{
-		"enter":    36,
-		"return":   36,
-		"tab":      48,
-		"escape":   53,
-		"esc":      53,
-		"delete":   51,
+		"enter":     36,
+		"return":    36,
+		"tab":       48,
+		"escape":    53,
+		"esc":       53,
+		"delete":    51,
 		"backspace": 51,
-		"space":    49,
-		"up":       126,
-		"down":     125,
-		"left":     123,
-		"right":    124,
-		"home":     115,
-		"end":      119,
-		"pageup":   116,
-		"pgup":     116,
-		"pagedown": 121,
-		"pgdn":     121,
-		"f1":       122,
-		"f2":       120,
-		"f3":       99,
-		"f4":       118,
-		"f5":       96,
-		"f6":       97,
-		"f7":       98,
-		"f8":       100,
-		"f9":       101,
-		"f10":      109,
-		"f11":      103,
-		"f12":      111,
+		"space":     49,
+		"up":        126,
+		"down":      125,
+		"left":      123,
+		"right":     124,
+		"home":      115,
+		"end":       119,
+		"pageup":    116,
+		"pgup":      116,
+		"pagedown":  121,
+		"pgdn":      121,
+		"f1":        122,
+		"f2":        120,
+		"f3":        99,
+		"f4":        118,
+		"f5":        96,
+		"f6":        97,
+		"f7":        98,
+		"f8":        100,
+		"f9":        101,
+		"f10":       109,
+		"f11":       103,
+		"f12":       111,
 	}
 	if code, ok := keyCodes[strings.ToLower(key)]; ok {
 		return code, true
@@ -652,5 +753,3 @@ func toInt(v any) int {
 	}
 	return 0
 }
-
-

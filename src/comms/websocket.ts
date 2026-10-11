@@ -1,14 +1,22 @@
 import type { Server, ServerWebSocket } from 'bun';
+import { debugRpcGate } from '../daemon/debug-rpc-gate.ts';
 import { timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { isWithin } from '../util/path.ts';
 import type { SidecarManager } from '../sidecar/manager.ts';
+import { PANEL_SESSION_COOKIE } from '../sidecar/panel-sessions.ts';
+import { getCookie } from '../util/cookie.ts';
+import { rejectsCrossSiteWrite } from './cross-site-guard.ts';
 
 /** Constant-time string comparison to prevent timing attacks */
 export type WSMessage = {
-  type: 'chat' | 'command' | 'status' | 'stream' | 'error' | 'notification'
+  type: 'chat' | 'cancel' | 'command' | 'status' | 'stream' | 'error' | 'notification'
       | 'tts_start' | 'tts_text' | 'tts_end' | 'voice_start' | 'voice_end' | 'voice_text'
       | 'interview_start' | 'interview_user_message' | 'interview_assistant' | 'interview_done' | 'interview_error'
+      // A dashboard loaded before the interview became text-only can still
+      // send `interview_listen`; the daemon answers `interview_listen_state`
+      // with reason 'text-only' so it stops waiting on a microphone.
+      | 'interview_listen' | 'interview_listen_stop' | 'interview_listen_state'
       | 'thinking_start' | 'thinking_end'
       | 'workflow_event'
       | 'goal_event'
@@ -56,7 +64,12 @@ export type WSMessage = {
       // Emitted when a pending voice confirmation (clarifier / repeat-back)
       // expires from the server-side TTL sweep. Payload: { id: string }.
       // Clients should dismiss the corresponding card from their UI.
-      | 'voice_confirmation_expired';
+      | 'voice_confirmation_expired'
+      // Emitted after DB-backed settings are hot-applied to the running
+      // daemon (per-section apply or POST /api/config/reload / SIGHUP).
+      // Payload: { sections: string[], ok: boolean, errors?: { section, error }[] }
+      // — section names and error strings only, never setting values.
+      | 'settings_applied';
   payload: unknown;
   id?: string;
   priority?: 'urgent' | 'normal' | 'low';
@@ -79,12 +92,6 @@ const AUTH_ERROR_HTML = await Bun.file(path.join(import.meta.dir, 'auth-error.ht
 /** Inline script injected into authed HTML pages — strips ?token= from the hash. */
 const TOKEN_STRIP_SCRIPT = `<script>(function(){var h=location.hash,i=h.indexOf('?');if(i===-1)return;var p=new URLSearchParams(h.slice(i));if(!p.has('token'))return;p.delete('token');var c=h.slice(0,i),r=p.toString();if(r)c+='?'+r;location.replace(location.pathname+location.search+c)})()</script>`;
 
-function getCookie(req: Request, name: string): string | null {
-  const cookies = req.headers.get('Cookie');
-  if (!cookies) return null;
-  const match = cookies.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
-  return match ? decodeURIComponent(match[1]!) : null;
-}
 
 function isPublicRoute(pathname: string, method: string): boolean {
   return (
@@ -92,6 +99,11 @@ function isPublicRoute(pathname: string, method: string): boolean {
     pathname === '/sidecar/connect' ||
     pathname === '/api/sidecars/.well-known/jwks.json' ||
     pathname.startsWith('/api/webhooks/') ||
+    // The control-plane bench endpoint bypasses the dashboard access-token gate
+    // ONLY when the daemon was started with a valid JARVIS_DEBUG_RPC secret —
+    // and it is still independently protected by that secret echoed as a
+    // header (see api-routes.ts). Without the gate the route does not exist.
+    (pathname === '/api/debug/rpc' && debugRpcGate() !== null) ||
     method === 'OPTIONS'
   );
 }
@@ -142,9 +154,10 @@ export class WebSocketServer {
   private publicDir: string | null = null;
   private sidecarManager: SidecarManager | null = null;
   /**
-   * JWT-only by default: every non-public route requires a valid short-lived
-   * sidecar access token (minted from an enrollment JWT). The ONLY way to
-   * open the dashboard without one is the explicit config escape hatch
+   * Authenticated by default: every non-public route requires a live PANEL
+   * SESSION (src/sidecar/panel-sessions.ts), which is opened by exchanging an
+   * access token that was itself minted from an enrollment JWT. The ONLY way
+   * to open the dashboard without one is the explicit config escape hatch
    * `auth.insecure_open_access: true` (pre-enrollment setup; see docs).
    */
   private insecureOpenAccess = false;
@@ -159,6 +172,10 @@ export class WebSocketServer {
 
   setInsecureOpenAccess(enabled: boolean): void {
     this.insecureOpenAccess = enabled;
+  }
+
+  setCorsOrigin(origin: string): void {
+    this.corsOrigin = origin.replace(/\/+$/, '');
   }
 
   setHandler(handler: WSClientHandler): void {
@@ -225,13 +242,16 @@ export class WebSocketServer {
     // one variant, so the pair is cast to the port variant; at runtime Bun
     // receives exactly one of the two keys.
     const listenOpts = (this.unixPath ? { unix: this.unixPath } : { port: this.port }) as { port: number };
-    this.server = Bun.serve<{ sidecar_id?: string; proxy_target?: string; _proxyUpstream?: WebSocket }>({
+    this.server = Bun.serve<{ sidecar_id?: string; channel?: string; proxy_target?: string; panel_session?: string; _proxyUpstream?: WebSocket }>({
       ...listenOpts,
       idleTimeout: 30, // seconds — prevent timeout during heavy processing (OCR, PowerShell)
 
       async fetch(req, server) {
         const url = new URL(req.url);
         const pathname = url.pathname;
+        /** Set by the auth block when this request carried a live panel
+         *  session; read by the /ws upgrade to bind the socket to it. */
+        let panelSessionId: string | null = null;
 
         // 0. Sidecar WebSocket upgrade (has its own JWT auth)
         if (pathname === '/sidecar/connect' && self.sidecarManager) {
@@ -248,7 +268,12 @@ export class WebSocketServer {
             return new Response('Invalid or revoked token', { status: 403 });
           }
 
-          const success = server.upgrade(req, { data: { sidecar_id: claims.sid } });
+          // A `?channel=audio` connection is the pebble's dedicated realtime
+          // audio pipe — isolated from this sidecar's bulk RPC/screenshot
+          // connection so a 2.4 MB capture can't queue in front of audio frames.
+          // Same JWT, so it's attributable to the same sidecar (claims.sid).
+          const channel = url.searchParams.get('channel') === 'audio' ? 'audio' : undefined;
+          const success = server.upgrade(req, { data: { sidecar_id: claims.sid, channel } });
           if (success) return undefined;
           return new Response('WebSocket upgrade failed', { status: 500 });
         }
@@ -256,9 +281,10 @@ export class WebSocketServer {
         // 0b. Sidecar access-token mint. Authenticated by the long-lived
         //     enrollment JWT (Authorization: Bearer) — this and /sidecar/connect
         //     are the ONLY places that credential is accepted. Returns a
-        //     short-lived access token the sidecar injects into its panel
-        //     webviews; everything on the data plane (/api, /ws) authenticates
-        //     with that access token, never the enrollment JWT.
+        //     short-lived access token the sidecar puts in a panel's spawn
+        //     URL, where it is exchanged for a panel session; the data plane
+        //     (/api, /ws) then authenticates with that SESSION, never with
+        //     this token and never with the enrollment JWT.
         if (pathname === '/sidecar/token' && req.method === 'POST' && self.sidecarManager) {
           const authHeader = req.headers.get('Authorization');
           const enrollTok = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
@@ -273,35 +299,53 @@ export class WebSocketServer {
           return Response.json({ access_token: minted.token, expires_in: minted.expiresIn });
         }
 
-        // 1. Auth check. JWT-only by default: a request is authorized by a
-        // valid short-lived sidecar ACCESS token (minted from the enrollment
-        // JWT via /sidecar/token) - the sidecar's panel webviews carry one.
-        // The long-lived enrollment JWT is deliberately NOT accepted here —
-        // only on /sidecar/connect and the mint endpoint — so a leaked panel
-        // credential is bounded to the access-token TTL instead of forever.
-        // There is NO shared dashboard token: enroll a device or (setup only)
-        // set auth.insecure_open_access.
+        // 1. Auth check. A request is authorized by a PANEL SESSION cookie
+        // (panel-sessions.ts). The access token minted from the enrollment JWT
+        // is now a bootstrap credential only: it arrives as ?token= on a freshly
+        // spawned panel, is exchanged here for a session, and is never the thing
+        // the cookie carries. The exchange is not single-use and cannot cheaply
+        // be made so; panel-sessions.ts records what that costs.
+        //
+        // It used to BE the cookie, which made the token's 10-minute TTL the
+        // session's lifetime: the panel died mid-use and no amount of retrying
+        // could revive it, because only the sidecar may mint and the cookie is
+        // HttpOnly. A session is refreshed by nothing and outlives no
+        // revocation -- see the resolver, which re-checks enrollment.
+        //
+        // The long-lived enrollment JWT is still NOT accepted here, only on
+        // /sidecar/connect and the mint endpoint. There is NO shared dashboard
+        // token: enroll a device or (setup only) set auth.insecure_open_access.
         if (!self.insecureOpenAccess && !isPublicRoute(pathname, req.method)) {
-          const accepts = async (tok: string | null): Promise<boolean> => {
-            if (!tok) return false;
-            if (self.sidecarManager && (await self.sidecarManager.verifyAccessToken(tok))) return true;
-            return false;
-          };
-          const cookieToken = getCookie(req, 'token');
-          if (!(await accepts(cookieToken))) {
-            // Check ?token= query param — set cookie via Set-Cookie and redirect
+          const cookie = getCookie(req, PANEL_SESSION_COOKIE);
+          const session = cookie && self.sidecarManager
+            ? self.sidecarManager.resolvePanelSession(cookie)
+            : null;
+          if (session) {
+            // Remembered for the /ws upgrade below, which binds the socket to
+            // the session so an open panel counts as live (panel-sessions.ts).
+            panelSessionId = session.id;
+          }
+          if (!session) {
+            // No session yet (a freshly spawned panel) or a dead one. Bootstrap
+            // from ?token=, then redirect to the same URL WITHOUT it so the
+            // credential does not survive in the address bar or history.
             const queryToken = url.searchParams.get('token');
-            if (await accepts(queryToken)) {
+            const opened = queryToken && self.sidecarManager
+              ? await self.sidecarManager.openPanelSession(queryToken)
+              : null;
+            if (opened) {
               const cleanParams = new URLSearchParams(url.searchParams);
               cleanParams.delete('token');
               const qs = cleanParams.toString();
               const redirectTo = pathname + (qs ? '?' + qs : '');
               // Mark the cookie Secure whenever the connection is TLS (directly,
-              // or terminated upstream and forwarded) so the token can't leak
-              // over a downgraded http request to the same host.
+              // or terminated upstream and forwarded) so the session id can't
+              // leak over a downgraded http request to the same host.
               const xfProto = (req.headers.get('x-forwarded-proto') ?? '').split(',')[0]?.trim();
               const isHttps = url.protocol === 'https:' || xfProto === 'https';
-              const cookie = `token=${queryToken}; Path=/; SameSite=Lax; HttpOnly` +
+              // No Max-Age on purpose: the cookie dies with the webview, and
+              // the store's absolute cap is what bounds it server-side.
+              const cookie = `${PANEL_SESSION_COOKIE}=${opened.id}; Path=/; SameSite=Lax; HttpOnly` +
                 (isHttps ? '; Secure' : '');
               return new Response(null, {
                 status: 302,
@@ -342,15 +386,20 @@ export class WebSocketServer {
               return new Response('Forbidden: origin mismatch', { status: 403 });
             }
           }
-          const success = server.upgrade(req, { data: {} });
+          const success = server.upgrade(req, { data: { panel_session: panelSessionId ?? undefined } });
           if (success) return undefined;
           return new Response('WebSocket upgrade failed', { status: 500 });
         }
 
-        // 3. Health check (always public)
+        // 3. Health check (always public). `version` is the pinned release the
+        // process was launched from (systemd sets JARVIS_VERSION from the
+        // per-instance EnvironmentFile); the hosting control plane reads it to
+        // CONFIRM a rolling update actually landed on the target version rather
+        // than trusting the restart. `null` on self-host (no pin).
         if (pathname === '/health') {
           return Response.json({
             status: 'ok',
+            version: process.env.JARVIS_VERSION ?? null,
             uptime: Date.now() - self.startTime,
             clients: self.clients.size,
             timestamp: Date.now(),
@@ -375,7 +424,10 @@ export class WebSocketServer {
                 return new Response('Dev server not running', { status: 502 });
               }
               const success = server.upgrade(req, {
-                data: { proxy_target: targetUrl },
+                // panel_session so a revoked device's dev-server bridge is hung
+                // up on like any other panel socket; it passed the same auth
+                // block to get here.
+                data: { proxy_target: targetUrl, panel_session: panelSessionId ?? undefined },
               });
               if (success) return undefined;
               return new Response('WebSocket upgrade failed', { status: 500 });
@@ -398,6 +450,11 @@ export class WebSocketServer {
                 'Access-Control-Allow-Headers': 'Content-Type',
               },
             });
+          }
+
+          // Cross-site write guard; see cross-site-guard.ts for the reasoning.
+          if (rejectsCrossSiteWrite(req.method, req.headers.get('sec-fetch-site'), isPublicRoute(pathname, req.method))) {
+            return Response.json({ error: 'Cross-site requests are not accepted' }, { status: 403 });
           }
 
           // Try exact match first
@@ -425,19 +482,20 @@ export class WebSocketServer {
           return Response.json({ error: 'Not found' }, { status: 404 });
         }
 
-        // 5a. Overlay widget (served from ui/ source, not dist/)
-        if (pathname === '/overlay' && self.staticDir) {
-          // overlay.html lives in the ui/ source directory (parent of dist/)
-          const overlayPath = path.join(self.staticDir, '..', 'overlay.html');
-          const overlayFile = Bun.file(overlayPath);
-          if (await overlayFile.exists()) {
-            if (!self.insecureOpenAccess) {
-              const html = await overlayFile.text();
-              return new Response(injectTokenStrip(html), { headers: { 'Content-Type': 'text/html' } });
-            }
-            return new Response(overlayFile, { headers: { 'Content-Type': 'text/html' } });
-          }
-        }
+        // (Removed) `GET /overlay` served ui/overlay.html, the old-dashboard
+        // awareness widget. The widget itself was removed earlier, for cause:
+        // it auto-launched a Chromium window pointed here, which connected as
+        // a WebSocket client and made the daemon's proactive TTS play THROUGH
+        // it, talking over the native pebble's realtime voice (see the
+        // "(Removed)" note in daemon/index.ts). Nothing has launched or
+        // fetched this route since; the page kept two WebSocket constructions,
+        // so serving it only offered a way to re-arm that regression by hand,
+        // and under `insecure_open_access` it served with no token at all.
+        //
+        // #642 proposed shipping the file so the route would stop 404ing in
+        // the image and the npm tarball. That had the polarity backwards: a
+        // 404 was the correct answer for an orphaned route, so the route is
+        // gone instead of the gap being filled.
 
         // 5b. Static files (dashboard)
         if (self.staticDir) {
@@ -457,9 +515,20 @@ export class WebSocketServer {
 
           const file = Bun.file(filePath);
           if (await file.exists()) {
-            if (!self.insecureOpenAccess && filePath.endsWith('.html')) {
-              const html = await file.text();
-              return new Response(injectTokenStrip(html), { headers: { 'Content-Type': 'text/html' } });
+            if (filePath.endsWith('.html')) {
+              // The HTML points at content-hashed JS/CSS bundles. Never let a
+              // browser or reverse proxy retain an old shell after an update,
+              // otherwise newly deployed controls (such as Stop) remain
+              // invisible even though the new bundle exists on the server.
+              const headers = {
+                'Content-Type': 'text/html',
+                'Cache-Control': 'no-store',
+              };
+              if (!self.insecureOpenAccess) {
+                const html = await file.text();
+                return new Response(injectTokenStrip(html), { headers });
+              }
+              return new Response(file, { headers });
             }
             return new Response(file);
           }
@@ -487,7 +556,11 @@ export class WebSocketServer {
           if (req.headers.get('upgrade')?.toLowerCase() === 'websocket') {
             const targetUrl = self.siteProxy.getWebSocketTargetFromCookie(req, pathname);
             if (targetUrl) {
-              const success = server.upgrade(req, { data: { proxy_target: targetUrl } });
+              const success = server.upgrade(req, {
+                // panel_session so a revoked device's dev-server bridge is hung up on
+                // like any other panel socket; it passed the same auth block.
+                data: { proxy_target: targetUrl, panel_session: panelSessionId ?? undefined },
+              });
               if (success) return undefined;
             }
           }
@@ -504,6 +577,13 @@ export class WebSocketServer {
         maxPayloadLength: 16 * 1024 * 1024,
 
         open(ws) {
+          // Before any branch: every socket that carried a panel session is
+          // tracked, including the HMR bridge below, which returns early. An
+          // untracked socket is one no teardown can hang up on.
+          if (ws.data?.panel_session) {
+            self.sidecarManager?.panelSocketOpened(ws.data.panel_session, ws);
+          }
+
           // HMR proxy WebSocket — bridge to dev server
           const proxyTarget = (ws.data as any)?.proxy_target as string | undefined;
           if (proxyTarget) {
@@ -525,6 +605,12 @@ export class WebSocketServer {
 
           const sidecarId = (ws.data as any)?.sidecar_id as string | undefined;
           if (sidecarId && self.sidecarManager) {
+            // Dedicated realtime audio channel — register it, don't treat it as
+            // a second control connection.
+            if ((ws.data as any)?.channel === 'audio') {
+              self.sidecarManager.registerAudioChannel(sidecarId, ws);
+              return;
+            }
             self.sidecarManager.handleSidecarConnect(ws, sidecarId);
             return;
           }
@@ -546,6 +632,12 @@ export class WebSocketServer {
 
           const sidecarId = (ws.data as any)?.sidecar_id as string | undefined;
           if (sidecarId && self.sidecarManager) {
+            // Audio channel: binary frames are mic PCM; route them to the
+            // realtime session (text frames, if any, are control — ignored here).
+            if ((ws.data as any)?.channel === 'audio') {
+              if (message instanceof Buffer) self.sidecarManager.handleAudioFrame(sidecarId, message);
+              return;
+            }
             self.sidecarManager.handleSidecarMessage(ws, message);
             return;
           }
@@ -594,6 +686,14 @@ export class WebSocketServer {
         },
 
         close(ws) {
+          // Mirrors open(): before any early return. A panel's window going
+          // away takes its sockets with it, on every platform and every spawn
+          // path, and that is what marks the session collectable
+          // (PANEL_SESSION_IDLE_MS).
+          if (ws.data?.panel_session) {
+            self.sidecarManager?.panelSocketClosed(ws.data.panel_session, ws);
+          }
+
           // HMR proxy cleanup
           const proxyUpstream = (ws.data as any)?._proxyUpstream as WebSocket | undefined;
           if (proxyUpstream) {
@@ -603,7 +703,13 @@ export class WebSocketServer {
 
           const sidecarId = (ws.data as any)?.sidecar_id as string | undefined;
           if (sidecarId && self.sidecarManager) {
-            self.sidecarManager.handleSidecarDisconnect(sidecarId);
+            // Audio channel closing must NOT tear down the control connection —
+            // just deregister the pipe.
+            if ((ws.data as any)?.channel === 'audio') {
+              self.sidecarManager.unregisterAudioChannel(sidecarId, ws);
+              return;
+            }
+            self.sidecarManager.handleSidecarDisconnect(sidecarId, ws);
             return;
           }
 
@@ -642,7 +748,12 @@ export class WebSocketServer {
       console.log(`[WebSocketServer] Health endpoint: http://localhost:${this.port}/health`);
     }
     if (this.staticDir) {
-      console.log(`[WebSocketServer] Dashboard: http://localhost:${this.port}/`);
+      // Not a localhost URL in unix-socket mode: nothing is listening on
+      // this.port there, and the log would advertise a dashboard that is not
+      // reachable that way (#544, same class as the CLI's open step).
+      console.log(this.unixPath
+        ? `[WebSocketServer] Dashboard: served over unix:${this.unixPath}`
+        : `[WebSocketServer] Dashboard: http://localhost:${this.port}/`);
     }
   }
 
@@ -668,13 +779,17 @@ export class WebSocketServer {
   }
 
   broadcast(message: WSMessage): void {
+    this.broadcastWithReceipt(message);
+  }
+
+  /** Number of sockets accepting the frame, including queued backpressure. Not a read receipt. */
+  broadcastWithReceipt(message: WSMessage): number {
     const payload = JSON.stringify(message);
     let sent = 0;
 
     for (const client of this.clients) {
       try {
-        client.send(payload);
-        sent++;
+        if (client.send(payload) !== 0) sent++;
       } catch (error) {
         console.error('[WebSocketServer] Error broadcasting to client:', error);
       }
@@ -684,6 +799,7 @@ export class WebSocketServer {
     if (sent === 0 && this.clients.size > 0) {
       console.warn(`[WebSocketServer] Broadcast failed: 0/${this.clients.size} clients received message`);
     }
+    return sent;
   }
 
   send(client: ServerWebSocket<unknown>, message: WSMessage): void {

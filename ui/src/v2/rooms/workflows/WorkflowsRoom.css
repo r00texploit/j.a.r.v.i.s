@@ -585,6 +585,10 @@
   border-radius: var(--radius-2, 6px);
   background: var(--surface-1);
 }
+/* Managed install: a row is a name and a sentence -- no chips, no meta line,
+   no action column. The full row padding was sized around a two-line control;
+   across the whole catalog it reads as a stack of cards rather than a list. */
+.wf-lib__row--managed { padding: var(--s-2) var(--s-3); }
 .wf-lib__row-main { display: flex; flex-direction: column; gap: 4px; flex: 1 1 auto; min-width: 0; }
 .wf-lib__row-title { display: flex; align-items: center; gap: var(--s-1); flex-wrap: wrap; }
 .wf-lib__row-name { font-weight: 600; color: var(--ink-1); }
@@ -612,3 +616,24 @@
   word-break: break-word;
   line-height: 1.4;
 }
+
+/* ═══════════════════ Brand Book III / Monochrome Lab ═══════════════════
+   Room chrome (design room 01 §01): Workflows list, Connections, Library.
+   Drop corners on rows/cards, Familjen weight on titles, blue focus, and
+   the amber #fbbf24 leak remapped to --hold. */
+.wf-room { --accent-warn: var(--hold); }
+.wf-list,
+.wf-conn__row,
+.wf-lib__row,
+.wf-detail,
+.wf-empty,
+.wf-conn__form,
+.wf-list__warning-full { border-radius: var(--corner); }
+.wf-list__title,
+.wf-detail__title,
+.wf-conn__title,
+.wf-lib__header,
+.wf-room__header { font-weight: 700; letter-spacing: -0.01em; }
+.wf-room__tabs button[aria-selected="true"],
+.wf-room__tabs button[data-active="true"] { border-radius: var(--corner-sm); }
+.wf-room :focus-visible { outline-color: var(--speak); }

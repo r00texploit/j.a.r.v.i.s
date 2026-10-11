@@ -5,10 +5,23 @@
  * Returns a routes object for Bun.serve().
  */
 
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import { DEBUG_RPC_HEADER, debugRpcGate, debugRpcTokenMatches } from './debug-rpc-gate.ts';
 import type { HealthMonitor } from './health.ts';
+import { applyApprovalDecision, applyExecutionResolution } from './approval-decision.ts';
+import { executionState } from '../authority/approval.ts';
+import { createWorkItemRoutes } from '../goals/work-item-routes.ts';
+import { isPermissionName, readSystemPermissions, requestSystemPermission } from './system-permissions.ts';
+import { PANEL_SESSION_COOKIE } from '../sidecar/panel-sessions.ts';
+import { SIDECAR_LATEST_VERSION } from '../sidecar/compat.ts';
+import { SidecarRPCError } from '../sidecar/rpc.ts';
+import { getCookie } from '../util/cookie.ts';
+import { SecretStorageError } from './section-secrets.ts';
 import type { AgentService } from './agent-service.ts';
 import type { JarvisConfig } from '../config/types.ts';
-import { resolveRealtimeVoice, DEFAULT_BLOCKED_CATEGORIES } from '../config/realtime.ts';
+import { realtimeServedByPlan, resolveRealtimeVoice, DEFAULT_BLOCKED_CATEGORIES } from '../config/realtime.ts';
+import { hasUsejarvisAi, isHostedInstall, effectiveSttForBinding, effectiveTtsForBinding, realtimeEnablement, usejarvisVoiceCredentials } from './usejarvis-ai.ts';
+import { cachedRealtimeVerdict } from './realtime-gate.ts';
 import type { EntityType } from '../vault/entities.ts';
 import type { CommitmentPriority, CommitmentStatus } from '../vault/commitments.ts';
 import type { ObservationType } from '../vault/observations.ts';
@@ -23,7 +36,8 @@ import { applyQuickOverride } from '../authority/quick-override.ts';
 import type { ActionCategory } from '../roles/authority.ts';
 
 import { findEntities, getEntity, searchEntitiesByName, createEntity } from '../vault/entities.ts';
-import { findFacts, createFact } from '../vault/facts.ts';
+import { findFacts, createFact, FactInputError } from '../vault/facts.ts';
+import { createFactDecisionRoutes } from '../vault/fact-routes.ts';
 import { findRelationships, getEntityRelationships, createRelationship } from '../vault/relationships.ts';
 import { listFlows } from '../workflows/db/repos/flow.ts';
 import { getFlowVersion, getLatestDraft } from '../workflows/db/repos/flow-version.ts';
@@ -32,6 +46,7 @@ const VALID_ENTITY_TYPES = new Set(['person', 'project', 'tool', 'place', 'conce
 import { getDb } from '../vault/schema.ts';
 import { findCommitments, getUpcoming, createCommitment, getCommitment, updateCommitmentStatus, reorderCommitments } from '../vault/commitments.ts';
 import { getOrCreateConversation, getMessages, getRecentConversation } from '../vault/conversations.ts';
+import { telegramAllowList, discordAllowList } from '../comms/channels/allow-list.ts';
 import { getRecentObservations, summarizeObservation } from '../vault/observations.ts';
 import { listAgentActivity, countAgentActivity } from '../vault/agent-activity.ts';
 import { getPersonality } from '../personality/model.ts';
@@ -61,6 +76,8 @@ import { mkdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { isWithin } from '../util/path.ts';
+import { externalUrl, resolveExternalOrigin } from '../util/external-origin.ts';
+import { GoogleOAuthFlowStore } from '../integrations/google-oauth-flow.ts';
 
 // --- Security helpers ---
 
@@ -101,6 +118,7 @@ import type { WebSocketService } from './ws-service.ts';
 import type { ChannelService } from './channel-service.ts';
 
 import type { AwarenessService } from '../awareness/service.ts';
+import { createOpportunityRoutes } from '../awareness/opportunity-routes.ts';
 import { readFileSync } from 'node:fs';
 import {
   getCapture,
@@ -113,8 +131,16 @@ import {
   isAutostartInstalled,
   scheduleAutostartRestart,
 } from '../cli/autostart.ts';
+import { runWithOrigin } from '../llm/origin.ts';
+import { getGoalApplication } from '../goals/application-service.ts';
+import { readGoalEvents } from '../goals/event-delivery.ts';
+import { GoalValidationError, number as goalNumber, keys as goalKeys, record as goalRecord } from '../goals/validation.ts';
+
+import { createSuggestionFeedbackRoutes } from '../awareness/suggestion-feedback-routes.ts';
+import { approvalIntentFields } from '../authority/approval-delivery.ts';
 
 export type ApiContext = {
+  suggestionComposer?: import('../awareness/suggestion-composer.ts').SuggestionComposer | null;
   /**
    * Daemon process boot time (Date.now() at start). Surfaced via the
    * onboarding-status endpoint so the dashboard can detect when setup
@@ -129,6 +155,15 @@ export type ApiContext = {
   healthMonitor: HealthMonitor;
   agentService: AgentService;
   config: JarvisConfig;
+  /**
+   * Where the Google tokens live. Only set by tests.
+   *
+   * GoogleAuth otherwise resolves this through os.homedir(), which Bun fixes at
+   * process start and no test can redirect — so without this seam the Google
+   * status endpoint reads whatever tokens the machine running the tests happens
+   * to have, and its reconnect/authenticated branches cannot be exercised at all.
+   */
+  googleTokensPath?: string;
   wsService?: WebSocketService;
   channelService?: ChannelService;
   authorityEngine?: AuthorityEngine;
@@ -158,7 +193,27 @@ export type ApiContext = {
    * show the "Restart Jarvis" fallback banner.
    */
   isPostSetupServicesReady?: () => boolean;
+  /**
+   * Settings hot reload coordinator. Wired by the daemon at boot; runs
+   * per-section appliers so DB-backed settings (channels, STT, Google
+   * observers, ...) apply to the running process without a restart.
+   */
+  settingsReload?: import('./settings-reload.ts').SettingsReloadCoordinator;
+  /**
+   * Observer service, for the hosted push bridge's doorbell to poll on demand.
+   * Absent when observers are not running, which the webhook reports honestly
+   * rather than pretending to have synced.
+   */
+  observerService?: { syncNow(source: 'gmail' | 'calendar'): Promise<string[]> };
 };
+
+/**
+ * How far out of date a push doorbell may be. Generous, because it is bounded by
+ * Pub/Sub's retry window and clock skew between two machines, not by anything
+ * precise — the point is to reject a captured notification replayed hours later,
+ * not to police seconds.
+ */
+const NOTIFY_MAX_SKEW_MS = 5 * 60 * 1000;
 
 // CORS headers — scoped to the dashboard origin, not wildcard
 let CORS: Record<string, string> = {
@@ -168,9 +223,9 @@ let CORS: Record<string, string> = {
 };
 
 /** Call once during init to set the correct CORS origin from config */
-export function setCorsOrigin(port: number, host = 'localhost') {
+export function setCorsOrigin(origin: string) {
   CORS = {
-    'Access-Control-Allow-Origin': `http://${host}:${port}`,
+    'Access-Control-Allow-Origin': origin.replace(/\/+$/, ''),
     'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
   };
@@ -187,6 +242,20 @@ function error(message: string, status = 400): Response {
 function errorFromException(err: unknown): Response {
   if (err instanceof HttpError) return error(err.message, err.status);
   return error(err instanceof Error ? err.message : String(err), 500);
+}
+
+/**
+ * Failure path shared by the config POST handlers. A malformed body is the
+ * caller's fault (400), but a credential the keychain refused is ours: the
+ * setting genuinely did not persist, and reporting that as "Invalid request
+ * body" would send the user hunting for a typo in a valid request.
+ */
+function configSaveError(context: string, err: unknown): Response {
+  console.error(`[API] ${context}:`, err);
+  if (err instanceof SecretStorageError) {
+    return json({ ok: false, message: err.message }, 500);
+  }
+  return error('Invalid request body');
 }
 
 function getSearchParams(req: Request): URLSearchParams {
@@ -279,10 +348,65 @@ function buildAgentSnapshots(ctx: ApiContext) {
  * Create all API route handlers.
  */
 export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
+  const googleOAuthFlows = new GoogleOAuthFlowStore();
+
+  /**
+   * POST /api/sidecars/:id/{update-prompt,update}: forward to the sidecar's
+   * self-update RPC. 409 when the sidecar is offline, 422 when it does not
+   * advertise the feature (older sidecars), 409 with the sidecar's reason when
+   * it refuses (nothing to install, an update already running).
+   */
+  async function sidecarUpdateRoute(
+    req: Request,
+    feature: 'update_prompt' | 'update_apply',
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<Response> {
+    const parts = new URL(req.url).pathname.split('/');
+    const id = parts[parts.length - 2]!;
+    try {
+      if (!ctx.sidecarManager) return error('Sidecar manager not available', 503);
+      if (!ctx.sidecarManager.isConnected(id)) {
+        return error('Sidecar is not connected', 409);
+      }
+      const info = ctx.sidecarManager.getSidecar(id);
+      if (!info?.features?.includes(feature)) {
+        return error('This sidecar cannot do that; update it manually', 422);
+      }
+      const result = await ctx.sidecarManager.dispatchRPC(id, method, params);
+      return json({ ok: true, result });
+    } catch (err) {
+      // The sidecar's own refusal (nothing to install, already updating):
+      // its message, without the code prefix, for the dashboard to show.
+      if (err instanceof SidecarRPCError) {
+        return json({ error: err.message.replace(/^[A-Z_]+: /, ''), code: err.code }, 409);
+      }
+      if (ctx.sidecarManager && !ctx.sidecarManager.isConnected(id)) {
+        return error('Sidecar disconnected', 409);
+      }
+      return error(`${err}`, 500);
+    }
+  }
+
   return {
+    ...createOpportunityRoutes(json),
     // --- Health ---
     '/api/health': {
       GET: () => json(ctx.healthMonitor.getHealth()),
+    },
+
+    '/api/system/external-origin': {
+      GET: (req: Request) => {
+        const resolved = resolveExternalOrigin(ctx.config, req);
+        return json({
+          public_origin: resolved.httpOrigin,
+          websocket_origin: resolved.wsOrigin,
+          source: resolved.source,
+          proxy_detected: resolved.proxyDetected,
+          google_callback: externalUrl(resolved, '/api/auth/google/callback'),
+          warnings: resolved.warnings,
+        });
+      },
     },
 
     // --- Vault: Entities ---
@@ -339,10 +463,11 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     },
 
     // --- Vault: Facts ---
+    ...createFactDecisionRoutes(json),
     '/api/vault/facts': {
       GET: (req: Request) => {
         const params = getSearchParams(req);
-        const query: { subject_id?: string; predicate?: string; object?: string } = {};
+        const query: Parameters<typeof findFacts>[0] = { includeSuperseded: params.get('include_superseded') === 'true' };
         const subjectId = params.get('subject_id');
         const predicate = params.get('predicate');
         const object = params.get('object');
@@ -359,6 +484,9 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             object?: string;
             confidence?: number;
             source?: string;
+            scope?: string;
+            valid_from?: number;
+            valid_to?: number;
           };
           if (!body.subject_id || !body.predicate || !body.object) {
             return error('subject_id, predicate, and object are required', 400);
@@ -368,9 +496,10 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           const fact = createFact(body.subject_id, body.predicate, body.object, {
             confidence: body.confidence,
             source: body.source ?? 'dashboard',
+            scope: body.scope, validFrom: body.valid_from, validTo: body.valid_to,
           });
           return json(fact);
-        } catch (err) { return errorFromException(err); }
+        } catch (err) { return err instanceof FactInputError ? error(err.message, err.status) : errorFromException(err); }
       },
     },
 
@@ -760,6 +889,11 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             },
           };
 
+          // Refuse BEFORE spawning: a cap hit after it would leave an idle
+          // agent behind for a task that never started.
+          if (body.task?.trim() && !taskManager.canLaunch()) {
+            return error('Too many agent tasks are already running. Wait for one to finish.', 429);
+          }
           const spawned = spawnPersistentAgent(deps, body.specialist ?? '');
           let assignment: Awaited<ReturnType<typeof assignPersistentAgentTask>> | null = null;
 
@@ -1292,6 +1426,44 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             tts?: Record<string, unknown>;
           };
 
+          // 0. Hosted installs answer LLM/STT/TTS from the platform, so the
+          //    wizard hides those steps and sends no provider config. Enforce
+          //    that HERE rather than trusting the client: a stale cached
+          //    bundle, a replayed request, or curl would otherwise pin the
+          //    account off its own plan — writing llm.default (which makes
+          //    effectiveLlmForBinding bail out and disables all four uj-*
+          //    tiers) or tts.provider (which marks the user as having chosen,
+          //    so the included voice never applies again).
+          //
+          //    `mode` is the one LLM field a hosted install may set: it
+          //    records the architecture choice without naming a provider or a
+          //    model, and without it the settings tab misreports multi-tier
+          //    as single. Everything else is dropped.
+          //    `tts.enabled` is likewise kept: whether the assistant SPEAKS is
+          //    not a provider choice, and dropping it would leave a hosted
+          //    install mute (DEFAULT_CONFIG has it false) while the wizard
+          //    promises the plan includes voice. The provider field is still
+          //    stripped, so the row stays silent and the included uj voice
+          //    applies.
+          // Whatever the guard strips is REPORTED back (`dropped`): a wizard
+          // that raced the hosted probe may have collected provider config
+          // the guard is about to discard — answering plain ok would let it
+          // print "✓ brain · Anthropic" for credentials that were never
+          // saved (review pr7#4).
+          const dropped: string[] = [];
+          if (hasUsejarvisAi(ctx.config)) {
+            const llmBody = body.llm as { mode?: unknown; providers?: unknown; default?: unknown } | undefined;
+            const mode = llmBody?.mode;
+            if (llmBody && (llmBody.providers !== undefined || llmBody.default !== undefined)) dropped.push('llm');
+            body.llm = mode === 'single' || mode === 'multi-tier' ? { mode } : undefined;
+            if (body.stt !== undefined) dropped.push('stt');
+            body.stt = undefined;
+            const ttsBody = body.tts as { enabled?: unknown; provider?: unknown } | undefined;
+            if (ttsBody && Object.keys(ttsBody).some((k) => k !== 'enabled')) dropped.push('tts');
+            const enabled = ttsBody?.enabled;
+            body.tts = typeof enabled === 'boolean' ? { enabled } : undefined;
+          }
+
           // 1. LLM settings — same path as /api/config/llm POST.
           if (body.llm && Object.keys(body.llm).length > 0) {
             const { saveLLMSettings, hotReloadLLMProviders } = await import('./llm-settings.ts');
@@ -1304,32 +1476,40 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           //    daemon kill (or crash) between them persisted setup HALF-done
           //    — TTS saved but the completion flag lost — and the user was
           //    funneled back into onboarding on the next boot.
-          const { saveUserSection } = await import('./user-settings.ts');
+          const { saveUserSection, persistUserPatch } = await import('./user-settings.ts');
           const { mergeSTTConfig, mergeTTSConfig } = await import('./config-merge.ts');
-          const fresh = ctx.config;
-          if (body.stt) {
-            // Mirrors /api/config/stt POST semantics. STT is consumed at
-            // the next transcription request, so no hot-swap is needed.
-            fresh.stt = mergeSTTConfig(fresh.stt, body.stt);
-          }
-          if (body.tts) {
-            fresh.tts = mergeTTSConfig(fresh.tts, body.tts);
-          }
+          // Everything is merged into LOCALS and published to ctx.config only
+          // after all three saves succeeded. saveUserSection throws when the
+          // keychain refuses a key, and a half-published config would leave the
+          // running daemon reporting setup as complete (GET /api/onboarding/
+          // status reads ctx.config) with no key stored.
+          const stt = body.stt ? mergeSTTConfig(ctx.config.stt, body.stt) : undefined;
+          const tts = body.tts ? mergeTTSConfig(ctx.config.tts, body.tts) : undefined;
           const now = Date.now();
-          fresh.onboarding = {
+          const onboarding = {
             setup_completed_at: now,
-            tutorial_completed_at: fresh.onboarding?.tutorial_completed_at ?? null,
-            setup_skipped_profile: fresh.onboarding?.setup_skipped_profile,
-            tutorial_dismissed_at: fresh.onboarding?.tutorial_dismissed_at,
-            tutorial_progress_step: fresh.onboarding?.tutorial_progress_step,
-            last_reset_at: fresh.onboarding?.last_reset_at,
+            tutorial_completed_at: ctx.config.onboarding?.tutorial_completed_at ?? null,
+            setup_skipped_profile: ctx.config.onboarding?.setup_skipped_profile,
+            tutorial_dismissed_at: ctx.config.onboarding?.tutorial_dismissed_at,
+            tutorial_progress_step: ctx.config.onboarding?.tutorial_progress_step,
+            last_reset_at: ctx.config.onboarding?.last_reset_at,
           };
-          if (body.stt) saveUserSection('stt', fresh.stt);
-          if (body.tts) saveUserSection('tts', fresh.tts);
-          saveUserSection('onboarding', fresh.onboarding);
-          if (body.stt) ctx.config.stt = fresh.stt;
-          if (body.tts) ctx.config.tts = fresh.tts;
-          ctx.config.onboarding = fresh.onboarding;
+          // Credential-bearing sections first, the completion flag LAST: a
+          // keychain failure throws out of here, and the flag not being written
+          // is what we want — setup did not succeed, so the wizard must run
+          // again rather than leave the user with a "done" marker and no key.
+          //
+          // Persist the wizard's PATCHES over the stored rows (not the merged
+          // sections): a declined voice step ({enabled:false} with no
+          // provider) must not stamp the DEFAULT provider into the row, or
+          // every onboarded hosted install would read as "explicitly chose
+          // Edge" and never get the included Usejarvis AI default.
+          if (body.stt) persistUserPatch('stt', body.stt);
+          if (body.tts) persistUserPatch('tts', body.tts);
+          saveUserSection('onboarding', onboarding);
+          if (stt) ctx.config.stt = stt;
+          if (tts) ctx.config.tts = tts;
+          ctx.config.onboarding = onboarding;
 
           // 3. Hot-reload the TTS provider when possible so the post-setup
           //    "Welcome to Jarvis" reply is spoken immediately.
@@ -1337,7 +1517,8 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             try {
               if (ctx.config.tts && ctx.wsService) {
                 const { createTTSProvider } = await import('../comms/voice.ts');
-                const provider = await createTTSProvider(ctx.config.tts);
+                const ttsBinding = effectiveTtsForBinding(ctx.config) ?? ctx.config.tts;
+                const provider = createTTSProvider(ttsBinding, usejarvisVoiceCredentials(ctx.config));
                 if (provider) ctx.wsService.setTTSProvider(provider);
               }
             } catch (err) {
@@ -1368,6 +1549,9 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             ok: true,
             setup_completed_at: now,
             post_setup_services_started: postSetupStarted,
+            // Sections the hosted guard stripped from this request, so the
+            // wizard can tell the user instead of claiming they were saved.
+            dropped,
             message: 'Setup complete. Jarvis is ready.',
           });
         } catch (err) {
@@ -1386,7 +1570,12 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           // canonical summary - provider names, single-LLM default, and the
           // tier map. The dedicated dashboard endpoint is /api/config/llm.
           llm: {
-            providers: Object.keys(config.llm.providers ?? {}),
+            // Hosted installs: hide the injected reserved provider, matching
+            // getLLMSettings — a client that round-trips this list into a
+            // save would hit the managed-provider 400 (pr2 review #9).
+            providers: Object.keys(config.llm.providers ?? {}).filter(
+              (name) => name !== 'usejarvis_ai' || !hasUsejarvisAi(config),
+            ),
             default: config.llm.default ?? null,
             tiers: config.llm.tiers ?? {},
           },
@@ -1396,6 +1585,88 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           active_role: config.active_role,
           voice: config.voice ?? { wake_engine: 'openwakeword' },
         });
+      },
+    },
+
+    // Force a full re-read of the DB-backed settings into the running
+    // daemon. Covers edits made outside the process (sqlite3 CLI, another
+    // tool); same path as SIGHUP. In-process saves don't need this — the
+    // saveUserSection choke point already runs the appliers.
+    '/api/config/reload': {
+      POST: async () => {
+        if (!ctx.settingsReload) return error('Settings hot reload not available', 503);
+        try {
+          const result = await ctx.settingsReload.reloadAll();
+          return json({ ok: result.errors.length === 0, ...result });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return error(`Settings reload failed: ${msg}`, 500);
+        }
+      },
+    },
+
+    /**
+     * What the desktop app on this machine has been granted, and how to ask
+     * for what it has not. Feeds the onboarding wizard's Permissions screen,
+     * which before this could neither read a status nor open a settings pane
+     * (see system-permissions.ts for why both halves were broken).
+     *
+     * Answers about ONE machine, resolved from the panel session this request
+     * carries. `available: false` with a reason is a normal answer, not an
+     * error: a brain with no desktop app connected, or one that cannot tell
+     * which of several is being looked at, genuinely has nothing to say, and
+     * the screen renders that case rather than dead buttons.
+     */
+    '/api/system/permissions': {
+      GET: async (req: Request) => {
+        if (!ctx.sidecarManager) return error('Sidecar manager not available', 503);
+        const result = await readSystemPermissions(
+          ctx.sidecarManager,
+          getCookie(req, PANEL_SESSION_COOKIE),
+        );
+        return json(result);
+      },
+    },
+
+    '/api/system/permissions/request': {
+      POST: async (req: Request) => {
+        if (!ctx.sidecarManager) return error('Sidecar manager not available', 503);
+        // This route's visible effect is a dialog and a System Settings window
+        // on the user's desktop, which makes it the one worth hardening against
+        // a drive-by POST. Under auth.insecure_open_access -- the setup-time
+        // configuration, i.e. exactly when this screen is on -- there is no
+        // cookie to withhold, and a body posted as text/plain is a CORS
+        // "simple request" that needs no preflight, so any page the user is
+        // browsing could pop TCC prompts. Demanding a JSON content type forces
+        // a preflight, which the configured allow-origin then bounds; the
+        // Sec-Fetch-Site check catches a browser that sends it. (The request
+        // router now applies a Sec-Fetch-Site guard to every non-GET API
+        // route, comms/cross-site-guard.ts; this one stays as defence in
+        // depth for the route where the effect is a desktop prompt.)
+        if (!(req.headers.get('content-type') ?? '').toLowerCase().includes('application/json')) {
+          return error('Content-Type: application/json required', 415);
+        }
+        if (req.headers.get('sec-fetch-site') === 'cross-site') {
+          return error('Cross-site requests are not accepted here', 403);
+        }
+        let body: unknown;
+        try {
+          body = await req.json();
+        } catch {
+          return error('Invalid JSON body');
+        }
+        const name = (body as { name?: unknown } | null)?.name;
+        // The name reaches an `open` in the sidecar. It is checked there too;
+        // this is the edge of the system and the cheaper place to refuse.
+        if (!isPermissionName(name)) {
+          return error(`Unknown permission: ${String(name)}`);
+        }
+        const result = await requestSystemPermission(
+          ctx.sidecarManager,
+          getCookie(req, PANEL_SESSION_COOKIE),
+          name,
+        );
+        return json(result);
       },
     },
 
@@ -1460,7 +1731,15 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     '/api/config/llm/test': {
       POST: async (req: Request) => {
         try {
-          const body = await req.json() as { provider: string; api_key?: string; model?: string; base_url?: string };
+          const body = await req.json() as {
+            name?: string;
+            provider?: string;
+            kind?: import('../config/types.ts').LLMProviderKind;
+            api_key?: string;
+            model?: string;
+            base_url?: string;
+            auth_header?: string;
+          };
           const { testLLMProvider } = await import('./llm-settings.ts');
           const result = await testLLMProvider(body, ctx.config);
           return json(result);
@@ -1486,6 +1765,201 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           const key = getSecret('llm.provider.nvidia.api_key') ?? '';
           const provider = new NVIDIAProvider(key);
           const models = await provider.listModels();
+          return json({ ok: true, models });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return json({ ok: false, error: msg, models: [] });
+        }
+      },
+    },
+
+    // Live model catalog for Ollama. Unlike the cloud providers, an Ollama
+    // install only serves the models the operator actually pulled, and every
+    // one of them carries a tag ("qwen2.5:3b"). A curated list can only ever
+    // guess, and a guessed *untagged* id ("qwen2.5") resolves to ":latest",
+    // which is typically NOT pulled -> `model not found` at first chat.
+    // Ask the server instead. `base_url` is a query param because onboarding
+    // tests a URL the user has typed but not saved yet; it falls back to the
+    // configured entry, then to the default endpoint.
+    '/api/config/llm/ollama/models': {
+      GET: async (req: Request) => {
+        try {
+          const { OllamaProvider } = await import('../llm/ollama.ts');
+          const typed = new URL(req.url).searchParams.get('base_url')?.trim();
+          if (typed && !/^https?:\/\//i.test(typed)) {
+            return json({ ok: false, error: 'base_url must be an http(s) URL', models: [] });
+          }
+          const configured = Object.values(ctx.config.llm.providers ?? {})
+            .find((e) => e?.kind === 'ollama')?.base_url;
+          const baseUrl = typed || configured || 'http://localhost:11434';
+          const models = await new OllamaProvider(baseUrl).listModels();
+          return json({ ok: true, models });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return json({ ok: false, error: msg, models: [] });
+        }
+      },
+    },
+
+    // Live Usejarvis AI catalog: the uj-* aliases THIS account's key may
+    // call (the proxy filters per key, so there is no hardcoded list). The
+    // provider is built from the system-owned config.yaml block — the route
+    // takes no credentials and never echoes the base_url or key back.
+    /**
+     * The owner's billing summary, for Settings -> Billing and the shell banner
+     * (control plane: docs/BILLING.md "Billing inside the brain").
+     *
+     * Read-only. The response carries the parsed summary and the account-page
+     * LINKS every change goes through, opened in the system browser; never the
+     * endpoint, the instance id or the secret.
+     *
+     * - self-hosted: 503, like the usage meter — there is no bill to show;
+     * - hosted but no billing block, or the read failed: 200 `{ ok: false }`,
+     *   with links when the block names a page, so the user still has a way to
+     *   their account;
+     * - `?fresh=1` re-reads (bounded, see BILLING_FRESH_MIN_MS) for a user who
+     *   just came back from changing something.
+     */
+    '/api/billing': {
+      GET: async (req: Request) => {
+        const { readHostedBillingConfig, readHostedBilling, billingLinks } = await import('./hosted-billing.ts');
+        const cfg = readHostedBillingConfig(ctx.config);
+        if (!cfg) {
+          const { isHostedInstall } = await import('./usejarvis-ai.ts');
+          if (!isHostedInstall(ctx.config)) {
+            return error('Billing is only available on hosted installs.', 503);
+          }
+          return json({ ok: false, error: 'Billing is unavailable right now', links: null });
+        }
+        const fresh = new URL(req.url).searchParams.get('fresh') === '1';
+        const summary = await readHostedBilling(ctx.config, { fresh });
+        const links = billingLinks(cfg.pageUrl);
+        return summary
+          ? json({ ok: true, summary, links })
+          : json({ ok: false, error: 'Billing is unavailable right now', links });
+      },
+    },
+
+    /**
+     * This instance's hosted usage meter — % of each window used and when they
+     * reset (docs/LLM.md on the control plane, "Windows + meters").
+     *
+     * Hosted-only, like its neighbour below: a self-hosted install has no key,
+     * no plan and no windows, so 503 is the honest answer rather than zeros.
+     *
+     * Degrades to `{ ok: false }` rather than throwing, and never carries the
+     * upstream body — the control-plane host is withheld here for the same
+     * reason the catalog route withholds the proxy's.
+     */
+    '/api/llm/budget': {
+      GET: async () => {
+        const { hasUsejarvisAi } = await import('./usejarvis-ai.ts');
+        if (!hasUsejarvisAi(ctx.config)) {
+          return error('The usage meter is only available on hosted installs.', 503);
+        }
+        const { readHostedUsage } = await import('./hosted-usage.ts');
+        const meter = await readHostedUsage(ctx.config);
+        return meter
+          ? json({ ok: true, meter })
+          : json({ ok: false, error: 'Usage is unavailable right now' });
+      },
+    },
+
+    '/api/config/llm/usejarvis/models': {
+      GET: async () => {
+        const { hasUsejarvisAi } = await import('./usejarvis-ai.ts');
+        if (!hasUsejarvisAi(ctx.config)) {
+          return error('Usejarvis AI is only available on hosted installs.', 503);
+        }
+        try {
+          const { UsejarvisAIProvider } = await import('../llm/usejarvis.ts');
+          const { noteHostedCatalog } = await import('./usejarvis-ai.ts');
+          const block = ctx.config.usejarvis_ai!;
+          const provider = new UsejarvisAIProvider(block.base_url!.trim(), block.api_key!.trim());
+          const { models, degraded } = await provider.listModelsDetailed();
+          // A live catalog feeds the save-time allowlist; a degraded one never
+          // does (it would shrink the allowlist to the fallback four). The
+          // flag lets the dashboard show "plan catalog unreachable — Retry"
+          // instead of presenting the fallback as the plan's truth.
+          noteHostedCatalog(models, degraded);
+          return json({ ok: true, models, degraded });
+        } catch (err) {
+          // listModels embeds the upstream response body in its errors, and a
+          // CDN/proxy error page can echo the hosted base_url hostname this
+          // surface deliberately hides — the detail stays in the server log.
+          console.warn(
+            '[LLM] Usejarvis AI catalog fetch failed:',
+            err instanceof Error ? err.message : err,
+          );
+          return json({ ok: false, error: 'Usejarvis AI catalog unavailable', models: [] });
+        }
+      },
+    },
+
+    // Full OmniRoute catalog: provider models, free routes, automatic routes,
+    // and user-defined combos. POST keeps an onboarding API key out of the URL
+    // and also supports a saved provider by name from Settings.
+    '/api/config/llm/omniroute/models': {
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as {
+            name?: string;
+            base_url?: string;
+            api_key?: string;
+          };
+          // Effective kind is `entry.kind ?? name` (see config-binding.ts) -
+          // a provider simply named "omniroute" counts too.
+          const providers = ctx.config.llm.providers ?? {};
+          const providerName = body.name
+            ?? Object.keys(providers).find((name) => (providers[name]?.kind ?? name) === 'omniroute');
+          const configured = providerName ? providers[providerName] : undefined;
+          if (body.name && (!configured || (configured.kind ?? body.name) !== 'omniroute')) {
+            return json({ ok: false, error: 'OmniRoute provider not found', models: [] });
+          }
+          const requestedBaseUrl = body.base_url?.trim();
+          const baseUrl = requestedBaseUrl || configured?.base_url?.trim() || 'http://localhost:20128/v1';
+          if (!/^https?:\/\//i.test(baseUrl)) {
+            return json({ ok: false, error: 'base_url must be an http(s) URL', models: [] });
+          }
+
+          // Saved credentials only travel to the saved base URL - a caller-typed
+          // base_url never gets the stored key attached.
+          const { getSecret } = await import('../vault/keychain.ts');
+          const storedApiKey = requestedBaseUrl
+            ? null
+            : (providerName ? getSecret(`llm.provider.${providerName}.api_key`) : null) || configured?.api_key;
+          const apiKey = body.api_key || storedApiKey || '';
+          const { OmniRouteProvider } = await import('../llm/omniroute.ts');
+          const models = await new OmniRouteProvider(baseUrl, 'auto', apiKey).listModels();
+          return json({ ok: true, models });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return json({ ok: false, error: msg, models: [] });
+        }
+      },
+    },
+
+    // Keep Groq's changing model catalog out of hard-coded UI lists.
+    '/api/config/llm/groq/models': {
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as { name?: string; api_key?: string };
+          const providers = ctx.config.llm.providers ?? {};
+          const providerName = body.name
+            ?? Object.keys(providers).find((name) => (providers[name]?.kind ?? name) === 'groq');
+          const configured = providerName ? providers[providerName] : undefined;
+          if (body.name && (!configured || (configured.kind ?? body.name) !== 'groq')) {
+            return json({ ok: false, error: 'Groq provider not found', models: [] });
+          }
+          const { getSecret } = await import('../vault/keychain.ts');
+          const apiKey = body.api_key
+            || (providerName ? getSecret(`llm.provider.${providerName}.api_key`) : null)
+            || configured?.api_key
+            || '';
+          if (!apiKey) return json({ ok: false, error: 'Groq API key required', models: [] });
+
+          const { GroqProvider } = await import('../llm/groq.ts');
+          const models = await new GroqProvider(apiKey).listModels();
           return json({ ok: true, models });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -1845,7 +2319,10 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         const params = getSearchParams(req);
         const code = params.get('code');
         const authError = params.get('error');
+        const state = params.get('state');
 
+        // A denial has nothing to protect and nothing to exchange — render it
+        // before touching (and burning) the one-time state.
         if (authError) {
           return new Response(
             `<html><body><h1>Authorization Denied</h1><p>${escapeHtml(authError)}</p><p>You can close this tab.</p></body></html>`,
@@ -1857,6 +2334,18 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           return error('Missing authorization code', 400);
         }
 
+        // Top-level browser navigation: state failures get an HTML page, not JSON.
+        const pendingFlow = state ? googleOAuthFlows.consume(state) : null;
+        if (!pendingFlow) {
+          const reason = state
+            ? 'This authorization link was already used or has expired.'
+            : 'This authorization link is missing its OAuth state.';
+          return new Response(
+            `<html><body><h1>Authorization Failed</h1><p>${reason}</p><p>Start Google authorization again from the Jarvis dashboard.</p></body></html>`,
+            { headers: { ...CORS, 'Content-Type': 'text/html' }, status: 400 }
+          );
+        }
+
         // Try to exchange the code using GoogleAuth from context
         const googleConfig = ctx.config.google;
         if (!googleConfig?.client_id || !googleConfig?.client_secret) {
@@ -1866,8 +2355,16 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         try {
           // Lazy import to avoid circular deps
           const { GoogleAuth } = await import('../integrations/google-auth.ts');
-          const auth = new GoogleAuth(googleConfig.client_id, googleConfig.client_secret);
-          await auth.exchangeCode(code);
+          const auth = new GoogleAuth(googleConfig.client_id, googleConfig.client_secret, {
+            redirectUri: pendingFlow.redirectUri,
+          });
+          await auth.exchangeCode(code, { codeVerifier: pendingFlow.codeVerifier });
+
+          // The exchange above used a throwaway GoogleAuth that saved the
+          // tokens to disk; nudge the hot-reload applier so the daemon's
+          // long-lived auth re-reads them and the observers start now
+          // (no saveGoogleSettings fires here, so this is explicit).
+          ctx.settingsReload?.sectionChanged('google');
 
           return new Response(
             `<html><body style="font-family:system-ui;text-align:center;padding:60px">
@@ -1894,27 +2391,86 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     '/api/auth/google/status': {
       GET: async () => {
         const googleConfig = ctx.config.google;
-        const hasCredentials = !!(googleConfig?.client_id && googleConfig?.client_secret);
+        const { classifyGoogle, makeGoogleAuth } = await import(
+          '../integrations/google-managed-refresh.ts'
+        );
+        const shape = classifyGoogle(ctx.config);
+        // A MANAGED instance has no client credentials by design — the control
+        // plane holds them and refreshes on its behalf — so "configured" cannot
+        // mean "has credentials" any more, or hosted would always read as
+        // not_configured.
+        const configured = shape.mode !== 'none';
+        // Control-plane managed (GOOGLE.md): the settings UI must show the hosted
+        // Connect button instead of the credentials form, because the account is
+        // connected THROUGH the control plane and this daemon's own OAuth flow
+        // cannot work here.
+        //
+        // From the CLASSIFIER, not from connect_url. Keyed on connect_url alone
+        // this disagreed with `configured` whenever a config had refresh_url and
+        // no connect_url: the instance was managed, refresh and the doorbell
+        // worked, and the tab still rendered the credentials form — whose save
+        // then 409s from the managed guard and whose OAuth button 400s. The
+        // control plane now refuses to boot without the link, and this reads the
+        // same source of truth the auth builder does.
+        const managed = shape.mode === 'managed';
+        const managedFields = managed
+          ? { managed: true as const, connect_url: googleConfig?.connect_url ?? null }
+          : { managed: false as const };
 
-        if (!hasCredentials) {
-          return json({ status: 'not_configured', has_credentials: false, is_authenticated: false, scopes: [], token_expiry: null });
+        if (!configured) {
+          return json({
+            status: 'not_configured',
+            configured: false,
+            is_authenticated: false,
+            scopes: [],
+            token_expiry: null,
+            // A config we REFUSED says why; "no Google here" says nothing.
+            ...(shape.reason ? { reason: shape.reason } : {}),
+            ...managedFields,
+          });
         }
 
         try {
-          const { GoogleAuth } = await import('../integrations/google-auth.ts');
-          const auth = new GoogleAuth(googleConfig!.client_id, googleConfig!.client_secret);
-          const authenticated = auth.isAuthenticated();
-          const tokens = auth.loadTokens();
+          const auth = makeGoogleAuth(ctx.config, undefined, ctx.googleTokensPath);
+          const tokens = auth?.loadTokens() ?? null;
+          // A revoked or expired grant leaves the tokens file exactly where it
+          // was, so "we have tokens" is not "Google works". When the grant is
+          // known to be gone, report NOT authenticated — that is what puts the
+          // Connect button back in front of the user instead of a green
+          // "connected" chip over a dead integration.
+          const reconnect = auth?.reconnectRequired() ?? null;
+          const authenticated = !reconnect && (auth?.isAuthenticated() ?? false);
 
           return json({
-            status: authenticated ? 'connected' : 'credentials_saved',
-            has_credentials: true,
+            // Managed and not yet authenticated is "waiting for the control
+            // plane to deliver", not "save your credentials" — there are none to
+            // save here.
+            status: reconnect
+              ? 'reconnect_required'
+              : authenticated
+                ? 'connected'
+                : managed
+                  ? 'not_connected'
+                  : 'credentials_saved',
+            configured: true,
             is_authenticated: authenticated,
+            ...(reconnect ? { reconnect_reason: reconnect } : {}),
             scopes: ['gmail.readonly', 'calendar.readonly'],
             token_expiry: tokens?.expiry_date ?? null,
+            ...managedFields,
           });
         } catch {
-          return json({ status: 'credentials_saved', has_credentials: true, is_authenticated: false, scopes: [], token_expiry: null });
+          // managedFields is carried here too: dropping it answered
+          // `credentials_saved` with no `managed`, i.e. the self-hosted
+          // credentials form on a hosted box — the same wrong UI as above.
+          return json({
+            status: managed ? 'not_connected' : 'credentials_saved',
+            configured: true,
+            is_authenticated: false,
+            scopes: [],
+            token_expiry: null,
+            ...managedFields,
+          });
         }
       },
     },
@@ -1922,12 +2478,24 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     '/api/config/google': {
       POST: async (req: Request) => {
         try {
+          // MANAGED instances must not accept credentials here (GOOGLE.md).
+          // The sibling /api/auth/google/init already refuses; this one did not,
+          // and it REPLACES the whole google section — so one POST from a stale
+          // tab or a curl dropped refresh_url, instance_id and notify_secret
+          // from the running config and persisted a row that then won on every
+          // reload: refresh dead, doorbell 404, managed UI gone. Silently.
+          const { classifyGoogle } = await import('../integrations/google-managed-refresh.ts');
+          if (classifyGoogle(ctx.config).mode === 'managed' || ctx.config.google?.refresh_url) {
+            return error(
+              'This instance is managed by usejarvis — its Google credentials are held by the control plane and cannot be set here.',
+              409,
+            );
+          }
           const body = await req.json() as { client_id: string; client_secret: string };
           if (!body.client_id || !body.client_secret) {
             return error('Missing client_id or client_secret');
           }
 
-          const { saveUserSection } = await import('./user-settings.ts');
           const freshConfig = ctx.config;
           freshConfig.google = { client_id: body.client_id, client_secret: body.client_secret };
           const { saveGoogleSettings } = await import('./user-settings.ts');
@@ -1947,23 +2515,105 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     '/api/auth/google/init': {
       POST: async () => {
         const googleConfig = ctx.config.google;
+        // MANAGED instances must not run this flow (GOOGLE.md). Its redirect URI
+        // is this instance's own hostname, which is not registered with Google —
+        // there is exactly ONE registered URI, on the control plane, precisely so
+        // that moving to another host does not break it. Starting the flow here
+        // therefore ends at a redirect_uri_mismatch error page, so it is refused
+        // at the API rather than only hidden in the UI.
+        if (googleConfig?.connect_url) {
+          return error(
+            `This instance is managed by usejarvis — connect Google from ${googleConfig.connect_url}`,
+            409,
+          );
+        }
         if (!googleConfig?.client_id || !googleConfig?.client_secret) {
           return error('Google credentials not configured. Save client_id and client_secret first.', 400);
         }
 
         try {
           const { GoogleAuth } = await import('../integrations/google-auth.ts');
-          const auth = new GoogleAuth(googleConfig.client_id, googleConfig.client_secret);
+          const externalOrigin = resolveExternalOrigin(ctx.config);
+          const redirectUri = externalUrl(externalOrigin, '/api/auth/google/callback');
+          const flow = googleOAuthFlows.start(redirectUri);
+          const auth = new GoogleAuth(googleConfig.client_id, googleConfig.client_secret, { redirectUri });
           const scopes = [
             'https://www.googleapis.com/auth/gmail.readonly',
             'https://www.googleapis.com/auth/calendar.readonly',
           ];
-          const authUrl = auth.getAuthUrl(scopes);
-          return json({ auth_url: authUrl });
+          const authUrl = auth.getAuthUrl(scopes, {
+            state: flow.state,
+            codeChallenge: flow.codeChallenge,
+          });
+          return json({ auth_url: authUrl, redirect_uri: redirectUri });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           return error(`Failed to generate auth URL: ${msg}`, 500);
         }
+      },
+    },
+
+
+    /**
+     * The push bridge's doorbell (GOOGLE.md "Push bridging"). HOSTED ONLY.
+     *
+     * PUBLIC route, deliberately, and it has to be: the caller is the control
+     * plane, which holds no enrolled-device token and must not. It lives under
+     * `/api/webhooks/` because that prefix is already the public, signature-
+     * verified machine-to-machine surface (see isPublicRoute) — inventing a new
+     * exception for one route would widen the unauthenticated surface for no
+     * reason. Two path segments so it cannot be confused with the workflow
+     * webhook ingress at `/api/webhooks/:flowId`.
+     *
+     * Authentication is the HMAC over the exact body, keyed by the per-instance
+     * notify_secret from the system config. Constant-time compared: this is a MAC
+     * check on attacker-supplied input, and a byte-by-byte early exit is what a
+     * forgery attempt measures.
+     *
+     * The body is a DOORBELL — `{source, at}`, no data — so the worst a forged
+     * one achieves is an early poll. That is why the answer is deliberately
+     * uninformative about which instance or address exists.
+     */
+    '/api/webhooks/google/notify': {
+      POST: async (req: Request) => {
+        const secret = ctx.config.google?.notify_secret;
+        // No secret configured = self-hosted, or a hosted instance whose config
+        // predates the bridge. Nothing can be verified, so nothing is accepted.
+        if (!secret) return error('not configured', 404);
+
+        const raw = await req.text();
+        const { INSTANCE_SIGNATURE_HEADER, verifyWithSecret } = await import(
+          '../integrations/google-signature.ts'
+        );
+        // Byte-length compare, via the shared helper: the hand-rolled version
+        // here gated on String.length, so a 64-CHARACTER non-ASCII signature got
+        // past it and made timingSafeEqual throw — a 500 with a stack instead of
+        // a 401, from any unauthenticated caller, on a deliberately public route.
+        if (!verifyWithSecret(secret, raw, req.headers.get(INSTANCE_SIGNATURE_HEADER))) {
+          return error('bad signature', 401);
+        }
+
+        let source: 'gmail' | 'calendar' | null = null;
+        let at = 0;
+        try {
+          const body = JSON.parse(raw) as { source?: unknown; at?: unknown };
+          if (body.source === 'gmail' || body.source === 'calendar') source = body.source;
+          if (typeof body.at === 'string') at = Date.parse(body.at);
+        } catch {
+          return error('bad body', 400);
+        }
+        if (!source) return error('bad body', 400);
+        // The timestamp is INSIDE the signed bytes, so a replayed doorbell can be
+        // rejected without keeping a nonce store: an old one is either a retry
+        // long past being useful or a capture being replayed, and the poll timer
+        // covers anything genuinely missed.
+        if (!Number.isFinite(at) || Math.abs(Date.now() - at) > NOTIFY_MAX_SKEW_MS) {
+          return error('stale', 400);
+        }
+
+        if (!ctx.observerService) return json({ ok: true, synced: [] });
+        const synced = await ctx.observerService.syncNow(source);
+        return json({ ok: true, synced });
       },
     },
 
@@ -1975,7 +2625,16 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             const { unlinkSync } = await import('node:fs');
             unlinkSync(tokensPath);
           }
-          return json({ ok: true, message: 'Disconnected. Restart JARVIS to deactivate observers.' });
+          // The google applier drops the daemon's in-memory tokens and
+          // restarts the observers, so the disconnect takes effect now.
+          if (!ctx.settingsReload) {
+            return json({ ok: true, message: 'Disconnected. Restart to deactivate observers (hot reload unavailable).' });
+          }
+          const applyErr = await ctx.settingsReload.applyNow('google');
+          if (applyErr) {
+            return json({ ok: false, message: `Disconnected, but deactivating observers failed: ${applyErr.error}` });
+          }
+          return json({ ok: true, message: 'Disconnected. Google observers deactivated.' });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           return error(`Failed to disconnect: ${msg}`, 500);
@@ -1987,9 +2646,17 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     '/api/channels/status': {
       GET: () => {
         if (!ctx.channelService) return json({ channels: {}, stt: null });
+        // Binding view, like the /api/config/stt GET: after a provider reset
+        // on a hosted install the raw section has no (or an empty sentinel)
+        // provider while transcription runs happily on 'usejarvis' — the raw
+        // read blanked the Channels header on a working install.
+        const sttBinding = effectiveSttForBinding(ctx.config);
         return json({
           channels: ctx.channelService.getChannelStatus(),
-          stt: ctx.config.stt?.provider ?? null,
+          // Per connected channel: whether approval requests and
+          // notifications have anywhere to go (#890).
+          recipients: ctx.channelService.getRecipientStatus(),
+          stt: sttBinding?.provider || ctx.config.stt?.provider || null,
         });
       },
     },
@@ -1997,48 +2664,125 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     '/api/config/channels': {
       GET: () => {
         const cfg = ctx.config.channels;
+        // The saved list is reported as the adapters read it (#883): the ids
+        // that name someone, plus what was ignored and why, so a hand-edited
+        // value that names nobody shows up on the settings page instead of
+        // only as a bot that never answers. The raw value could be any shape,
+        // and the page's `.join` on a string crashed the Channels tab.
+        const tgList = telegramAllowList(cfg?.telegram?.allowed_users);
+        const dcList = discordAllowList(cfg?.discord?.allowed_users);
         return json({
-          telegram: cfg?.telegram ? {
-            enabled: cfg.telegram.enabled,
-            has_token: !!cfg.telegram.bot_token,
-            allowed_users: cfg.telegram.allowed_users,
-          } : { enabled: false, has_token: false, allowed_users: [] },
-          discord: cfg?.discord ? {
-            enabled: cfg.discord.enabled,
-            has_token: !!cfg.discord.bot_token,
-            allowed_users: cfg.discord.allowed_users,
-            guild_id: cfg.discord.guild_id ?? null,
-          } : { enabled: false, has_token: false, allowed_users: [], guild_id: null },
+          telegram: {
+            enabled: cfg?.telegram?.enabled ?? false,
+            has_token: !!cfg?.telegram?.bot_token,
+            allowed_users: tgList.ids,
+            allowed_users_rejected: tgList.rejected,
+            allowed_users_problems: tgList.problems,
+          },
+          discord: {
+            enabled: cfg?.discord?.enabled ?? false,
+            has_token: !!cfg?.discord?.bot_token,
+            allowed_users: dcList.ids,
+            allowed_users_rejected: dcList.rejected,
+            allowed_users_problems: dcList.problems,
+            guild_id: cfg?.discord?.guild_id ?? null,
+          },
         });
       },
       POST: async (req: Request) => {
         try {
-          const body = await req.json() as Record<string, unknown>;
+          let body: unknown;
+          try {
+            body = await req.json();
+          } catch {
+            return error('Expected a JSON body');
+          }
+          // Every key checked, unknown ones refused, nothing saved unless the
+          // whole body is valid (#883). This was spread over the section with
+          // `as any`, so `allowed_users: "12345"` was saved and made the chat
+          // gate a substring match.
+          const { validateChannelsPatch } = await import('./channels-config-patch.ts');
+          const checked = validateChannelsPatch(body);
+          if (!checked.ok) return error(checked.error);
           const { saveUserSection } = await import('./user-settings.ts');
-          const freshConfig = ctx.config;
 
-          if (!freshConfig.channels) freshConfig.channels = {};
-
-          if (body.telegram && typeof body.telegram === 'object') {
-            freshConfig.channels.telegram = {
-              ...freshConfig.channels.telegram,
-              ...(body.telegram as Record<string, unknown>),
-            } as any;
+          // Merge into a LOCAL copy: saveUserSection throws when the keychain
+          // refuses the token, and mutating ctx.config first would leave the
+          // running daemon holding a credential the API just reported as not
+          // saved (GET would answer has_token: true) until the next restart.
+          const merged: NonNullable<JarvisConfig['channels']> = { ...ctx.config.channels };
+          if (checked.patch.telegram) {
+            merged.telegram = {
+              enabled: false, bot_token: '', allowed_users: [],
+              ...merged.telegram,
+              ...checked.patch.telegram,
+            };
           }
-          if (body.discord && typeof body.discord === 'object') {
-            freshConfig.channels.discord = {
-              ...freshConfig.channels.discord,
-              ...(body.discord as Record<string, unknown>),
-            } as any;
+          if (checked.patch.discord) {
+            const { guild_id, ...rest } = checked.patch.discord;
+            const discord: NonNullable<NonNullable<JarvisConfig['channels']>['discord']> = {
+              enabled: false, bot_token: '', allowed_users: [],
+              ...merged.discord,
+              ...rest,
+            };
+            if (guild_id === null) delete discord.guild_id;
+            else if (guild_id !== undefined) discord.guild_id = guild_id;
+            merged.discord = discord;
           }
 
-          saveUserSection('channels', freshConfig.channels);
-          ctx.config.channels = freshConfig.channels;
+          // An enabled channel must name somebody (#908). Checked on the MERGED
+          // result, not the patch, because a patch is partial in both
+          // directions: `{telegram: {enabled: true}}` says nothing about the
+          // saved list, and `{telegram: {allowed_users: []}}` reaches the same
+          // open state on a channel that is already enabled. Only the merge
+          // knows what the save would actually leave behind.
+          //
+          // Why this is refused rather than warned: at the default authority
+          // level an unlisted sender's turn gets run_command, read_file,
+          // write_file and browser_navigate with requiresApproval false, and
+          // taint gating does not engage because their message IS the user
+          // turn. So an enabled channel with an empty list is shell access for
+          // anyone who can reach the bot -- any member of a Discord guild it is
+          // in, with no discovery needed. Refusing at save time means there is
+          // no window in which the channel is enabled and open.
+          // Only the channels this save TOUCHES, the same scope #890's warning
+          // below uses. Scanning both would let one channel's pre-#908 state
+          // block an unrelated save -- including the save that disables it --
+          // and a config already holding that state is the startup path's job,
+          // which refuses to start such a channel and says why.
+          const openChannel = (['telegram', 'discord'] as const).find((name) => {
+            if (!checked.patch[name]) return false;
+            const ch = merged[name];
+            return ch?.enabled === true && (ch.allowed_users ?? []).length === 0;
+          });
+          if (openChannel) {
+            return error(
+              `${openChannel}.allowed_users must name at least one user before the channel can be enabled. ` +
+              'An enabled channel with an empty list lets anyone who can reach the bot run commands and ' +
+              'read or write files with your authority.',
+            );
+          }
+          saveUserSection('channels', merged);
+          ctx.config.channels = merged;
 
-          return json({ ok: true, message: 'Channel config saved. Restart JARVIS to apply changes.' });
+          if (!ctx.settingsReload) {
+            return json({ ok: true, message: 'Channel config saved. Restart to apply (hot reload unavailable).' });
+          }
+          const applyErr = await ctx.settingsReload.applyNow('channels');
+          if (applyErr) {
+            return json({ ok: false, message: `Channel config saved, but applying it failed: ${applyErr.error}` });
+          }
+          // Say so now if the save left a channel with nowhere to send
+          // approval requests, e.g. the recipient was just removed (#890).
+          const { recipientWarning } = await import('./channel-service.ts');
+          // Only the channels this save touched: saving Discord says nothing
+          // about Telegram.
+          const status = ctx.channelService?.getRecipientStatus() ?? {};
+          const touched = Object.fromEntries(Object.entries(status).filter(([name]) => name in (checked.patch as Record<string, unknown>)));
+          const warning = recipientWarning(touched);
+          return json({ ok: true, message: warning ? `Channel config saved and applied. ${warning}` : 'Channel config saved and applied.' });
         } catch (err) {
-          console.error('[API] Error saving channels config:', err);
-          return error('Invalid request body');
+          return configSaveError('Error saving channels config', err);
         }
       },
     },
@@ -2046,8 +2790,18 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     '/api/config/stt': {
       GET: () => {
         const stt = ctx.config.stt;
+        // `provider` reports the BINDING view: on hosted installs where the
+        // user never chose, it reads 'usejarvis' (what actually transcribes)
+        // while the persisted cfg.stt row stays untouched. No key material —
+        // the hosted credentials live only in the system config.
+        const effective = effectiveSttForBinding(ctx.config);
         return json({
-          provider: stt?.provider ?? 'openai',
+          provider: effective?.provider ?? stt?.provider ?? 'openai',
+          usejarvis_available: hasUsejarvisAi(ctx.config),
+          // Empty string = auto-detect (the language param is omitted from
+          // provider requests). Surfaced so hosted users — who have no shell
+          // access to config.yaml — can change it from the dashboard.
+          language: stt?.language ?? '',
           has_openai_key: !!stt?.openai?.api_key,
           has_groq_key: !!stt?.groq?.api_key,
           has_sarvam_key: !!stt?.sarvam?.api_key,
@@ -2059,17 +2813,77 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       POST: async (req: Request) => {
         try {
           const body = await req.json() as Record<string, unknown>;
-          const { saveUserSection } = await import('./user-settings.ts');
+          const { persistUserPatch, clearProviderChoice } = await import('./user-settings.ts');
           const { mergeSTTConfig } = await import('./config-merge.ts');
-          const freshConfig = ctx.config;
 
-          freshConfig.stt = mergeSTTConfig(freshConfig.stt, body);
-          saveUserSection('stt', freshConfig.stt);
-          ctx.config.stt = freshConfig.stt;
-          return json({ ok: true, message: 'STT config saved. Restart JARVIS to apply changes.' });
+          // `provider: null` means "reset to the plan default": drop the
+          // recorded choice so the row is silent again and
+          // effectiveSttForBinding fills it with the included uj stack.
+          // Writing 'usejarvis' instead would record a choice and pin them.
+          // Runs BEFORE provider validation: null is a command, not a
+          // provider value. Hosted only: on a self-hosted install there is no
+          // plan default to fall back TO, so clearing the choice would leave
+          // createSTTProvider with nothing to build and silently kill
+          // transcription.
+          if (body.provider === null) {
+            if (!hasUsejarvisAi(ctx.config)) {
+              return error('No plan default to reset to on a self-hosted install');
+            }
+            const cleared = clearProviderChoice('stt');
+            if (!cleared) {
+              return json({ ok: true, message: 'Nothing to reset — no transcription choice is recorded, so your plan default already applies.' });
+            }
+            if (ctx.config.stt) delete (ctx.config.stt as Record<string, unknown>).provider;
+            if (!ctx.settingsReload) {
+              return json({ ok: true, message: 'Reset to your plan default. Restart to apply.' });
+            }
+            const resetErr = await ctx.settingsReload.applyNow('stt');
+            return json(resetErr
+              ? { ok: false, message: `Reset saved, but applying it failed: ${resetErr.error}` }
+              : { ok: true, message: 'Reset to your plan default.' });
+          }
+
+          // Validate before anything persists: an unknown provider (or
+          // 'usejarvis' on a self-hosted install, where createSTTProvider can
+          // never construct it) previously saved fine and answered ok:true —
+          // then STT was silently dead on every surface with only a console
+          // line to show for it.
+          const STT_PROVIDERS = ['openai', 'groq', 'local', 'sarvam', 'usejarvis'];
+          if (body.provider !== undefined) {
+            if (typeof body.provider !== 'string' || !STT_PROVIDERS.includes(body.provider)) {
+              return json({ ok: false, message: `Unknown STT provider: ${String(body.provider)}` }, 400);
+            }
+            if (body.provider === 'usejarvis' && !hasUsejarvisAi(ctx.config)) {
+              return json({ ok: false, message: 'Usejarvis AI transcription is only available on hosted installs.' }, 400);
+            }
+          }
+          // The hosted credentials never live in cfg.stt — a 'usejarvis'
+          // sub-block in the patch would persist a key into the plaintext
+          // settings row, the exact leak the credential split exists to stop.
+          delete body.usejarvis;
+
+          // Merged locally and published only once the save succeeded (a
+          // throwing keychain must not leave the live config holding a key the
+          // API reported as rejected), but what gets PERSISTED is the request
+          // patch, not the merged section: the merge carries DEFAULT_CONFIG
+          // fills, and storing those would stamp a provider choice the user
+          // never made and permanently defeat the hosted-default silence
+          // detection. Appliers run on a scheduled tick, so they observe the
+          // published config below rather than this frame.
+          const merged = mergeSTTConfig(ctx.config.stt, body);
+          persistUserPatch('stt', body);
+          ctx.config.stt = merged;
+
+          if (!ctx.settingsReload) {
+            return json({ ok: true, message: 'STT config saved. Restart to apply (hot reload unavailable).' });
+          }
+          const applyErr = await ctx.settingsReload.applyNow('stt');
+          if (applyErr) {
+            return json({ ok: false, message: `STT config saved, but applying it failed: ${applyErr.error}` });
+          }
+          return json({ ok: true, message: 'STT config saved and applied.' });
         } catch (err) {
-          console.error('[API] Error saving STT config:', err);
-          return error('Invalid request body');
+          return configSaveError('Error saving STT config', err);
         }
       },
     },
@@ -2077,9 +2891,14 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     '/api/config/tts': {
       GET: () => {
         const tts = ctx.config.tts;
+        // Same shape as GET /api/config/stt: `provider` is the BINDING view
+        // (hosted installs with no recorded choice read 'usejarvis'), the
+        // persisted cfg.tts row stays pure user intent, no key material.
+        const effective = effectiveTtsForBinding(ctx.config);
         return json({
           enabled: tts?.enabled ?? false,
-          provider: tts?.provider ?? 'edge',
+          provider: effective?.provider ?? tts?.provider ?? 'edge',
+          usejarvis_available: hasUsejarvisAi(ctx.config),
           voice: tts?.voice ?? 'en-US-AriaNeural',
           rate: tts?.rate ?? '+0%',
           volume: tts?.volume ?? '+0%',
@@ -2102,27 +2921,78 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       POST: async (req: Request) => {
         try {
           const body = await req.json() as Record<string, unknown>;
-          const { saveUserSection } = await import('./user-settings.ts');
-          const { mergeTTSConfig } = await import('./config-merge.ts');
-          const freshConfig = ctx.config;
+          const { persistUserPatch, clearProviderChoice } = await import('./user-settings.ts');
 
-          freshConfig.tts = mergeTTSConfig(freshConfig.tts, body);
-          saveUserSection('tts', freshConfig.tts);
-          ctx.config.tts = freshConfig.tts;
+          // `provider: null` resets to the plan default, mirroring the STT
+          // route: a command, handled before provider validation.
+          if (body.provider === null) {
+            if (!hasUsejarvisAi(ctx.config)) {
+              return error('No plan default to reset to on a self-hosted install');
+            }
+            const cleared = clearProviderChoice('tts');
+            if (!cleared) {
+              return json({ ok: true, message: 'Nothing to reset — no voice choice is recorded, so your plan default already applies.' });
+            }
+            if (ctx.config.tts) delete (ctx.config.tts as Record<string, unknown>).provider;
+            if (!ctx.settingsReload) {
+              return json({ ok: true, message: 'Reset to your plan default. Restart to apply.' });
+            }
+            const resetErr = await ctx.settingsReload.applyNow('tts');
+            return json(resetErr
+              ? { ok: false, message: `Reset saved, but applying it failed: ${resetErr.error}` }
+              : { ok: true, message: 'Reset to your plan default.' });
+          }
+
+          // Validate the provider before anything persists: an unknown string
+          // (or 'usejarvis' on a self-hosted install, where no hosted
+          // credentials exist to bind it) would be recorded as a choice that
+          // createTTSProvider can never construct — voice silently dead with
+          // an ok:true toast.
+          if (body.provider !== undefined) {
+            const VALID_TTS_PROVIDERS = ['edge', 'elevenlabs', 'sarvam', 'usejarvis'];
+            if (typeof body.provider !== 'string' || !VALID_TTS_PROVIDERS.includes(body.provider)) {
+              return json({ ok: false, error: `Unknown TTS provider: ${String(body.provider)}` }, 400);
+            }
+            if (body.provider === 'usejarvis' && !hasUsejarvisAi(ctx.config)) {
+              return json({ ok: false, error: 'The Usejarvis AI voice is only available on hosted installs; pick edge, elevenlabs or sarvam.' }, 400);
+            }
+          }
+          const { mergeTTSConfig } = await import('./config-merge.ts');
+
+          // Same discipline as /api/config/stt POST above: single merge,
+          // persist the request patch over the STORED row, publish only after
+          // the persist succeeded. Without patch-over-row persistence, the
+          // "Enable TTS" toggle (whose body carries no explicit choice) would
+          // stamp the DEFAULT provider 'edge' into the row as user intent.
+          const merged = mergeTTSConfig(ctx.config.tts, body);
+          persistUserPatch('tts', body);
+          ctx.config.tts = merged;
 
           // Hot-reload TTS provider if wsService available
-          if (ctx.wsService && freshConfig.tts) {
+          if (ctx.wsService && merged) {
             const { createTTSProvider } = await import('../comms/voice.ts');
-            const provider = createTTSProvider(freshConfig.tts);
-            if (provider) {
-              ctx.wsService.setTTSProvider(provider);
+            // Bind through the routing view: a hosted user who never chose a
+            // provider must get the included voice, not the DEFAULT_CONFIG
+            // 'edge' fill that `merged` carries. ctx.config.tts is already
+            // the post-save value (assigned above).
+            const ttsBinding = effectiveTtsForBinding(ctx.config) ?? merged;
+            const provider = createTTSProvider(ttsBinding, usejarvisVoiceCredentials(ctx.config));
+            // Always publish the result — including null. Leaving the previous
+            // provider live after a save that yields none (disabled, or a
+            // provider missing its key) keeps a stale voice speaking while the
+            // response claims the new config applied.
+            ctx.wsService.setTTSProvider(provider);
+            if (!provider) {
+              const reason = merged.enabled === false
+                ? 'TTS config saved; speech is off.'
+                : 'TTS config saved, but no voice is active yet (the selected provider has no usable credentials).';
+              return json({ ok: true, message: reason });
             }
           }
 
           return json({ ok: true, message: 'TTS config saved.' });
         } catch (err) {
-          console.error('[API] Error saving TTS config:', err);
-          return error('Invalid request body');
+          return configSaveError('Error saving TTS config', err);
         }
       },
     },
@@ -2132,16 +3002,38 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       GET: () => {
         const voice = ctx.config.voice;
         const rt = voice?.realtime;
-        // Surface whether realtime would actually resolve (BYO key cascade),
-        // so the UI can show "active / no key" without exposing secrets.
+        // The BINDING view, not the raw field: on a hosted install a tenant who
+        // never chose gets realtime on, and reporting the stored false here
+        // would show an off toggle for a feature that is actually running.
+        const enablement = realtimeEnablement(ctx.config);
+        const enabledNow = enablement !== 'off';
+        // Whether realtime would actually resolve, so the UI can show its state
+        // without exposing secrets. The plan gate is part of "available": this
+        // flag is what puts the browser into raw-PCM capture mode, so reporting
+        // true for a plan that excludes uj-realtime makes client and server
+        // disagree about the wire format for a whole utterance.
+        //
+        // Read through the CACHE-ONLY gate, which never stalls this poll. It
+        // does now start a background fetch on a miss or a stale entry — that
+        // changed when the boot warm turned out not to cover a cache cleared by
+        // SIGHUP — but the entry it writes ends the misses, so the ceiling is
+        // one request per cache-empty poll rather than one per poll. An unknown
+        // verdict still reads as available, matching the gate's advisory stance.
         let available = false;
         try {
-          available = resolveRealtimeVoice(ctx.config).ok;
+          const res = resolveRealtimeVoice(ctx.config, enablement);
+          available = res.ok && cachedRealtimeVerdict(res.resolved) !== false;
         } catch { available = false; }
+        // NOT derived from the resolution above: that is computed under the
+        // CURRENT enablement, so a tenant with realtime off resolves ok:false
+        // and would be told they are billed by OpenAI — next to the toggle
+        // they are deciding whether to flip. Who would serve a session is a
+        // property of the install, not of whether one is switched on.
+        const hostedRealtime = realtimeServedByPlan(ctx.config);
         return json({
           wake_engine: voice?.wake_engine ?? 'openwakeword',
           realtime: {
-            enabled: rt?.enabled ?? false,
+            enabled: enabledNow,
             model: rt?.model ?? 'gpt-realtime-2',
             voice: rt?.voice ?? null,
             reasoning_effort: rt?.reasoning_effort ?? 'low',
@@ -2155,6 +3047,19 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             // it is so a client can tell "using the default" from an explicit set.
             blocked_categories: rt?.blocked_categories ?? DEFAULT_BLOCKED_CATEGORIES,
             blocked_categories_default: rt?.blocked_categories === undefined,
+            // WHY it is on, so the tab can stop telling a hosted tenant they
+            // are billed by OpenAI at $0.30/min for something their plan
+            // includes, and can name the real reason it is unavailable ("not
+            // in your plan") instead of "no OpenAI provider is configured".
+            // Same shape as blocked_categories_default above: the effective
+            // value plus a flag saying whose answer it is.
+            enabled_default: enablement === 'hosted-default',
+            // Who would actually SERVE a session, not merely whether this
+            // install is hosted. The tab's billing copy keys off this: saying
+            // "included in your plan" while a BYO key was about to be charged
+            // is the assurance that made the billing bug worse than silent.
+            served_by_plan: hostedRealtime,
+            hosted: hasUsejarvisAi(ctx.config),
             // true when enabled AND an OpenAI provider key resolves (via
             // llm.providers or env) - reflects whether realtime would actually
             // start if voice_start arrived right now.
@@ -2165,15 +3070,20 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       POST: async (req: Request) => {
         try {
           const body = await req.json() as Record<string, unknown>;
-          const { saveUserSection } = await import('./user-settings.ts');
+          const { persistUserPatch } = await import('./user-settings.ts');
           const { mergeVoiceConfig, validateVoicePatch } = await import('./config-merge.ts');
 
           const validation = validateVoicePatch(body);
           if (!validation.ok) return error(validation.error, 400);
 
+          // Persist the PATCH over the stored row, never the merged in-memory
+          // section: the latter always carries DEFAULT_CONFIG's
+          // `realtime.enabled: false`, and writing that back reads as the user
+          // explicitly declining realtime. The in-memory config is still
+          // updated below for the next voice_start — the two differ on purpose.
+          persistUserPatch('voice', validation.patch as Record<string, unknown>);
           const freshConfig = ctx.config;
           freshConfig.voice = mergeVoiceConfig(freshConfig.voice, validation.patch);
-          saveUserSection('voice', freshConfig.voice);
           // Update in-memory config so the next voice_start resolves with the
           // new settings — resolveRealtimeVoice reads ctx.config live, so no
           // provider hot-reload is needed (unlike TTS/LLM).
@@ -2218,6 +3128,61 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
+    /**
+     * Synthesize a short sample with the given voice params and return the
+     * raw MP3 bytes, so the UI (onboarding + settings) can PLAY a preview
+     * directly instead of relying on the WS/Pebble broadcast path. The config
+     * passed here is EPHEMERAL — nothing is saved, so it never disturbs the
+     * live TTS. For ElevenLabs this doubles as a real key test: a synthesis
+     * call exercises the same TTS path (and scope) the app actually uses, so
+     * a key that lacks `voices_read` but can synthesize still passes.
+     */
+    '/api/tts/preview': {
+      POST: async (req: Request) => {
+        try {
+          const body = (await req.json().catch(() => ({}))) as {
+            provider?: string; voice?: string; api_key?: string; voice_id?: string; model?: string; text?: string;
+          };
+          const text = (typeof body.text === 'string' && body.text.trim() ? body.text.trim() : "Hi, I'm Jarvis. This is how I'll sound.").slice(0, 280);
+          const cfg: Record<string, unknown> = {
+            enabled: true,
+            provider: body.provider === 'elevenlabs' || body.provider === 'usejarvis' ? body.provider : 'edge',
+          };
+          if (body.provider === 'elevenlabs') {
+            if (!body.api_key) return error('ElevenLabs API key required.', 400);
+            cfg.elevenlabs = {
+              api_key: body.api_key,
+              voice_id: typeof body.voice_id === 'string' ? body.voice_id : undefined,
+              model: typeof body.model === 'string' ? body.model : undefined,
+            };
+          } else if (body.provider === 'usejarvis') {
+            // Hosted preview: no key in the body — the factory gets the
+            // system-owned proxy credentials as its separate argument below.
+            if (!hasUsejarvisAi(ctx.config)) return error('Usejarvis AI is not available on this install.', 400);
+            if (typeof body.voice === 'string' && body.voice) {
+              // Reject Edge neural names outright instead of letting the
+              // factory silently preview 'alloy' — the sample the user hears
+              // must be the voice they asked for.
+              if (/Neural$/i.test(body.voice)) {
+                return error(`"${body.voice}" is an Edge TTS voice — Usejarvis AI uses OpenAI-style voices (e.g. alloy).`, 400);
+              }
+              cfg.voice = body.voice;
+            }
+          } else {
+            cfg.voice = body.voice || 'en-US-AriaNeural';
+          }
+          const { createTTSProvider } = await import('../comms/voice.ts');
+          const provider = createTTSProvider(cfg as never, usejarvisVoiceCredentials(ctx.config));
+          if (!provider) return error('Could not build a TTS provider from those settings.', 400);
+          const audio = await provider.synthesize(text);
+          return new Response(new Uint8Array(audio), { headers: { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store' } });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return error(msg, 502);
+        }
+      },
+    },
+
     // --- Authority & Autonomy ---
     '/api/authority/status': {
       GET: () => {
@@ -2230,6 +3195,8 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           enabled: true,
           emergency_state: emergency.getState(),
           pending_approvals: approvals?.getPending().length ?? 0,
+          // Approved before a restart and never receipted; they need a decision too.
+          unresolved_approvals: approvals?.getUnresolved().length ?? 0,
           config: engine.getConfig(),
         });
       },
@@ -2243,28 +3210,28 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         const rows =
           status === 'pending'
             ? ctx.approvalManager.getPending()
-            : ctx.approvalManager.getHistory({
-                limit: parseInt(params.get('limit') ?? '50') || 50,
-                action: (params.get('action') as ActionCategory) || undefined,
-                agentId: params.get('agent_id') || undefined,
-                status: (params.get('status') as any) || undefined,
-              });
+            : status === 'unresolved'
+              ? ctx.approvalManager.getUnresolved()
+              : ctx.approvalManager.getHistory({
+                  limit: parseInt(params.get('limit') ?? '50') || 50,
+                  action: (params.get('action') as ActionCategory) || undefined,
+                  agentId: params.get('agent_id') || undefined,
+                  status: (params.get('status') as any) || undefined,
+                });
 
         // Phase 5B audit fix: enrich the REST response with the same
         // `intent` + `impact` fields the WS broadcasts already carry, so
         // dashboard rehydration on reconnect doesn't have to derive them
         // client-side from `tool_name` + `action_category`.
         const { impactFromCategory } = require('../roles/authority.ts');
-        const wsService = ctx.wsService as
-          | { computeApprovalIntent?: (r: typeof rows[number]) => string }
-          | undefined;
-
         const enriched = rows.map((r) => ({
           ...r,
+          execution_state: executionState(r),
           impact: impactFromCategory(r.action_category as ActionCategory),
-          intent:
-            wsService?.computeApprovalIntent?.(r) ??
-            (r.reason && r.reason.trim() ? r.reason : r.tool_name),
+          // `intent` is the joined sentence; since #792 `intent_action` and
+          // `intent_reason` carry its two parts apart, so a card can show the
+          // reason in its own element.
+          ...approvalIntentFields(r),
         }));
 
         return json(enriched);
@@ -2276,27 +3243,14 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         if (!ctx.approvalManager || !ctx.deferredExecutor) {
           return error('Authority system not configured', 500);
         }
-        const requestId = req.params.id;
-        const approved = ctx.approvalManager.approve(requestId, 'dashboard');
-        if (!approved) return error('Request not found or already decided', 404);
-
-        // Intent-declaration approvals have no deferred tool to execute —
-        // the originating `request_approval` tool call is blocked waiting for
-        // the DB status to flip (via waitForResolution polling). Skipping
-        // executeApproved avoids a recursive call into the tool registry.
-        // Inline-mode requests are likewise executed by the authority gate
-        // that is blocked on this status flip, so the result flows back to
-        // the conversation — executing here would run the tool twice.
-        let result = '';
-        if (approved.tool_name !== 'request_approval' && approved.execution_mode !== 'inline') {
-          result = await ctx.deferredExecutor.executeApproved(requestId);
-        }
-
-        // Broadcast the update (removes the card from the dashboard thread)
-        const updated = ctx.approvalManager.getRequest(requestId);
-        if (updated) ctx.wsService?.broadcastApprovalUpdate(updated);
-
-        return json({ ok: true, result: result.slice(0, 500) });
+        const outcome = await applyApprovalDecision('approve', req.params.id, 'dashboard', {
+          approvalManager: ctx.approvalManager,
+          deferredExecutor: ctx.deferredExecutor,
+          wsService: ctx.wsService,
+        });
+        if (outcome.status === 'already_decided') return error('Request not found or already decided', 404);
+        if (outcome.status !== 'approved') return error('Unexpected decision outcome', 500);
+        return json({ ok: true, result: outcome.result.slice(0, 500) });
       },
     },
 
@@ -2305,16 +3259,52 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         if (!ctx.approvalManager || !ctx.deferredExecutor) {
           return error('Authority system not configured', 500);
         }
-        const requestId = req.params.id;
-        const denied = ctx.approvalManager.deny(requestId, 'dashboard');
-        if (!denied) return error('Request not found or already decided', 404);
+        const outcome = await applyApprovalDecision('deny', req.params.id, 'dashboard', {
+          approvalManager: ctx.approvalManager,
+          deferredExecutor: ctx.deferredExecutor,
+          wsService: ctx.wsService,
+        });
+        if (outcome.status === 'already_decided') return error('Request not found or already decided', 404);
+        return json({ ok: true });
+      },
+    },
 
-        // Record denial for learning
-        ctx.deferredExecutor.recordDenial(denied);
+    // An approval a restart left without a receipt. `execute` runs it once,
+    // and only when nothing happened; `close` resolves it without running.
+    '/api/authority/approvals/:id/execute': {
+      POST: async (req: Request & { params: { id: string } }) => {
+        if (!ctx.approvalManager || !ctx.deferredExecutor) {
+          return error('Authority system not configured', 500);
+        }
+        const outcome = await applyExecutionResolution('execute', req.params.id, 'dashboard', {
+          approvalManager: ctx.approvalManager,
+          deferredExecutor: ctx.deferredExecutor,
+          wsService: ctx.wsService,
+        });
+        if (outcome.status === 'not_unresolved') return error('Request not found or not left unresolved by a restart', 404);
+        if (outcome.status === 'not_executable') return error(outcome.reason, 409);
+        if (outcome.status !== 'executed') return error('Unexpected resolution outcome', 500);
+        return json({ ok: true, result: outcome.result.slice(0, 500) });
+      },
+    },
 
-        // Broadcast the update
-        ctx.wsService?.broadcastApprovalUpdate(denied);
-
+    '/api/authority/approvals/:id/close': {
+      POST: async (req: Request & { params: { id: string } }) => {
+        if (!ctx.approvalManager || !ctx.deferredExecutor) {
+          return error('Authority system not configured', 500);
+        }
+        // No body, an empty body or a non-object body all mean "no note".
+        const body = (await req.json().catch(() => null)) as unknown;
+        const rawNote = body && typeof body === 'object' ? (body as { note?: unknown }).note : undefined;
+        if (rawNote !== undefined && typeof rawNote !== 'string') return error('note must be a string', 400);
+        const note = rawNote?.slice(0, 500);
+        const outcome = await applyExecutionResolution('close', req.params.id, 'dashboard', {
+          approvalManager: ctx.approvalManager,
+          deferredExecutor: ctx.deferredExecutor,
+          wsService: ctx.wsService,
+        }, note);
+        if (outcome.status === 'not_unresolved') return error('Request not found or not left unresolved by a restart', 404);
+        if (outcome.status !== 'closed') return error('Unexpected resolution outcome', 500);
         return json({ ok: true });
       },
     },
@@ -2614,6 +3604,21 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
               });
               added++;
             }
+            // Approved before a restart and never receipted: still a decision.
+            for (const a of mgr.getUnresolved()) {
+              if (added >= perType) break;
+              if (!matches(a.reason) && !matches(a.tool_name) && !matches(a.action_category)) continue;
+              results.push({
+                type: 'authority',
+                id: a.id,
+                ref: a.id,
+                title: a.reason || a.tool_name,
+                summary: `${a.tool_name} · ${a.action_category}`,
+                meta: a.urgency,
+                status: { label: a.execution_outcome === 'unknown' ? 'Interrupted' : 'Not started', tone: 'warn' },
+              });
+              added++;
+            }
           }
         } catch (err) {
           console.warn('[palette] authority search failed:', err);
@@ -2710,7 +3715,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             : [];
 
           const { generateVoiceSuggestions } = await import('../agents/voice-suggestions.ts');
-          const suggestions = await generateVoiceSuggestions(turns, llm);
+          const suggestions = await runWithOrigin('user', () => generateVoiceSuggestions(turns, llm));
           return json({ suggestions });
         } catch (err) {
           console.warn('[api] voice suggestions error:', err);
@@ -2778,7 +3783,9 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     '/api/authority/config': {
       GET: () => {
         if (!ctx.authorityEngine) return json({});
-        return json(ctx.authorityEngine.getConfig());
+        // `background` is not part of the engine's config: it is the extra
+        // restriction set the background agent's profile is built from.
+        return json({ ...ctx.authorityEngine.getConfig(), background: ctx.config.authority?.background });
       },
       POST: async (req: Request) => {
         if (!ctx.authorityEngine) return error('Authority engine not configured', 500);
@@ -2795,7 +3802,28 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
 
           ctx.authorityEngine.updateConfig(currentConfig);
 
-          // Persist to config.yaml
+          // Background-agent restrictions: validated by buildBackgroundProfile
+          // on apply; here only the shape is checked so a bad body is a 400.
+          let background = ctx.config.authority?.background;
+          if (body.background !== undefined) {
+            const b = body.background as Record<string, unknown> | null;
+            if (b === null || typeof b !== 'object' || Array.isArray(b)) return error('background must be an object');
+            if (b.governed_categories !== undefined && !Array.isArray(b.governed_categories)) {
+              return error('background.governed_categories must be a list');
+            }
+            if (b.level_cap !== undefined && typeof b.level_cap !== 'number') {
+              return error('background.level_cap must be a number');
+            }
+            // Merge over the stored value so sending one field keeps the other.
+            background = {
+              ...background,
+              ...(b.governed_categories !== undefined ? { governed_categories: (b.governed_categories as unknown[]).map(String) } : {}),
+              ...(b.level_cap !== undefined ? { level_cap: b.level_cap as number } : {}),
+            };
+          }
+
+          // Persist to the user settings store; saving the section triggers
+          // the 'authority' reload applier, which rebuilds the background profile.
           const { saveUserSection } = await import('./user-settings.ts');
           const freshConfig = ctx.config;
           freshConfig.authority = {
@@ -2805,10 +3833,11 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             overrides: currentConfig.overrides,
             context_rules: currentConfig.context_rules,
             learning: currentConfig.learning,
+            ...(background !== undefined ? { background } : {}),
           };
           saveUserSection('authority', freshConfig.authority);
 
-          return json({ ok: true, config: currentConfig });
+          return json({ ok: true, config: { ...currentConfig, background } });
         } catch (err) {
           return error('Invalid request body');
         }
@@ -3037,21 +4066,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
-    '/api/awareness/suggestions/:id/dismiss': {
-      PATCH: (req: Request & { params: { id: string } }) => {
-        if (!ctx.awarenessService) return error('Awareness service not running', 503);
-        ctx.awarenessService.dismissSuggestion(req.params.id);
-        return json({ ok: true });
-      },
-    },
-
-    '/api/awareness/suggestions/:id/act': {
-      PATCH: (req: Request & { params: { id: string } }) => {
-        if (!ctx.awarenessService) return error('Awareness service not running', 503);
-        ctx.awarenessService.actOnSuggestion(req.params.id);
-        return json({ ok: true });
-      },
-    },
+    ...createSuggestionFeedbackRoutes(() => ctx.suggestionComposer),
 
     '/api/awareness/report': {
       GET: async (req: Request) => {
@@ -3078,11 +4093,14 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
 
     '/api/awareness/report/weekly': {
       GET: async (req: Request) => {
-        if (!ctx.awarenessService) return error('Awareness service not available', 503);
+        const awareness = ctx.awarenessService;
+        if (!awareness) return error('Awareness service not available', 503);
         try {
           const params = getSearchParams(req);
           const weekStart = params.get('weekStart') ?? undefined;
-          const report = await ctx.awarenessService.generateWeeklyReport(weekStart);
+          // Background like the rest of awareness: the report is built from
+          // screen-derived session summaries, not from anything typed.
+          const report = await runWithOrigin('background', () => awareness.generateWeeklyReport(weekStart));
           return json(report);
         } catch (err) {
           return error(`Weekly report error: ${err instanceof Error ? err.message : err}`);
@@ -3143,39 +4161,59 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
       POST: async (req: Request) => {
         try {
-          const body = await req.json() as Record<string, unknown>;
-          const mode = body.mode as string | undefined;
+          const body = goalRecord(await req.json(), 'request');
+          const { mode, title, level = 'task', ...options } = body;
+          if (mode !== undefined && mode !== 'quick' && mode !== 'propose' && mode !== 'create_from_proposal') return error('Unknown goal creation mode', 400);
 
           // Natural language → OKR proposal (uses LLM)
           if (mode === 'propose') {
-            const text = body.text as string;
-            if (!text?.trim()) return error('text is required for propose mode', 400);
+            goalKeys(body, ['mode', 'text', 'parent_id'], 'request');
+            const text = body.text;
+            if (typeof text !== 'string' || !text.trim()) return error('text is required for propose mode', 400);
             const { NLGoalBuilder } = await import('../goals/nl-builder.ts');
             const llmManager = ctx.agentService.getLLMManager();
-            const builder = new NLGoalBuilder(llmManager);
-            const proposal = await builder.parseGoal(text.trim());
+            const builder = new NLGoalBuilder(llmManager, { timezone: ctx.config.timezone });
+            const proposal = await runWithOrigin('user', () => builder.parseGoal(text.trim(), body.parent_id as string | undefined));
             return json(proposal);
           }
 
           // Create goals from a confirmed proposal
           if (mode === 'create_from_proposal') {
-            const proposal = body.proposal as any;
-            if (!proposal?.objective?.title) return error('proposal with objective required', 400);
+            goalKeys(body, ['mode', 'proposal', 'parent_id'], 'request');
+            const proposal = body.proposal;
             const { NLGoalBuilder } = await import('../goals/nl-builder.ts');
-            const llmManager = ctx.agentService.getLLMManager();
-            const builder = new NLGoalBuilder(llmManager);
+            const builder = new NLGoalBuilder(undefined, { timezone: ctx.config.timezone });
             const created = builder.createFromProposal(proposal, body.parent_id as string | undefined);
             return json(created, 201);
           }
 
           // Quick create (direct)
-          const title = body.title as string;
-          const level = (body.level as string) ?? 'task';
-          if (!title) return error('title is required', 400);
-          const goals = require('../vault/goals.ts');
-          const goal = goals.createGoal(title, level, body);
+          const goal = getGoalApplication().createGoal(title, level, options);
           return json(goal, 201);
-        } catch (err) { return error(`${err}`); }
+        } catch (err) {
+          if (err instanceof GoalValidationError) return json({ error: err.message, code: 'INVALID_GOAL', path: err.path }, 400);
+          return error(`${err}`, err instanceof SyntaxError ? 400 : 500);
+        }
+      },
+    },
+
+    '/api/goals/events': {
+      GET: (req: Request) => {
+        try {
+          const params = new URL(req.url).searchParams;
+          // An absent parameter takes its default; a present but blank one is invalid, not 0.
+          const param = (name: string, fallback: number) => {
+            const raw = params.get(name);
+            return raw === null ? fallback : raw.trim() ? Number(raw) : NaN;
+          };
+          const after = goalNumber(param('after', 0), 'after', 0, Number.MAX_SAFE_INTEGER, true);
+          const limit = goalNumber(param('limit', 100), 'limit', 1, 100, true);
+          const events = readGoalEvents(after, limit);
+          return json({ events, nextCursor: events.at(-1)?.sequence ?? after });
+        } catch (err) {
+          if (err instanceof GoalValidationError) return json({ error: err.message, code: 'INVALID_GOAL', path: err.path }, 400);
+          return error('Goal event history unavailable', 503);
+        }
       },
     },
 
@@ -3210,8 +4248,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       POST: async (req: Request) => {
         try {
           const body = await req.json() as { id: string; sort_order: number }[];
-          const goals = require('../vault/goals.ts');
-          goals.reorderGoals(body);
+          getGoalApplication().reorderGoals(body);
           return json({ ok: true });
         } catch (err) { return error(`${err}`); }
       },
@@ -3233,10 +4270,13 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       GET: () => {
         try {
           const goals = require('../vault/goals.ts');
+          // Keep the legacy goal-row contract; Today uses /api/work-items?today=true.
           return json(goals.findGoals({ level: 'daily_action', status: 'active', limit: 20 }));
         } catch (err) { return error(`${err}`); }
       },
     },
+
+    ...createWorkItemRoutes(json),
 
     '/api/goals/:id': {
       GET: (req: Request) => {
@@ -3254,18 +4294,19 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           const url = new URL(req.url);
           const id = url.pathname.split('/').pop()!;
           const body = await req.json() as Record<string, unknown>;
-          const goals = require('../vault/goals.ts');
-          const updated = goals.updateGoal(id, body);
+          const updated = getGoalApplication().updateGoal(id, body);
           if (!updated) return error('Goal not found', 404);
           return json(updated);
-        } catch (err) { return error(`${err}`); }
+        } catch (err) {
+          if (err instanceof GoalValidationError) return json({ error: err.message, code: 'INVALID_GOAL', path: err.path }, 400);
+          return error(`${err}`, err instanceof SyntaxError ? 400 : 500);
+        }
       },
       DELETE: (req: Request) => {
         try {
           const url = new URL(req.url);
           const id = url.pathname.split('/').pop()!;
-          const goals = require('../vault/goals.ts');
-          const deleted = goals.deleteGoal(id);
+          const deleted = getGoalApplication().deleteGoal(id);
           if (!deleted) return error('Goal not found', 404);
           return json({ ok: true });
         } catch (err) { return error(`${err}`); }
@@ -3299,45 +4340,50 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     '/api/goals/:id/score': {
       POST: async (req: Request) => {
         try {
-          const url = new URL(req.url);
-          const parts = url.pathname.split('/');
-          const id = parts[parts.length - 2]!;
-          const body = await req.json() as { score: number; reason: string; source?: string };
-          const goals = require('../vault/goals.ts');
-          const updated = goals.updateGoalScore(id, body.score, body.reason, body.source ?? 'user');
+          const id = new URL(req.url).pathname.split('/').at(-2)!;
+          const body = goalRecord(await req.json(), 'request');
+          goalKeys(body, ['score', 'reason', 'source'], 'request');
+          if (body.source === 'daily_review') throw new GoalValidationError('source', 'Automatic goal reviews require a verified measurement-to-score mapping');
+          if (body.source !== undefined && body.source !== 'user') throw new GoalValidationError('source', 'Manual score requests must use source user');
+          const updated = getGoalApplication().scoreGoal(id, body.score as number, (body.reason === undefined ? '' : body.reason) as string);
           if (!updated) return error('Goal not found', 404);
           return json(updated);
-        } catch (err) { return error(`${err}`); }
+        } catch (err) {
+          if (err instanceof GoalValidationError) return json({ error: err.message, code: 'INVALID_GOAL', path: err.path }, 400);
+          return error(`${err}`, err instanceof SyntaxError ? 400 : 500);
+        }
       },
     },
 
     '/api/goals/:id/status': {
       POST: async (req: Request) => {
         try {
-          const url = new URL(req.url);
-          const parts = url.pathname.split('/');
-          const id = parts[parts.length - 2]!;
-          const body = await req.json() as { status: string };
-          const goals = require('../vault/goals.ts');
-          const updated = goals.updateGoalStatus(id, body.status as any);
+          const id = new URL(req.url).pathname.split('/').at(-2)!;
+          const body = goalRecord(await req.json(), 'request');
+          goalKeys(body, ['status'], 'request');
+          const updated = getGoalApplication().updateStatus(id, body.status as any);
           if (!updated) return error('Goal not found', 404);
           return json(updated);
-        } catch (err) { return error(`${err}`); }
+        } catch (err) {
+          if (err instanceof GoalValidationError) return json({ error: err.message, code: 'INVALID_GOAL', path: err.path }, 400);
+          return error(`${err}`, err instanceof SyntaxError ? 400 : 500);
+        }
       },
     },
 
     '/api/goals/:id/health': {
       POST: async (req: Request) => {
         try {
-          const url = new URL(req.url);
-          const parts = url.pathname.split('/');
-          const id = parts[parts.length - 2]!;
-          const body = await req.json() as { health: string };
-          const goals = require('../vault/goals.ts');
-          const updated = goals.updateGoalHealth(id, body.health as any);
+          const id = new URL(req.url).pathname.split('/').at(-2)!;
+          const body = goalRecord(await req.json(), 'request');
+          goalKeys(body, ['health'], 'request');
+          const updated = getGoalApplication().updateHealth(id, body.health as any);
           if (!updated) return error('Goal not found', 404);
           return json(updated);
-        } catch (err) { return error(`${err}`); }
+        } catch (err) {
+          if (err instanceof GoalValidationError) return json({ error: err.message, code: 'INVALID_GOAL', path: err.path }, 400);
+          return error(`${err}`, err instanceof SyntaxError ? 400 : 500);
+        }
       },
     },
 
@@ -3437,10 +4483,123 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
+    // Raw sidecar RPC passthrough for the control-plane bench harness
+    // (bench/control/acceptance.ts). It reaches any RPC a sidecar registered
+    // (shell, files, clipboard, browser JavaScript, desktop input) and skips
+    // routeToSidecar's capability checks, the authority engine and the audit
+    // trail; only the sidecar's own capability registry and command blocklist
+    // still apply. Hence the double gate: the route does not exist unless the
+    // daemon resolved a JARVIS_DEBUG_RPC secret of at least 16 characters at
+    // startup (never on a hosted install), and the caller must echo it back
+    // (compared in constant time). The HTTP server may be bound beyond
+    // loopback. See debug-rpc-gate.ts.
+    '/api/debug/rpc': {
+      POST: async (req: Request) => {
+        const gate = debugRpcGate();
+        if (!gate || !debugRpcTokenMatches(req.headers.get(DEBUG_RPC_HEADER), gate)) {
+          return error('Not found', 404);
+        }
+        try {
+          if (!ctx.sidecarManager) return error('Sidecar manager not available', 503);
+          const body = await req.json() as {
+            target?: string;
+            method?: string;
+            params?: Record<string, unknown>;
+          };
+
+          // The bench harness lists sidecars THROUGH this endpoint (which is
+          // reachable with just the debug secret) so it never needs the
+          // access-token-gated /api/sidecars.
+          if (body.method === '__list_sidecars') {
+            // `os` is the sidecar's GOOS. The harness needs it because some
+            // checks can only pass on one platform (get_window_tree's
+            // `semantic` flag is read on Windows only), and without it a
+            // missing surface is indistinguishable from a stale build.
+            return json(ctx.sidecarManager.listSidecars().map((s) => ({
+              id: s.id, name: s.name, connected: s.connected, capabilities: s.capabilities, os: s.os,
+            })));
+          }
+
+          if (!body.method) return error('Missing "method" field');
+
+          const sidecars = ctx.sidecarManager.listSidecars();
+          const target = body.target
+            ? sidecars.find((s) => s.id === body.target || s.name.toLowerCase() === body.target!.toLowerCase())
+            : sidecars.find((s) => s.connected);
+          if (!target) return error(body.target ? `No sidecar matching "${body.target}"` : 'No connected sidecar', 409);
+          if (!target.connected) return error(`Sidecar "${target.name}" is offline`, 409);
+
+          // The only trace these calls leave: they never reach the audit trail.
+          console.log('[DebugRPC]', JSON.stringify(body.method), '->', target.name);
+          const started = Date.now();
+          const result = await ctx.sidecarManager.dispatchRPC(
+            target.id,
+            body.method,
+            body.params ?? {},
+            { initial: 60_000, max: 120_000 },
+          );
+          return json({
+            sidecar: target.name,
+            method: body.method,
+            elapsed_ms: Date.now() - started,
+            detached: result === 'detached',
+            result: result === 'detached' ? null : result,
+          });
+        } catch (err) {
+          return json({ error: err instanceof Error ? err.message : String(err) }, 500);
+        }
+      },
+    },
+
+    /**
+     * Enroll a device from the dashboard. SELF-HOSTED ONLY.
+     *
+     * This mints a long-lived enrollment JWT and hands it to the page, which
+     * shows it once and tells the user to run `jarvis --token <jwt>` on the
+     * target machine. That is one self-hosted way to add a device -- the other,
+     * and the one docs/SELF_HOSTING.md calls primary, is `jarvis enroll <name>`
+     * on the brain host. Refusing here therefore never strands anyone.
+     *
+     * On a hosted install it is neither needed nor wanted:
+     *
+     *  - It is not the flow. A hosted user adds a device by installing Jarvis
+     *    there and signing in; the control plane runs `jarvis enroll` over SSH
+     *    on their behalf (ONBOARDING.md). Nobody is meant to copy a JWT, and
+     *    the copy here tells them to run a CLI flag they never touch.
+     *  - It is an escalation. Every route under /api is authorized by a PANEL
+     *    SESSION -- a cookie in a webview, bounded by that session's cap. This
+     *    one turns that cookie into a permanent enrollment credential under a
+     *    NEW sid, which revoking the original device does not touch. It is the
+     *    only route on the data plane that can do that.
+     *
+     * Refusing here removes the escalation without costing a hosted user
+     * anything: their device list and revoke live in the hosting dashboard,
+     * authorized by their ACCOUNT rather than by a cookie.
+     *
+     * Gated on `isHostedInstall`, NOT on `hasUsejarvisAi` alone. The feature
+     * paths in this file ask the latter because a missing hosted-LLM block just
+     * means the feature is off. A deny-gate needs the opposite bias, and that
+     * block is renderable as null: a hosting deployment with no LLM proxy
+     * configured would read as self-hosted and reopen this route on every
+     * tenant it re-rendered. `daemon.listen: unix:` cannot be absent on a
+     * hosted instance, so the predicate ORs the two.
+     */
     '/api/sidecars/enroll': {
       POST: async (req: Request) => {
         try {
           if (!ctx.sidecarManager) return error('Sidecar manager not available', 503);
+          if (isHostedInstall(ctx.config)) {
+            // 403 rather than 409: the request is well-formed and the route
+            // exists, the caller simply may not do this here. 409 already means
+            // two other things on this route (name taken, name invalid), so it
+            // would carry no information.
+            return error(
+              'Adding a device from the dashboard is disabled on hosted installs. '
+                + 'Install Jarvis on the new device and sign in there with your Usejarvis '
+                + 'account -- it enrols itself. On a self-hosted brain, run: jarvis enroll <name>',
+              403,
+            );
+          }
           const body = await req.json() as { name?: string };
           if (!body.name) return error('Missing "name" field');
           const result = await ctx.sidecarManager.enrollSidecar(body.name);
@@ -3462,6 +4621,20 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           return json(ctx.sidecarManager.getJwks());
         } catch (err) { return error(`${err}`); }
       },
+    },
+
+    // Sidecar self-update. The dashboard's update hint opens the sidecar's own
+    // native prompt (update-prompt) where the sidecar has one, and installs
+    // directly (update) where it does not (Linux). Either way the sidecar
+    // decides what is installable: the version passed here is only checked
+    // against the one it confirmed itself.
+    '/api/sidecars/:id/update-prompt': {
+      POST: async (req: Request) => sidecarUpdateRoute(req, 'update_prompt', 'sidecar.update_prompt', {}),
+    },
+
+    '/api/sidecars/:id/update': {
+      POST: async (req: Request) =>
+        sidecarUpdateRoute(req, 'update_apply', 'sidecar.update_apply', { version: SIDECAR_LATEST_VERSION }),
     },
 
     '/api/sidecars/:id/config': {
@@ -3487,9 +4660,18 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           if (!ctx.sidecarManager.isConnected(id)) {
             return error('Sidecar is not connected', 409);
           }
-          const body = await req.json() as Record<string, unknown>;
-          delete body.token;
-          const result = await ctx.sidecarManager.dispatchRPC(id, 'update_config', body);
+          let body: unknown;
+          try {
+            body = await req.json();
+          } catch {
+            return error('Invalid JSON body');
+          }
+          if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+            return error('Body must be a JSON object');
+          }
+          const patch = body as Record<string, unknown>;
+          delete patch.token;
+          const result = await ctx.sidecarManager.dispatchRPC(id, 'update_config', patch);
           return json(result);
         } catch (err) { return error(`${err}`, 500); }
       },
@@ -3646,10 +4828,11 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           if (!body.path || body.content === undefined) return error('path and content are required');
           await ctx.siteBuilderService.projectManager.writeFile(id, body.path, body.content);
 
-          // Auto-commit if enabled
+          // Auto-commit if enabled (sites.auto_commit). The save stands even
+          // when git is off for the project (#523): the file is written either way.
           const projectPath = ctx.siteBuilderService.projectManager.getProjectPath(id);
           if (projectPath) {
-            await ctx.siteBuilderService.gitManager.autoCommit(projectPath, `Update ${body.path}`);
+            await ctx.siteBuilderService.autoCommitIfEnabled(projectPath, `Update ${body.path}`);
           }
 
           return json({ ok: true });
@@ -3893,17 +5076,11 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           const result = await ctx.siteBuilderService.githubManager.push(projectPath, undefined, body.force);
           if (!result.success) return error(result.error ?? 'Push failed');
 
-          // Update lastPushedAt
-          const project = await ctx.siteBuilderService.projectManager.getProject(id);
-          if (project?.githubUrl) {
-            const meta = require('node:fs').readFileSync(
-              require('node:path').join(projectPath, '.jarvis-project.json'), 'utf-8'
-            );
-            const parsed = JSON.parse(meta);
-            if (parsed.github) {
-              parsed.github.lastPushedAt = Date.now();
-              await Bun.write(require('node:path').join(projectPath, '.jarvis-project.json'), JSON.stringify(parsed, null, 2));
-            }
+          // The push has happened; failing to record it must not report it as failed.
+          try {
+            ctx.siteBuilderService.projectManager.markPushed(id);
+          } catch (err) {
+            console.error('[SiteBuilder] Could not record the push time:', err);
           }
 
           return json({ ok: true });

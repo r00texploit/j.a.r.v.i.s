@@ -17,12 +17,35 @@
  *   2. List every directory under packages/pieces/community/.
  *   3. For each piece, read its package.json (name, description, license).
  *   4. Query the npm registry for the latest published version.
- *      Pieces with no npm release are skipped (still in development).
+ *      Pieces npm answers 404 for are skipped (still in development, or
+ *      genuinely unpublished). Transient failures (429 / 5xx / network) that
+ *      survive the retry budget do NOT drop the piece: its previously
+ *      committed latestVersion is carried forward (metadata still comes from
+ *      the pinned SHA), so a rate-limited CI run can never masquerade as a
+ *      mass unpublish. If more than MAX_TRANSIENT_FRACTION of pieces fail
+ *      transiently the whole run aborts instead of shipping a mostly-stale
+ *      catalog. Retry / cooldown / classification logic lives in
+ *      scripts/lib/npm-latest.ts (unit-tested).
  *   5. Build a sorted entry list and write catalog-generated.ts.
- *   6. With --report <path> (or env CATALOG_REPORT_PATH): diff against the
+ *   6. Verified pieces move only to a version their governed adapter still
+ *      covers, decided against what is installed (the committed manifests);
+ *      a bump that fails is held at the installed version. The manifests come
+ *      from `--inspection <path>`, written by scripts/inspect-verified-pieces.ts
+ *      in CI's read-only job, so THIS process never runs piece code there.
+ *      Without the flag (a local run, `--check` included) they are read
+ *      in-process, which downloads and runs the verified pieces' code. See
+ *      scripts/lib/verified-sync.ts. The installed manifests are written to
+ *      verified-manifests-generated.ts, which governed-pieces.test.ts checks.
+ *   7. With --report <path> (or env CATALOG_REPORT_PATH): diff against the
  *      previously-committed catalog and write a markdown PR body that calls out
  *      "safe to merge" (version bumps only) vs "manual review required" (pieces
- *      added/removed, license or SHA changes). See scripts/lib/catalog-diff.ts.
+ *      added/removed, license or SHA changes, a verified bump that skipped the
+ *      check). See scripts/lib/catalog-diff.ts.
+ *   8. With --held <path>: write the held verified bumps as JSON, which
+ *      scripts/render-review-issue.ts turns into the review issue.
+ *
+ *   --manifests-only skips 1-8 and just rewrites the verified manifests for
+ *   the versions the committed catalog installs (runs piece code).
  *
  * What the script does NOT do:
  *   - Probe install size (slow, flaky in CI). Sizes come from the
@@ -56,6 +79,18 @@ import {
   hasChanges,
   type GeneratedEntryLike,
 } from "./lib/catalog-diff";
+import { createNpmClient, resolveVersion } from "./lib/npm-latest";
+import { fetchPieceManifest, type PieceManifest } from "./lib/piece-manifest";
+import type { UpgradeAssessment } from "./lib/verified-upgrade";
+import { committable, renderManifestsFile } from "./lib/verified-manifests";
+import { decideVerified, lookupIn, parseInspection } from "./lib/verified-sync";
+import { inspectVerified } from "./lib/verified-inspect";
+import {
+  VERIFIED,
+  VERIFIED_UPGRADE_REVIEWED,
+  VERSION_PIN,
+} from "../src/workflows/pieces-library/catalog-overrides";
+import { resolveGovernedPieceAction } from "../src/workflows/runtime/piece-effects";
 
 /**
  * Activepieces commit walked when generating the list. Keep this in sync
@@ -70,10 +105,7 @@ const PINNED_SHA = "d04e6807c485ecd788a72af0d04abffba78563c7";
 const REPO_URL = "https://github.com/activepieces/activepieces.git";
 const WORK_DIR = join(tmpdir(), `jarvis-pieces-sync-${PINNED_SHA.slice(0, 12)}`);
 const OUT_FILE = resolve(import.meta.dir, "../src/workflows/pieces-library/catalog-generated.ts");
-
-interface NpmInfo {
-  version: string;
-}
+const MANIFEST_FILE = resolve(import.meta.dir, "../src/workflows/pieces-library/verified-manifests-generated.ts");
 
 interface PieceMetadata {
   id: string;
@@ -94,6 +126,18 @@ async function main(): Promise<void> {
   info(`Mode:       ${checkOnly ? "check-only (no write)" : "write"}`);
   if (reportPath) info(`PR report:  ${reportPath}`);
 
+  // Previous generation, loaded before anything can overwrite the file. Used
+  // both to carry entries forward across transient npm failures and (with
+  // --report) to diff for the PR body.
+  const previous = await readPreviousGeneration();
+  const previousById = new Map((previous?.entries ?? []).map((e) => [e.id, e]));
+  const previousManifests = await readPreviousManifests();
+
+  if (process.argv.includes("--manifests-only")) {
+    await refreshManifestsOnly(previous, previousManifests);
+    return;
+  }
+
   // 1. Sparse-clone packages/pieces/community.
   ensureWorkdir();
   sparseClone(verbose);
@@ -110,16 +154,38 @@ async function main(): Promise<void> {
 
   // 3+4. Read package.json + cross-check npm in parallel.
   const found: PieceMetadata[] = [];
+  const carriedForward: Array<{ id: string; version: string }> = [];
   const skipped: Array<{ id: string; reason: string }> = [];
+  let transientFailures = 0;
   const npmConcurrency = 8;
   for (let i = 0; i < pieceDirs.length; i += npmConcurrency) {
     const batch = pieceDirs.slice(i, i + npmConcurrency);
     const results = await Promise.all(
-      batch.map((dir) => extractPiece(dir, verbose)),
+      batch.map((dir) => extractPiece(dir, verbose, previousById)),
     );
     for (const r of results) {
-      if (r.kind === "ok") found.push(r.entry);
-      else skipped.push({ id: r.id, reason: r.reason });
+      if (r.kind === "ok") {
+        found.push(r.entry);
+      } else if (r.kind === "carried-forward") {
+        found.push(r.entry);
+        carriedForward.push({ id: r.entry.id, version: r.entry.latestVersion });
+        transientFailures++;
+      } else {
+        skipped.push({ id: r.id, reason: r.reason });
+        if (r.transient) transientFailures++;
+      }
+    }
+    // If npm fails transiently for a large slice of the catalog the registry
+    // is down or hard-throttling us. Carrying that many entries forward would
+    // ship a mostly-stale catalog while looking like a routine refresh --
+    // abort (checked per batch so a dead registry fails in minutes, not after
+    // grinding through every remaining retry) and let the next scheduled run
+    // try again instead.
+    if (transientFailures > pieceDirs.length * MAX_TRANSIENT_FRACTION) {
+      fatal(
+        `npm failed transiently for ${transientFailures} of ${pieceDirs.length} pieces ` +
+          `(> ${MAX_TRANSIENT_FRACTION * 100}%) -- registry down or rate-limited, aborting`,
+      );
     }
   }
 
@@ -127,32 +193,49 @@ async function main(): Promise<void> {
   found.sort((a, b) => a.id.localeCompare(b.id));
 
   info(`Pieces resolved on npm: ${found.length}`);
+  if (carriedForward.length > 0) {
+    info(`  of which carried forward on transient npm failure: ${carriedForward.length}`);
+  }
   info(`Pieces skipped:         ${skipped.length}`);
   if (verbose && skipped.length > 0) {
     for (const s of skipped) console.log(`  - ${s.id}: ${s.reason}`);
   }
 
-  // 5. Render + (optionally) analyse the diff for the auto-PR body. Read the
-  // previous generation BEFORE the file is overwritten below.
+  // 6. Verified pieces move only to versions their governed adapter covers.
+  const verified = await decideVerifiedPieces(
+    found,
+    previousById,
+    previousManifests,
+    new Set(carriedForward.map((c) => c.id)),
+  );
+  const heldPath = resolveFlagPath("--held");
+  if (heldPath) {
+    mkdirSync(dirname(heldPath), { recursive: true });
+    writeFileSync(heldPath, JSON.stringify(verified.assessments.filter((a) => !a.ok), null, 2));
+  }
+
+  // 7. Render + (optionally) analyse the diff for the auto-PR body.
   const rendered = renderCatalogFile(found);
+  const renderedManifests = renderManifestsFile(verified.manifests);
   if (reportPath) {
-    const previous = await readPreviousGeneration();
-    await writePrReport(reportPath, previous, found, rendered);
+    await writePrReport(reportPath, previous, found, rendered, carriedForward, verified);
   }
 
   if (checkOnly) {
     const current = existsSync(OUT_FILE) ? readFileSync(OUT_FILE, "utf8") : "";
-    if (current === rendered) {
-      info("catalog-generated.ts is up to date.");
+    const currentManifests = existsSync(MANIFEST_FILE) ? readFileSync(MANIFEST_FILE, "utf8") : "";
+    if (current === rendered && currentManifests === renderedManifests) {
+      info("catalog-generated.ts and verified-manifests-generated.ts are up to date.");
       process.exit(0);
     }
-    console.error("catalog-generated.ts is out of date.");
+    console.error("catalog-generated.ts or verified-manifests-generated.ts is out of date.");
     console.error("Run `bun run scripts/sync-pieces-catalog.ts` and commit.");
     process.exit(1);
   }
 
   writeFileSync(OUT_FILE, rendered);
-  info(`Wrote ${OUT_FILE} (${found.length} entries)`);
+  writeFileSync(MANIFEST_FILE, renderedManifests);
+  info(`Wrote ${OUT_FILE} (${found.length} entries) and ${Object.keys(verified.manifests).length} verified manifests`);
 
   // Don't auto-clean WORK_DIR so subsequent local runs reuse the clone.
   // CI containers are ephemeral; nothing to leak.
@@ -182,9 +265,15 @@ function sparseClone(verbose: boolean): void {
 
 type ExtractResult =
   | { kind: "ok"; entry: PieceMetadata }
-  | { kind: "skip"; id: string; reason: string };
+  /** npm was unreachable; the previously committed latestVersion is reused. */
+  | { kind: "carried-forward"; entry: PieceMetadata }
+  | { kind: "skip"; id: string; reason: string; transient?: boolean };
 
-async function extractPiece(dir: string, verbose: boolean): Promise<ExtractResult> {
+async function extractPiece(
+  dir: string,
+  verbose: boolean,
+  previousById: Map<string, GeneratedEntryLike>,
+): Promise<ExtractResult> {
   const dirName = dir.split("/").pop()!;
   const pkgPath = join(dir, "package.json");
   if (!existsSync(pkgPath)) {
@@ -209,93 +298,55 @@ async function extractPiece(dir: string, verbose: boolean): Promise<ExtractResul
   if (!/^[a-z][a-z0-9-]*$/.test(id)) {
     return { kind: "skip", id, reason: "id fails [a-z][a-z0-9-]* regex" };
   }
-  // Cross-check npm. Pieces in the monorepo but not on npm are still
-  // under development and we don't want to ship a catalog entry that
-  // would 404 on install.
-  const latest = await fetchNpmLatest(pkg.name);
-  if (!latest) {
-    return { kind: "skip", id, reason: "no npm release" };
-  }
   const license = typeof pkg.license === "string"
     ? pkg.license
     : (pkg.license?.type ?? "");
   // Some pieces don't set `displayName`; fall back to a capitalised id.
   const displayName = pkg.displayName ?? humanise(id);
-  if (verbose) console.log(`  ✓ ${id} (${latest.version})`);
-  return {
-    kind: "ok",
-    entry: {
-      id,
-      npmPackage: pkg.name,
-      displayName,
-      description: pkg.description ?? "",
-      licenseSpdx: license,
-      latestVersion: latest.version,
-    },
-  };
-}
+  const meta = (latestVersion: string): PieceMetadata => ({
+    id,
+    npmPackage: pkg.name!,
+    displayName,
+    description: pkg.description ?? "",
+    licenseSpdx: license,
+    latestVersion,
+  });
 
-/**
- * How many times to attempt an npm registry GET before giving up. The sync
- * fires ~300 unauthenticated GETs from a shared CI IP, so transient 429s /
- * 5xx / connection resets are expected -- retrying absorbs them instead of
- * silently dropping a piece (which trips the "every VERIFIED id materializes"
- * catalog invariant when the dropped piece happens to be verified).
- */
-const NPM_MAX_ATTEMPTS = 4;
-/** Base backoff in ms. Grows exponentially per attempt (500, 1000, 2000...). */
-const NPM_BACKOFF_BASE_MS = 500;
-/** Cap on a single backoff wait so a large Retry-After can't stall the run. */
-const NPM_BACKOFF_MAX_MS = 10_000;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Parse a `Retry-After` header (RFC 7231: delay-seconds form only -- npm
- * sends integer seconds). Returns ms, or null when absent/unparseable.
- */
-function retryAfterMs(res: Response): number | null {
-  const raw = res.headers.get("retry-after");
-  if (!raw) return null;
-  const secs = Number(raw.trim());
-  return Number.isFinite(secs) && secs >= 0 ? secs * 1000 : null;
-}
-
-async function fetchNpmLatest(pkg: string): Promise<NpmInfo | null> {
-  const url = `https://registry.npmjs.org/${pkg}/latest`;
-  let lastError = "";
-  for (let attempt = 1; attempt <= NPM_MAX_ATTEMPTS; attempt++) {
-    let serverDelayMs: number | null = null;
-    try {
-      const res = await fetch(url);
-      // A genuine 404 means the piece has no npm release -- deterministic,
-      // not worth retrying. Skip it.
-      if (res.status === 404) return null;
-      if (res.ok) return (await res.json()) as NpmInfo;
-      // 429 (rate limit) / 5xx / anything else non-OK -- transient. Honour
-      // Retry-After when the server sends it, otherwise back off.
-      lastError = `HTTP ${res.status}`;
-      serverDelayMs = retryAfterMs(res);
-    } catch (e) {
-      // Network-level failure (DNS, reset, timeout) -- transient.
-      lastError = (e as Error).message;
-    }
-    if (attempt < NPM_MAX_ATTEMPTS) {
-      const backoff = NPM_BACKOFF_BASE_MS * 2 ** (attempt - 1);
-      const jitter = Math.floor(Math.random() * NPM_BACKOFF_BASE_MS);
-      const waitMs = Math.min(serverDelayMs ?? backoff + jitter, NPM_BACKOFF_MAX_MS);
-      await sleep(waitMs);
-    }
+  // Cross-check npm. Pieces in the monorepo but not on npm are still
+  // under development and we don't want to ship a catalog entry that
+  // would 404 on install.
+  const latest = await npm.fetchLatest(pkg.name);
+  const resolution = resolveVersion(latest, previousById.get(id)?.latestVersion ?? null);
+  switch (resolution.action) {
+    case "use":
+      if (verbose) console.log(`  ✓ ${id} (${resolution.version})`);
+      return { kind: "ok", entry: meta(resolution.version) };
+    case "carry-forward":
+      // npm wouldn't answer. That says nothing about the piece itself, so keep
+      // the version the last successful sync knew; it catches up next run.
+      console.warn(
+        `[warn] carrying forward ${id} at ${resolution.version} (npm unreachable: ${
+          latest.kind === "transient" ? latest.error : "unknown"
+        })`,
+      );
+      return { kind: "carried-forward", entry: meta(resolution.version) };
+    case "skip":
+      return { kind: "skip", id, reason: resolution.reason, transient: resolution.transient };
   }
-  // Exhausted retries. Soft-fail so one persistently broken package doesn't
-  // abort the whole sync; the piece is skipped this run and picked up next.
-  console.warn(
-    `[warn] npm fetch failed for ${pkg} after ${NPM_MAX_ATTEMPTS} attempts: ${lastError}`,
-  );
-  return null;
 }
+
+/**
+ * Abort the run when more than this fraction of pieces fail transiently --
+ * at that point the registry is down (or throttling so hard the results are
+ * meaningless) and a catalog refresh would be mostly carried-forward noise.
+ */
+const MAX_TRANSIENT_FRACTION = 0.1;
+
+/**
+ * Shared npm client: retry with backoff, fleet-wide 429 cooldown, tri-state
+ * result. Lives in scripts/lib/npm-latest.ts so it stays unit-tested.
+ */
+const npm = createNpmClient();
 
 function humanise(id: string): string {
   return id
@@ -381,12 +432,16 @@ function sourceUrlFor(id: string): string {
 // up-front "safe to merge" vs "manual review required" verdict instead of a
 // raw diff. See scripts/lib/catalog-diff.ts for the analysis itself.
 
+/** The path after `flag`, ignoring a missing value or a following flag (`--report --verbose`). */
+function resolveFlagPath(flag: string): string | null {
+  const idx = process.argv.indexOf(flag);
+  const next = idx !== -1 ? process.argv[idx + 1] : undefined;
+  return next && !next.startsWith("--") ? resolve(next) : null;
+}
+
 /** Where to write the PR-body markdown, or null when reporting is off. */
 function resolveReportPath(): string | null {
-  const idx = process.argv.indexOf("--report");
-  const next = idx !== -1 ? process.argv[idx + 1] : undefined;
-  // Ignore a missing value or an accidental following flag (`--report --verbose`).
-  const fromFlag = next && !next.startsWith("--") ? next : undefined;
+  const fromFlag = resolveFlagPath("--report");
   const raw = fromFlag ?? process.env.CATALOG_REPORT_PATH;
   return raw ? resolve(raw) : null;
 }
@@ -414,6 +469,105 @@ async function readPreviousGeneration(): Promise<PreviousGeneration | null> {
     console.warn(`[warn] could not read previous catalog for diff: ${(e as Error).message}`);
     return null;
   }
+}
+
+/** The committed verified manifests, read before anything overwrites them. */
+async function readPreviousManifests(): Promise<Record<string, PieceManifest>> {
+  if (!existsSync(MANIFEST_FILE)) return {};
+  try {
+    const mod = (await import(pathToFileURL(MANIFEST_FILE).href)) as {
+      VERIFIED_MANIFESTS?: Record<string, PieceManifest>;
+    };
+    return mod.VERIFIED_MANIFESTS ?? {};
+  } catch (e) {
+    console.warn(`[warn] could not read previous verified manifests: ${(e as Error).message}`);
+    return {};
+  }
+}
+
+/** The version the catalog installs for a verified id, as `catalog.ts` derives it. */
+function installedVersion(id: string, generatedVersion: string): string {
+  return Object.hasOwn(VERSION_PIN, id) ? VERSION_PIN[id]!.vettedVersion : generatedVersion;
+}
+
+/** The committed manifest when it is for `version`, otherwise read from npm. */
+async function manifestFor(
+  pkg: string,
+  version: string,
+  committed: PieceManifest | null,
+): Promise<PieceManifest | null> {
+  if (committed?.version === version) return committed;
+  const r = await fetchPieceManifest(pkg, version);
+  if (r.kind === "ok") return r.manifest;
+  console.warn(`[warn] could not read the actions of ${pkg}@${version}: ${r.error}`);
+  return null;
+}
+
+type VerifiedRun = ReturnType<typeof decideVerified>;
+
+/**
+ * Step 6: decide every verified piece's version (see scripts/lib/verified-sync.ts).
+ * Rewrites a held entry's `latestVersion` back to the installed version.
+ */
+async function decideVerifiedPieces(
+  found: PieceMetadata[],
+  previousById: Map<string, GeneratedEntryLike>,
+  previousManifests: Record<string, PieceManifest>,
+  carriedForward: ReadonlySet<string>,
+): Promise<VerifiedRun> {
+  const policy = { committed: previousManifests, pins: VERSION_PIN, reviewed: VERIFIED_UPGRADE_REVIEWED };
+  const entries = found.filter((e) => VERIFIED.has(e.id));
+  const inspectionPath = resolveFlagPath("--inspection");
+  let raw: unknown;
+  if (inspectionPath) {
+    raw = JSON.parse(readFileSync(inspectionPath, "utf8"));
+  } else {
+    info("no --inspection file: reading verified manifests in-process, which runs the pieces' code");
+    raw = await inspectVerified({
+      pieces: entries.map((e) => ({
+        id: e.id,
+        npmPackage: e.npmPackage,
+        installed: previousManifests[e.id]?.version ?? previousById.get(e.id)?.latestVersion ?? e.latestVersion,
+      })),
+      policy,
+      npm,
+      log: (msg) => info(`inspect ${msg}`),
+    });
+  }
+  const run = decideVerified({
+    entries,
+    previousVersion: (id) => previousById.get(id)?.latestVersion,
+    carriedForward,
+    policy,
+    lookup: lookupIn(parseInspection(raw)),
+    isMapped: (pkg, action) => resolveGovernedPieceAction(pkg, action)?.known === true,
+  });
+  for (const a of run.assessments) {
+    info(a.ok
+      ? `verified ${a.id}: ${a.from} -> ${a.to} (adapter covers it)`
+      : `verified ${a.id}: holding at ${a.from}, ${a.to} needs review (${a.reasons.map((r) => r.kind).join(", ")})`);
+  }
+  for (const note of run.notes) info(`verified ${note}`);
+  return run;
+}
+
+/** `--manifests-only`: rewrite the manifests for what the committed catalog installs. */
+async function refreshManifestsOnly(
+  previous: PreviousGeneration | null,
+  previousManifests: Record<string, PieceManifest>,
+): Promise<void> {
+  const manifests: Record<string, PieceManifest> = {};
+  for (const id of VERIFIED) {
+    const entry = previous?.entries.find((e) => e.id === id);
+    if (!entry) fatal(`verified piece ${id} is not in the committed catalog`);
+    const version = installedVersion(id, entry.latestVersion);
+    const m = await manifestFor(entry.npmPackage, version, previousManifests[id] ?? null);
+    if (!m) fatal(`could not read the actions of ${entry.npmPackage}@${version}`);
+    manifests[id] = committable(m);
+    info(`manifest ${id}@${version}: ${m.actions.length} actions`);
+  }
+  writeFileSync(MANIFEST_FILE, renderManifestsFile(manifests));
+  info(`Wrote ${MANIFEST_FILE}`);
 }
 
 /** Map each id to its 1-based line in the rendered file (for `path:Lnn` refs). */
@@ -447,17 +601,31 @@ async function writePrReport(
   previous: PreviousGeneration | null,
   found: PieceMetadata[],
   rendered: string,
+  carriedForward: Array<{ id: string; version: string }>,
+  verified: VerifiedRun,
 ): Promise<void> {
+  const assessments: UpgradeAssessment[] = verified.assessments;
   const diff = diffCatalogs(previous?.entries ?? [], toGeneratedEntries(found), {
     oldSha: previous?.sha ?? "",
     newSha: PINNED_SHA,
+    // A pinned verified piece installs its pin, so a generated bump moves
+    // nothing it runs.
+    verified: new Set([...VERIFIED].filter((id) => !Object.hasOwn(VERSION_PIN, id))),
+    checked: new Set(assessments.filter((a) => a.ok).map((a) => a.id)),
   });
+  const server = process.env.GITHUB_SERVER_URL;
+  const repo = process.env.GITHUB_REPOSITORY;
   const lineIndex = buildLineIndex(rendered);
   const { verdict, markdown } = renderReport(diff, {
     shortSha: PINNED_SHA.slice(0, 7),
     generatedAt: new Date().toISOString().slice(0, 10),
     fileLabel: "src/workflows/pieces-library/catalog-generated.ts",
     lineOf: (id) => lineIndex.get(id) ?? null,
+    carriedForward,
+    verifiedUpgrades: assessments,
+    ...(server && repo
+      ? { testsUrl: `${server}/${repo}/actions/workflows/test.yml?query=branch%3Achore%2Fsync-pieces-catalog` }
+      : {}),
   });
 
   mkdirSync(dirname(reportPath), { recursive: true });
@@ -474,7 +642,13 @@ async function writePrReport(
   const githubOutput = process.env.GITHUB_OUTPUT;
   if (githubOutput) {
     try {
-      appendFileSync(githubOutput, `verdict=${verdict}\nhas_changes=${changed}\n`);
+      // held_count drives the review issue; inconclusive_count keeps the
+      // workflow from closing it on a run that could not decide everything.
+      const held = assessments.filter((a) => !a.ok).length;
+      appendFileSync(
+        githubOutput,
+        `verdict=${verdict}\nhas_changes=${changed}\nheld_count=${held}\ninconclusive_count=${verified.inconclusive.length}\n`,
+      );
     } catch (e) {
       console.warn(`[warn] could not write GITHUB_OUTPUT: ${(e as Error).message}`);
     }

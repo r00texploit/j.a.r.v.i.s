@@ -17,13 +17,16 @@
 import type { Job } from "../db/repos/job-queue";
 import type { JobHandler } from "../queue/worker";
 import { getFlowRun, updateRun, type FlowRun } from "../db/repos/flow-run";
+import { getRunCancellation } from "../db/repos/run-cancellation";
+import { watchRunCancellation, withRunCancellation } from "../runtime/cancellation";
 import {
   getFlowVersion,
   mergeRunOutputsIntoSampleData,
   type FlowVersion,
 } from "../db/repos/flow-version";
 
-export const RUN_FLOW = "RUN_FLOW";
+import { workflowFailureMessage } from "../queue/retry-policy";
+export { RUN_FLOW } from "../queue/retry-policy";
 
 export interface RunFlowJobPayload {
   runId: string;
@@ -79,6 +82,8 @@ export interface RunFlowJobPayload {
 }
 
 export interface FlowExecutorContext {
+  /** Aborted after the durable cancellation fence closes. */
+  signal?: AbortSignal;
   run: FlowRun;
   version: FlowVersion;
   job: Job<RunFlowJobPayload>;
@@ -87,6 +92,8 @@ export interface FlowExecutorContext {
 }
 
 export interface FlowExecutorResult {
+  /** A pause completes this queue job but leaves the run waiting for a resume. */
+  status?: "SUCCEEDED" | "PAUSED";
   /** Per-step output keyed by step name. Empty for trivial flows. */
   steps: Record<string, unknown>;
   stepsCount: number;
@@ -132,18 +139,17 @@ export interface CreateRunFlowHandlerOptions {
  * Lifecycle on each invocation:
  *   - Read the flow_run referenced by the job; abort if missing.
  *   - Read the flow_version referenced by the run; abort if missing.
- *   - Mark RUNNING and clear stale failed_step from prior attempts.
+ *   - Allow BEGIN only for QUEUED runs and RESUME only for PAUSED runs.
+ *   - Mark RUNNING and clear the prior pause's failed_step.
  *   - Run the executor.
- *   - On success: mark SUCCEEDED with steps + finish_time.
+ *   - On completion: preserve PAUSED, or mark SUCCEEDED with finish_time.
  *   - On FlowExecutionError: mark FAILED with the named failedStep, then
- *     rethrow so the queue can decide on retry. Steps captured before the
+ *     rethrow so the queue records failure. Steps captured before the
  *     failure are persisted.
  *   - On any other Error: mark FAILED with a generic failed_step and rethrow.
  *
- * The queue's max_attempts policy controls retry. Retries re-enter this
- * handler on a fresh attempt; the run row is reused (status flipped back to
- * RUNNING). When the job ultimately succeeds or exhausts retries, the run
- * row's terminal state reflects the last attempt only.
+ * The shared queue policy forbids automatic workflow retries. A fresh queue
+ * job is not permission to replay an already started/terminal run either.
  */
 export function createRunFlowHandler(opts: CreateRunFlowHandlerOptions): JobHandler {
   const now = opts.now ?? Date.now;
@@ -160,6 +166,16 @@ export function createRunFlowHandler(opts: CreateRunFlowHandlerOptions): JobHand
       // deleted between enqueue and claim) and self-correcting.
       return;
     }
+    // The fence outranks the continuation guard below: a canceled run stops
+    // quietly instead of raising a refusal for the STOPPED status the
+    // cancellation itself wrote.
+    if (getRunCancellation(runId)) return;
+    const expectedStatus = typed.payload.executionType === "RESUME" ? "PAUSED" : "QUEUED";
+    if (job.attempt !== 1 || run.status !== expectedStatus) {
+      throw new Error(workflowFailureMessage(
+        `RUN_FLOW refused ${typed.payload.executionType ?? "BEGIN"} for run ${runId} in ${run.status} (attempt ${job.attempt}).`,
+      ));
+    }
     const version = getFlowVersion(run.flowVersionId);
     if (!version) {
       const ts = now();
@@ -175,23 +191,30 @@ export function createRunFlowHandler(opts: CreateRunFlowHandlerOptions): JobHand
     updateRun(runId, {
       status: "RUNNING",
       startTime,
-      // Clear any failed_step from a previous attempt of this same run.
+      finishTime: null,
+      // A planned continuation starts from the paused run's durable state.
       failedStep: null,
     });
 
+    const cancellation = watchRunCancellation(runId);
     try {
-      const result = await opts.executor.execute({
+      const result = await withRunCancellation(runId, () => opts.executor.execute({
         run,
         version,
         job: typed,
         payload: typed.payload.payload ?? {},
-      });
+        signal: cancellation.signal,
+      }));
       updateRun(runId, {
-        status: "SUCCEEDED",
+        status: result.status ?? "SUCCEEDED",
         steps: result.steps,
         stepsCount: result.stepsCount,
-        finishTime: now(),
+        finishTime: result.status === "PAUSED" ? null : now(),
       });
+      // Sample capture belongs to a run that finished on its own terms:
+      // skip a planned continuation, and skip a canceled run whose recorded
+      // outcome is the fence's, not the flow's.
+      if (result.status === "PAUSED" || getRunCancellation(runId)) return;
       // Auto-capture: write each step's output into the version's
       // sampleData map for cells that are currently empty. Lets the
       // variable picker in the editor surface real field names after a
@@ -208,23 +231,38 @@ export function createRunFlowHandler(opts: CreateRunFlowHandlerOptions): JobHand
         );
       }
     } catch (e) {
+      // Deleting the workflow cascades the run away mid-flight. There is no
+      // row left to mark FAILED, and retrying would only re-enter the stale-
+      // job return above.
+      if (!getFlowRun(runId)) return;
+      if (getRunCancellation(runId)) {
+        if (e instanceof FlowExecutionError) updateRun(runId, { steps: e.steps });
+        return;
+      }
       const ts = now();
+      // Persist the reason, not just the step. Both branches used to record a
+      // bare `{name, displayName}`, so an operator looking at a failed run saw
+      // "engine" and nothing else -- the actual message (RPC timeout, engine
+      // rejection, ...) lived only in the daemon log.
+      const errorMessage = workflowFailureMessage(e instanceof Error ? e.message : String(e));
       if (e instanceof FlowExecutionError) {
         updateRun(runId, {
           status: "FAILED",
           steps: e.steps,
           stepsCount: Object.keys(e.steps).length,
-          failedStep: e.failedStep,
+          failedStep: { ...e.failedStep, errorMessage },
           finishTime: ts,
         });
       } else {
         updateRun(runId, {
           status: "FAILED",
-          failedStep: { name: "<engine>", displayName: "engine" },
+          failedStep: { name: "<engine>", displayName: "engine", errorMessage },
           finishTime: ts,
         });
       }
       throw e;
+    } finally {
+      cancellation.dispose();
     }
   };
 }

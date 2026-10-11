@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test';
-import { mergeSTTConfig, mergeTTSConfig, mergeVoiceConfig, validateVoicePatch } from './config-merge.ts';
+import { mergeSTTConfig, mergeTTSConfig, mergeVoiceConfig, validateVoicePatch, resolveEngineIdleTtlMs, resolveEngineCacheRetention } from './config-merge.ts';
 import type { STTConfig, TTSConfig, VoiceConfig } from '../config/types.ts';
 
 describe('mergeSTTConfig', () => {
@@ -227,5 +227,63 @@ describe('validateVoicePatch', () => {
   test('rejects wrong-typed enabled / realtime', () => {
     expect(validateVoicePatch({ realtime: { enabled: 'yes' } }).ok).toBe(false);
     expect(validateVoicePatch({ realtime: 'nope' }).ok).toBe(false);
+  });
+});
+
+describe('resolveEngineIdleTtlMs', () => {
+  test('env var wins over configured value', () => {
+    expect(resolveEngineIdleTtlMs(60_000, { JARVIS_ENGINE_IDLE_TTL_MS: '30000' })).toBe(30_000);
+  });
+
+  test('falls back to configured value without env', () => {
+    expect(resolveEngineIdleTtlMs(60_000, {})).toBe(60_000);
+  });
+
+  test('undefined everywhere yields undefined (runtime default)', () => {
+    expect(resolveEngineIdleTtlMs(undefined, {})).toBeUndefined();
+  });
+
+  test('rejects zero and negative values (0 would disable eviction)', () => {
+    expect(resolveEngineIdleTtlMs(0, {})).toBeUndefined();
+    expect(resolveEngineIdleTtlMs(-5, {})).toBeUndefined();
+    expect(resolveEngineIdleTtlMs(60_000, { JARVIS_ENGINE_IDLE_TTL_MS: '0' })).toBeUndefined();
+  });
+
+  test('rejects non-numeric env values', () => {
+    expect(resolveEngineIdleTtlMs(60_000, { JARVIS_ENGINE_IDLE_TTL_MS: 'fast' })).toBeUndefined();
+  });
+});
+
+describe('resolveEngineCacheRetention', () => {
+  test('env vars win over configured values', () => {
+    expect(
+      resolveEngineCacheRetention(
+        { maxBundles: 3, maxAgeDays: 14 },
+        { JARVIS_ENGINE_CACHE_MAX_BUNDLES: '7', JARVIS_ENGINE_CACHE_MAX_AGE_DAYS: '2' },
+      ),
+    ).toEqual({ keep: 7, maxAgeMs: 2 * 24 * 60 * 60_000 });
+  });
+
+  test('falls back to configured values without env', () => {
+    expect(resolveEngineCacheRetention({ maxBundles: 5 }, {})).toEqual({ keep: 5 });
+  });
+
+  test('nothing configured yields nothing, so the pruner defaults apply', () => {
+    expect(resolveEngineCacheRetention({}, {})).toEqual({});
+  });
+
+  test('zero is honoured: it disables that cap rather than being ignored', () => {
+    // Unlike the idle TTL, 0 is a meaningful choice here -- "keep every
+    // bundle" / "never expire by age" -- for a host that manages the
+    // directory itself.
+    expect(resolveEngineCacheRetention({ maxBundles: 0, maxAgeDays: 0 }, {})).toEqual({
+      keep: 0,
+      maxAgeMs: 0,
+    });
+  });
+
+  test('rejects negative and non-numeric values', () => {
+    expect(resolveEngineCacheRetention({ maxBundles: -1, maxAgeDays: -3 }, {})).toEqual({});
+    expect(resolveEngineCacheRetention({}, { JARVIS_ENGINE_CACHE_MAX_BUNDLES: 'lots' })).toEqual({});
   });
 });

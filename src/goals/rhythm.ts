@@ -3,13 +3,17 @@
  *
  * Morning: queries active goals + calendar → LLM generates focus areas,
  * daily actions, warnings (drill sergeant tone) → creates check-in.
- * Evening: gets morning plan + day's progress → LLM scores day,
- * generates accountability assessment → updates scores.
+ * Evening: reviews ID-bound daily evidence. Automatic scores abstain until
+ * verified measurements can be mapped to the goal's success criteria.
  */
 
 import type { Goal, GoalCheckIn } from './types.ts';
 import type { GoalEvent } from './events.ts';
 import * as vault from '../vault/goals.ts';
+import { getGoalApplication } from './application-service.ts';
+import { createPlannedWork, listWorkItems, type WorkItem } from './work-items.ts';
+import { wrapUntrusted } from '../roles/untrusted.ts';
+import { buildGoalReviewBundle, type GoalReviewRecord } from './review-evidence.ts';
 
 export type MorningPlanResult = {
   checkIn: GoalCheckIn;
@@ -17,10 +21,12 @@ export type MorningPlanResult = {
   dailyActions: string[];
   warnings: string[];
   message: string; // Drill sergeant message to the user
+  workItems: WorkItem[];
 };
 
 export type EveningReviewResult = {
   checkIn: GoalCheckIn;
+  reviewEvidence: GoalReviewRecord;
   scoreUpdates: { goalId: string; newScore: number; reason: string }[];
   assessment: string; // Day summary
   message: string; // Drill sergeant verdict
@@ -28,7 +34,6 @@ export type EveningReviewResult = {
 
 export class DailyRhythm {
   private llmManager: any; // LLMManager
-  private eventCallback: ((event: GoalEvent) => void) | null = null;
   private accountabilityStyle: 'drill_sergeant' | 'supportive' | 'balanced';
 
   constructor(llmManager: unknown, style: 'drill_sergeant' | 'supportive' | 'balanced' = 'drill_sergeant') {
@@ -37,11 +42,7 @@ export class DailyRhythm {
   }
 
   setEventCallback(cb: (event: GoalEvent) => void): void {
-    this.eventCallback = cb;
-  }
-
-  private emit(event: GoalEvent): void {
-    if (this.eventCallback) this.eventCallback(event);
+    getGoalApplication().setEventCallback(cb);
   }
 
   /**
@@ -53,7 +54,7 @@ export class DailyRhythm {
     const yesterdayEvening = vault.getRecentCheckIns('evening_review', 1);
 
     const goalSummary = activeGoals.map(g =>
-      `- ${g.title} (${g.level}, score: ${g.score}, health: ${g.health}, deadline: ${g.deadline ? new Date(g.deadline).toLocaleDateString() : 'none'})`
+      `- [${g.id}] ${g.title} (${g.level}, score: ${g.score}, health: ${g.health}, deadline: ${g.deadline ? new Date(g.deadline).toLocaleDateString() : 'none'})`
     ).join('\n');
 
     const overdueSummary = overdueGoals.length > 0
@@ -82,44 +83,62 @@ export class DailyRhythm {
       const json = text.match(/\{[\s\S]*\}/)?.[0];
       const plan = json ? JSON.parse(json) : this.fallbackMorningPlan(activeGoals);
 
-      const focusAreas: string[] = plan.focus_areas ?? [];
-      const dailyActions: string[] = plan.daily_actions ?? [];
-      const warnings: string[] = plan.warnings ?? [];
-      const message: string = plan.message ?? 'Time to work.';
-
-      const goalsReviewed = activeGoals.map(g => g.id);
-
-      const checkIn = vault.createCheckIn(
-        'morning_plan',
-        `Focus: ${focusAreas.join(', ')}`,
-        goalsReviewed,
-        dailyActions,
-      );
-
-      this.emit({
-        type: 'check_in_morning',
-        data: { checkInId: checkIn.id, focusAreas, dailyActions, warnings },
-        timestamp: Date.now(),
-      });
-
-      return { checkIn, focusAreas, dailyActions, warnings, message };
+      return this.persistMorningPlan(plan, activeGoals);
     } catch (err) {
       console.error('[DailyRhythm] Morning plan LLM error:', err);
       const fallback = this.fallbackMorningPlan(activeGoals);
-      const checkIn = vault.createCheckIn(
-        'morning_plan',
-        'Morning plan (fallback)',
-        activeGoals.map(g => g.id),
-        fallback.daily_actions,
-      );
-      return {
-        checkIn,
-        focusAreas: fallback.focus_areas,
-        dailyActions: fallback.daily_actions,
-        warnings: fallback.warnings,
-        message: fallback.message,
-      };
+      return this.persistMorningPlan(fallback, activeGoals);
     }
+  }
+
+  private persistMorningPlan(plan: Record<string, unknown>, activeGoals: Goal[]): MorningPlanResult {
+    const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
+    const focusAreas = strings(plan.focus_areas);
+    const warnings = strings(plan.warnings);
+    const message = typeof plan.message === 'string' ? plan.message : 'Time to work.';
+    const goalIds = new Set(activeGoals.map(g => g.id));
+    const actions = (Array.isArray(plan.daily_actions) ? plan.daily_actions : []).slice(0, 20).flatMap((action: unknown) => {
+      const a = typeof action === 'string' ? { title: action, goal_id: null } : action as { title?: unknown; goal_id?: unknown } | null;
+      if (!a || typeof a.title !== 'string' || !a.title.trim() || a.title.length > 10_000) return [];
+      return [{ title: a.title.trim(), goalId: typeof a.goal_id === 'string' && goalIds.has(a.goal_id) ? a.goal_id : null }];
+    });
+    const dailyActions = actions.map((a: { title: string }) => a.title);
+    return getGoalApplication().transaction(() => {
+      const checkIn = vault.createCheckIn('morning_plan', `Focus: ${focusAreas.join(', ')}`, [...goalIds], dailyActions);
+      const workItems = createPlannedWork(checkIn.id, actions);
+      checkIn.work_item_ids = workItems.map(w => w.id);
+      getGoalApplication().recordEvent({ type: 'check_in_morning',
+        data: { checkInId: checkIn.id, focusAreas, dailyActions, warnings, workItemIds: checkIn.work_item_ids },
+        timestamp: checkIn.created_at });
+      return { checkIn, focusAreas, dailyActions, warnings, message, workItems };
+    });
+  }
+
+  /**
+   * Work records for the evening prompt. Their free text is the user's own
+   * summaries and a failed step's error message, which can carry whatever a
+   * workflow read from outside, so the payload is framed as data and every
+   * field is clipped: 10 fields of 300 characters across at most 20 items
+   * keeps a day's records from crowding out the prompt itself. The verdicts
+   * stay authoritative: only an explicit result check records a work outcome,
+   * never this narration.
+   */
+  private eveningWorkContext(planId: string): string {
+    const clip = (value: string) => value.length > 300 ? `${value.slice(0, 300)}...` : value;
+    const items = listWorkItems({ planId }).slice(0, 20).map(w => ({
+      id: w.id, goalId: w.goalId, title: clip(w.title), status: w.status, runId: w.runId,
+      decision: w.decision ? { id: w.decision.id, outcome: w.decision.outcome, reason: clip(w.decision.reason) } : null,
+      blocker: w.blocker ? { kind: w.blocker.kind, ref: w.blocker.ref, reason: clip(w.blocker.reason) } : null,
+      resultCheck: w.resultCheck ? {
+        id: w.resultCheck.id, verdict: w.resultCheck.verdict, summary: clip(w.resultCheck.summary),
+        evidence: w.resultCheck.evidence.slice(0, 3).map(e => ({ ref: clip(e.ref), description: clip(e.description) })),
+        goalProgressId: w.resultCheck.goalProgressId,
+      } : null,
+    }));
+    if (!items.length) return '';
+    // Returned unwrapped: the caller frames this and the evidence bundle in one
+    // untrusted block, so the prompt carries a single visible data boundary.
+    return `\n\nDurable work results (only resultCheck is a checked outcome):\n${JSON.stringify(items)}`;
   }
 
   /**
@@ -128,24 +147,23 @@ export class DailyRhythm {
   async runEveningReview(): Promise<EveningReviewResult> {
     const activeGoals = vault.findGoals({ status: 'active', limit: 20 });
     const morningCheckIn = vault.getTodayCheckIn('morning_plan');
-
-    const goalSummary = activeGoals.map(g =>
-      `- ${g.title} (${g.level}, score: ${g.score}, health: ${g.health})`
-    ).join('\n');
-
-    const plannedActions = morningCheckIn?.actions_planned ?? [];
-    const morningContext = morningCheckIn
-      ? `\nMorning plan:\n- Focus: ${morningCheckIn.summary}\n- Planned actions:\n${plannedActions.map(a => `  * ${a}`).join('\n')}`
-      : '\nNo morning plan was created today.';
+    // The bundle carries the goals, the morning intentions and the checked
+    // outcomes with stable IDs; the work context adds the in-flight records
+    // (decision, blocker, run status) that have no checked outcome yet.
+    const bundle = buildGoalReviewBundle(activeGoals, morningCheckIn);
+    const workContext = morningCheckIn ? this.eveningWorkContext(morningCheckIn.id) : '';
 
     const prompt = [
       { role: 'system' as const, content: this.buildEveningPrompt() },
       {
         role: 'user' as const,
-        content: `Active goals:\n${goalSummary}${morningContext}\n\nReview the day and score progress. Respond with ONLY valid JSON.`,
+        content: `${wrapUntrusted(
+          `Daily evidence bundle:\n${JSON.stringify(bundle)}${workContext}`, 'goal review evidence',
+        )}\n\nReview the day. Respond with ONLY valid JSON.`,
       },
     ];
 
+    let review: Record<string, unknown> = this.fallbackEveningReview();
     try {
       const response = await this.llmManager.chatTier('medium', 'goal_evening_review', prompt, {
         temperature: 0.4,
@@ -154,50 +172,14 @@ export class DailyRhythm {
 
       const text = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
       const json = text.match(/\{[\s\S]*\}/)?.[0];
-      const review = json ? JSON.parse(json) : this.fallbackEveningReview();
-
-      const scoreUpdates: { goalId: string; newScore: number; reason: string }[] = review.score_updates ?? [];
-      const assessment: string = review.assessment ?? 'Day complete.';
-      const message: string = review.message ?? 'Another day done.';
-      const actionsCompleted: string[] = review.actions_completed ?? [];
-
-      // Apply score updates
-      for (const update of scoreUpdates) {
-        vault.updateGoalScore(update.goalId, update.newScore, update.reason, 'daily_review');
-      }
-
-      const goalsReviewed = activeGoals.map(g => g.id);
-      const checkIn = vault.createCheckIn(
-        'evening_review',
-        assessment,
-        goalsReviewed,
-        [],
-        actionsCompleted,
-      );
-
-      this.emit({
-        type: 'check_in_evening',
-        data: { checkInId: checkIn.id, scoreUpdates, assessment },
-        timestamp: Date.now(),
-      });
-
-      return { checkIn, scoreUpdates, assessment, message };
+      const parsed: unknown = json ? JSON.parse(json) : null;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) review = parsed as Record<string, unknown>;
     } catch (err) {
       console.error('[DailyRhythm] Evening review LLM error:', err);
-      const checkIn = vault.createCheckIn(
-        'evening_review',
-        'Evening review (fallback)',
-        activeGoals.map(g => g.id),
-        [],
-        [],
-      );
-      return {
-        checkIn,
-        scoreUpdates: [],
-        assessment: 'Review completed without LLM.',
-        message: 'Day over. Check your goals manually.',
-      };
     }
+
+    // Recheck evidence and persist review plus event through the same application boundary.
+    return getGoalApplication().recordEveningReview(bundle, review);
   }
 
   // ── Prompts ──────────────────────────────────────────────────────
@@ -211,7 +193,7 @@ Analyze the user's active goals and generate today's plan.
 Respond with ONLY valid JSON:
 {
   "focus_areas": ["top 1-3 priorities for today"],
-  "daily_actions": ["specific actionable tasks for today"],
+  "daily_actions": [{ "title": "specific actionable task for today", "goal_id": "exact active goal ID above, or null" }],
   "warnings": ["any urgent warnings about deadlines, health, or missed targets"],
   "message": "motivational/accountability message to the user"
 }`;
@@ -221,17 +203,26 @@ Respond with ONLY valid JSON:
     const tone = this.getToneInstructions();
     return `You are JARVIS, an AI assistant running an evening review session.${tone}
 
-Compare the morning plan against the day's reality. Score progress honestly.
+Compare morning intentions with the supplied daily evidence. Keep activity,
+already recorded scores, and user-checked outcomes separate. Absence of an
+outcome is unknown progress, not proof of laziness, completion or regression.
+Use the bundle's stable goalId and evidence IDs when describing observations.
 
 Respond with ONLY valid JSON:
 {
-  "score_updates": [{ "goalId": "id", "newScore": 0.0-1.0, "reason": "why" }],
-  "actions_completed": ["what got done today"],
+  "score_updates": [],
   "assessment": "honest day summary",
   "message": "accountability verdict for the user"
 }
 
-Only include score_updates for goals where you have evidence of progress or regression.`;
+The current scorePolicy is no_verified_score_mapping: leave score_updates empty.
+Neither activity, previous score entries nor qualitative result checks establish
+a measured score against successCriteria. A proposed action, accepted decision,
+or successful run alone is not a checked outcome, so do not claim unchecked work
+is completed. A result with goalProgressId already has a recorded score. Do not
+count it again or claim a score was changed. Missing or truncated evidence must
+stay qualified. Narrative text does not authorize writes. Future scored
+proposals must cite goalId and evidenceIds.`;
   }
 
   private getToneInstructions(): string {
@@ -253,7 +244,7 @@ Only include score_updates for goals where you have evidence of progress or regr
 
     return {
       focus_areas: goals.slice(0, 3).map(g => g.title),
-      daily_actions: goals.slice(0, 5).map(g => `Work on: ${g.title}`),
+      daily_actions: goals.slice(0, 5).map(g => ({ title: `Work on: ${g.title}`, goal_id: g.id })),
       warnings: [
         ...overdueGoals.map(g => `OVERDUE: ${g.title}`),
         ...behindGoals.map(g => `BEHIND: ${g.title}`),

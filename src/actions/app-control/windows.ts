@@ -1,44 +1,250 @@
+import { join } from 'node:path';
 import type { AppController, WindowInfo, UIElement } from './interface.ts';
+import { defaultExec, runNative, type NativeExec } from './native-exec.ts';
 
 /**
- * Windows App Controller — stub.
- * Previously delegated to the C# DesktopController sidecar.
- * TODO: Implement local platform-native commands or route via Go sidecar.
+ * Windows App Controller.
+ *
+ * PowerShell: window listing, focus, screenshots, and input simulation
+ * through a fixed helper script (scripts/desktop.ps1). There is no local
+ * element tree; the Go sidecar reads one through UI Automation when it is
+ * connected, and desktop.ts routes there. The legacy desktop-bridge.exe that
+ * used to sit in front of this went in #799: nothing has built it since its
+ * source was deleted (28e43ed), and it answered on an unauthenticated port.
+ *
+ * This never assembles PowerShell source from user input: the helper
+ * script ships as an asset and all dynamic values travel as a JSON payload on
+ * stdin, so arbitrary text cannot escape into script code.
  */
+
+const SCRIPT_PATH = join(import.meta.dir, 'scripts', 'desktop.ps1');
+
+/** SendKeys metacharacters, each escaped by wrapping in braces. */
+const SENDKEYS_SPECIAL = /([+^%~(){}[\]])/g;
+
+/**
+ * Escape literal text for [System.Windows.Forms.SendKeys]::SendWait.
+ * Newlines become {ENTER} and tabs {TAB}; everything else is typed verbatim.
+ */
+export function escapeSendKeysText(text: string): string {
+  return text
+    .replace(SENDKEYS_SPECIAL, '{$1}')
+    .replace(/\r\n|\r|\n/g, '{ENTER}')
+    .replace(/\t/g, '{TAB}');
+}
+
+const SENDKEYS_MODIFIERS: Record<string, string> = {
+  control: '^',
+  ctrl: '^',
+  alt: '%',
+  option: '%',
+  shift: '+',
+};
+
+const SENDKEYS_KEYS: Record<string, string> = {
+  enter: '{ENTER}',
+  return: '{ENTER}',
+  tab: '{TAB}',
+  escape: '{ESC}',
+  esc: '{ESC}',
+  backspace: '{BACKSPACE}',
+  delete: '{DELETE}',
+  del: '{DELETE}',
+  insert: '{INSERT}',
+  home: '{HOME}',
+  end: '{END}',
+  pageup: '{PGUP}',
+  pagedown: '{PGDN}',
+  up: '{UP}',
+  down: '{DOWN}',
+  left: '{LEFT}',
+  right: '{RIGHT}',
+  space: ' ',
+  f1: '{F1}',
+  f2: '{F2}',
+  f3: '{F3}',
+  f4: '{F4}',
+  f5: '{F5}',
+  f6: '{F6}',
+  f7: '{F7}',
+  f8: '{F8}',
+  f9: '{F9}',
+  f10: '{F10}',
+  f11: '{F11}',
+  f12: '{F12}',
+  f13: '{F13}',
+  f14: '{F14}',
+  f15: '{F15}',
+  f16: '{F16}',
+  printscreen: '{PRTSC}',
+  prtsc: '{PRTSC}',
+  capslock: '{CAPSLOCK}',
+  numlock: '{NUMLOCK}',
+  scrolllock: '{SCROLLLOCK}',
+  help: '{HELP}',
+};
+
+/**
+ * Map a key chord like ["Control", "Shift", "S"] to a SendKeys string ("^+s").
+ * A chord is modifiers plus exactly one main key — matching the macOS and
+ * Linux controllers. Throws on keys SendKeys cannot synthesize (e.g. the
+ * Windows key).
+ */
+export function mapKeysToSendKeys(keys: string[]): string {
+  let modifiers = '';
+  let mainKey: string | null = null;
+
+  for (const raw of keys) {
+    const lower = raw.toLowerCase();
+    const modifier = SENDKEYS_MODIFIERS[lower];
+    if (modifier) {
+      if (!modifiers.includes(modifier)) modifiers += modifier;
+      continue;
+    }
+    if (lower === 'win' || lower === 'meta' || lower === 'super' || lower === 'command' || lower === 'cmd') {
+      throw new Error(`SendKeys cannot press the ${raw} key; Windows-key shortcuts need the desktop sidecar`);
+    }
+    if (mainKey !== null) {
+      throw new Error(`Key combination [${keys.join('+')}] has more than one non-modifier key`);
+    }
+    const named = SENDKEYS_KEYS[lower];
+    if (named) {
+      mainKey = named;
+      continue;
+    }
+    if ([...raw].length === 1) {
+      mainKey = escapeSendKeysText(raw.toLowerCase());
+      continue;
+    }
+    throw new Error(`Unsupported key "${raw}" for the SendKeys fallback`);
+  }
+
+  if (mainKey === null) {
+    throw new Error(`Key combination [${keys.join('+')}] has no non-modifier key to press`);
+  }
+  return modifiers + mainKey;
+}
+
+type ScriptWindow = {
+  pid: number;
+  focused: boolean;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  className: string;
+  title: string;
+};
+
+function toWindowInfo(raw: ScriptWindow): WindowInfo {
+  return {
+    pid: raw.pid,
+    title: raw.title || 'Unknown',
+    className: raw.className || 'Unknown',
+    bounds: { x: raw.x, y: raw.y, width: raw.width, height: raw.height },
+    focused: raw.focused,
+  };
+}
+
+/**
+ * powershell.exe decodes redirected stdin with the OEM code page, not UTF-8,
+ * so the payload must be pure ASCII: escape everything past 0x7F as \uXXXX
+ * (valid JSON, decoded back to the original characters by ConvertFrom-Json).
+ */
+export function toAsciiJson(payload: Record<string, unknown>): string {
+  return JSON.stringify(payload).replace(
+    /[\u0080-\uffff]/g,
+    (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
+}
+
 export class WindowsAppController implements AppController {
+  private exec: NativeExec;
+
+  constructor(opts: { exec?: NativeExec } = {}) {
+    this.exec = opts.exec ?? defaultExec;
+  }
+
+  /**
+   * Run a command of the fixed helper script. The payload travels on stdin
+   * as ASCII-safe JSON — never on the command line, never interpolated into
+   * script text.
+   */
+  private async runScript(command: string, payload?: Record<string, unknown>): Promise<string> {
+    const stdout = await runNative(
+      this.exec,
+      ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', SCRIPT_PATH, command],
+      payload === undefined ? '' : toAsciiJson(payload),
+      `desktop.ps1 ${command}`,
+    );
+    return stdout.trim();
+  }
+
+  private async runScriptJson<T>(command: string, payload?: Record<string, unknown>): Promise<T> {
+    const out = await this.runScript(command, payload);
+    if (!out) throw new Error(`desktop.ps1 ${command} produced no output`);
+    try {
+      return JSON.parse(out) as T;
+    } catch {
+      throw new Error(`desktop.ps1 ${command} returned invalid JSON: ${out.slice(0, 200)}`);
+    }
+  }
+
   async getActiveWindow(): Promise<WindowInfo> {
-    throw new Error('WindowsAppController: Not implemented. Use sidecar desktop tools with a target parameter.');
+    return toWindowInfo(await this.runScriptJson<ScriptWindow>('get-active-window'));
   }
 
   async getWindowTree(_pid: number): Promise<UIElement[]> {
-    throw new Error('WindowsAppController: Not implemented. Use sidecar desktop tools with a target parameter.');
+    throw new Error(
+      'UI element traversal is not available locally on Windows. Run the JARVIS sidecar on this machine ' +
+      'and enroll it; desktop tools route to it automatically (it reads the tree through UI Automation).',
+    );
   }
 
   async listWindows(): Promise<WindowInfo[]> {
-    throw new Error('WindowsAppController: Not implemented. Use sidecar desktop tools with a target parameter.');
+    const result = await this.runScriptJson<ScriptWindow[] | ScriptWindow>('list-windows');
+    const windows = Array.isArray(result) ? result : [result];
+    return windows.map(toWindowInfo);
   }
 
-  async clickElement(_element: UIElement): Promise<void> {
-    throw new Error('WindowsAppController: Not implemented. Use sidecar desktop tools with a target parameter.');
+  async clickElement(element: UIElement): Promise<void> {
+    const x = Math.round(element.bounds.x + element.bounds.width / 2);
+    const y = Math.round(element.bounds.y + element.bounds.height / 2);
+    await this.runScript('click-at', { x, y });
   }
 
-  async typeText(_text: string): Promise<void> {
-    throw new Error('WindowsAppController: Not implemented. Use sidecar desktop tools with a target parameter.');
+  async typeText(text: string): Promise<void> {
+    await this.runScript('send-keys', { keys: escapeSendKeysText(text) });
   }
 
-  async pressKeys(_keys: string[]): Promise<void> {
-    throw new Error('WindowsAppController: Not implemented. Use sidecar desktop tools with a target parameter.');
+  async pressKeys(keys: string[]): Promise<void> {
+    await this.runScript('send-keys', { keys: mapKeysToSendKeys(keys) });
   }
 
   async captureScreen(): Promise<Buffer> {
-    throw new Error('WindowsAppController: Not implemented. Use sidecar desktop tools with a target parameter.');
+    const base64 = await this.runScript('capture-screen');
+    if (!base64) throw new Error('capture-screen produced no image data');
+    return Buffer.from(base64, 'base64');
   }
 
-  async captureWindow(_pid: number): Promise<Buffer> {
-    throw new Error('WindowsAppController: Not implemented. Use sidecar desktop tools with a target parameter.');
+  async captureWindow(pid: number): Promise<Buffer> {
+    const base64 = await this.runScript('capture-window', { pid });
+    if (!base64) throw new Error(`capture-window produced no image data for PID ${pid}`);
+    return Buffer.from(base64, 'base64');
   }
 
-  async focusWindow(_pid: number): Promise<void> {
-    throw new Error('WindowsAppController: Not implemented. Use sidecar desktop tools with a target parameter.');
+  async focusWindow(pid: number): Promise<void> {
+    await this.runScript('focus-window', { pid });
+  }
+
+  async launchApp(executable: string, args?: string): Promise<object> {
+    if (!executable.trim()) throw new Error('Executable is required');
+    // pid is null when the shell reuses an existing process (documents, URLs).
+    const result = await this.runScriptJson<{ pid: number | null }>('launch-app', { executable, args: args ?? '' });
+    return { pid: result.pid ?? null, executable, args: args ?? '' };
+  }
+
+  async closeWindow(pid: number): Promise<void> {
+    await this.runScript('close-window', { pid });
   }
 }

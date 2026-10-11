@@ -13,6 +13,7 @@
  */
 
 import type { LLMManager } from '../../llm/manager.ts';
+import { type TurnToolScope } from '../../actions/tools/tool-scope.ts';
 import type { TaskRequest, TaskRecord, TaskResultEnvelope, TaskTemplate } from './task-envelope.ts';
 import type { TaskRegistry } from './task-registry.ts';
 
@@ -22,7 +23,9 @@ import type { TaskRegistry } from './task-registry.ts';
 // the summarizer stripping identifiers.
 const SUMMARY_THRESHOLD_CHARS = 3000;
 
-const TOOL_USE_INSTRUCTION = `IMPORTANT: You have access to real tools listed in your context. USE THEM to do the work - do not just describe what someone could do. If the user asked to create a workflow, use the workflow tools. If they asked to browse the web, use the browser. If they asked to read a file, use file-ops. Generic textual answers about "you could write a Python script" or "here is the general approach" are wrong when the right tool exists in your registry.`;
+const TOOL_USE_INSTRUCTION = `IMPORTANT: You have access to real tools listed in your context. USE THEM to do the work - do not just describe what someone could do. If the user asked to create a workflow, use the workflow tools. If they asked to browse the web, use the browser. If they asked to read a file, use file-ops. Generic textual answers about "you could write a Python script" or "here is the general approach" are wrong when the right tool exists in your registry.
+
+NEVER answer by announcing what you are about to do ("On it - I'll open Notepad, then verify it's in the foreground"). You are a background executor: nobody reads your text while you work, so an announcement reaches the user as the finished result and the work never happens. Call the tools first; your reply is the report of what they actually returned.`;
 
 const TEMPLATE_PROMPTS: Record<TaskTemplate, string> = {
   research: `[TASK TEMPLATE: RESEARCH] Gather information using your tools (web search, vault, docs). Stay on the user's intent. Cite sources where it matters. End with a clear conclusion the conversation agent can quote.\n\n${TOOL_USE_INSTRUCTION}`,
@@ -63,11 +66,44 @@ export type TaskRunner = (args: {
   signal: AbortSignal;
   /** When resuming, the conversation buffer captured at the previous pause. */
   history?: unknown[];
+  /**
+   * Tools this KIND of turn does not have (#571). Required, not optional:
+   * this is the only route from a hosted chat turn to the tool registry, and
+   * a runner that forgets it is a turn running unscoped. `null` is the
+   * explicit "no scope".
+   */
+  scope: TurnToolScope | null;
+  /**
+   * The site-builder prompt block for a project-scoped chat, if any. Rebuilt
+   * every turn and NOT persisted with the task: it carries repo-written file
+   * names framed as untrusted data (sites/prompt-context.ts), and a stale
+   * copy replayed onto a resume would describe a tree that has since moved.
+   */
+  siteContext?: string;
 }) => Promise<TaskRunResult>;
 
-export type DispatchOptions = {
-  /** Optional channel hint for logging. */
-  channel?: string;
+/**
+ * The facts about the dispatching TURN. Required on both `dispatch` and
+ * `resume`, not an optional options bag: a dispatch that does not say what
+ * scope its turn has is a task about to run unscoped, and the compiler is the
+ * only thing that catches the next call site (#571).
+ */
+export type TurnContext = {
+  /** Tools this kind of turn does not have. `null` is the explicit "none". */
+  scope: TurnToolScope | null;
+  /**
+   * WHICH CHAT this turn is, for matching a paused task to the chat that
+   * created it. `site:<projectId>` for a project-scoped site chat, undefined
+   * for the ordinary main chat.
+   *
+   * Separate from `scope` because the scope is a POLICY and there is only one
+   * of it: every project-scoped chat shares `PROJECT_SITE_CHAT_SCOPE`, so
+   * comparing scopes would make two different projects' chats the same
+   * context. See TaskRecord.contextKey.
+   */
+  contextKey?: string;
+  /** This turn's site prompt block, handed to the task tier that has the tools. */
+  siteContext?: string;
 };
 
 export class TaskDispatcher {
@@ -83,9 +119,30 @@ export class TaskDispatcher {
    * subscribers see each transition so the conv orchestrator can surface
    * UI events.
    */
-  async dispatch(request: TaskRequest, _opts?: DispatchOptions): Promise<TaskResultEnvelope> {
+  async dispatch(request: TaskRequest, turn: TurnContext): Promise<TaskResultEnvelope> {
     const subsystem = `task_${request.template}`;
-    const record = this.registry.create(request, subsystem);
+    // A scoped task must run on the USER's words. The fallback below
+    // (`original_message ?? intent`) would otherwise hand the task tier the
+    // router's paraphrase, and the paraphrase is what the relevance filter
+    // then selects on: "make the hero bigger" matches no trigger group and
+    // substitutes the site surface, while "update the hero section on the
+    // user's website" matches the BROWSE group (selection.ts puts "site" and
+    // "website" there, not in the site-build group), reaches for nothing
+    // withheld, and so gets the framed site readers but none of the actors.
+    // Failing is better than silently running a site task on text the user
+    // never wrote.
+    if (turn.scope && !request.original_message) {
+      // No task id at all, not a placeholder: no record was created, and a
+      // stand-in string is something the router can and will pass straight
+      // back to `check_task`.
+      return {
+        task_id: '',
+        status: 'failed',
+        summary: 'This chat is scoped to one project, so a task has to run on your own words. Please say that again.',
+        error: 'missing_original_message',
+      };
+    }
+    const record = this.registry.create(request, subsystem, turn.contextKey);
     const abort = new AbortController();
     this.registry.setAbortController(record.id, abort);
     this.registry.transition(record.id, 'running');
@@ -97,6 +154,10 @@ export class TaskDispatcher {
     return await this.runAndHandle(record, request, subsystem, abort, {
       originalMessage: request.original_message ?? request.intent,
       history: undefined,
+      // On a fresh dispatch the record's scope IS the turn's -- it was just
+      // written from it -- so there is nothing to reconcile.
+      scope: turn.scope,
+      ...(turn.siteContext ? { siteContext: turn.siteContext } : {}),
     });
   }
 
@@ -105,7 +166,7 @@ export class TaskDispatcher {
    * reply back into the task tier's conversation. Reuses the saved buffer
    * so the LLM continues from where it stopped instead of starting over.
    */
-  async resume(taskId: string, userInput: string): Promise<TaskResultEnvelope> {
+  async resume(taskId: string, userInput: string, turn: TurnContext): Promise<TaskResultEnvelope> {
     const record = this.registry.get(taskId);
     if (!record) {
       return {
@@ -124,6 +185,48 @@ export class TaskDispatcher {
       };
     }
 
+    // MATCH OR REFUSE, and not a union of the two scopes (#571).
+    //
+    // `resume_task` takes a task id the ROUTER chose, validated only for
+    // presence and existence, against a process-global TaskRegistry shared by
+    // every chat and channel. So the conv LLM in a site chat can resume a
+    // task that paused in the telegram chat, and vice versa.
+    //
+    // A union of the withheld sets is safe in the widening direction -- the
+    // resume can never do more than either context allowed -- but it is
+    // wrong in the narrowing one. A non-site task resumed from the Sites page
+    // would run under the site scope: its buffer already used `read_file`, the
+    // ledger is seeded from that buffer so the model believes it has it, the
+    // candidate set removes it, `discover_tools` cannot hand it back because
+    // the catalogue is scope-filtered too, and the refusal it finally gets
+    // says "use the site_* tools with the project_id" for a task that has no
+    // project. The user's paused work is burned on iteration cap or an
+    // apology, triggered by a model's choice of id rather than anything the
+    // user did.
+    //
+    // Comparing the stored KEY as an opaque string, and never resolving it
+    // into a policy, is deliberate: a row carrying a key this build no longer
+    // produces matches no live turn and is refused, where resolving it would
+    // yield "no scope" and run the task with the full registry. The
+    // security-relevant direction fails closed.
+    //
+    // And the key carries the PROJECT, not just the scope kind. There is one
+    // scope object for every site chat, so comparing scopes would let a task
+    // paused in project A's chat be resumed from project B's -- replaying A's
+    // persisted tool results, which is the same disclosure with a narrower
+    // blast radius.
+    const recordContext = record.contextKey ?? null;
+    const turnContext = turn.contextKey ?? null;
+    if (recordContext !== turnContext) {
+      return {
+        task_id: taskId,
+        status: 'failed',
+        summary: `Task ${taskId} was started in a different chat and cannot be continued here. `
+          + 'Ask again in the chat it started in, or start it over here.',
+        error: 'scope_mismatch',
+      };
+    }
+
     const subsystem = record.subsystem;
     const abort = new AbortController();
     this.registry.setAbortController(taskId, abort);
@@ -137,6 +240,10 @@ export class TaskDispatcher {
     return await this.runAndHandle(record, record.request, subsystem, abort, {
       originalMessage: userInput,
       history,
+      // Identical to the record's by the check above, so either is correct;
+      // the turn's is the live object.
+      scope: turn.scope,
+      ...(turn.siteContext ? { siteContext: turn.siteContext } : {}),
     });
   }
 
@@ -150,7 +257,12 @@ export class TaskDispatcher {
     request: TaskRequest,
     subsystem: string,
     abort: AbortController,
-    callArgs: { originalMessage: string; history: unknown[] | undefined },
+    callArgs: {
+      originalMessage: string;
+      history: unknown[] | undefined;
+      scope: TurnToolScope | null;
+      siteContext?: string;
+    },
   ): Promise<TaskResultEnvelope> {
     try {
       const result = await this.runner({
@@ -161,6 +273,8 @@ export class TaskDispatcher {
         originalMessage: callArgs.originalMessage,
         signal: abort.signal,
         history: callArgs.history,
+        scope: callArgs.scope,
+        ...(callArgs.siteContext ? { siteContext: callArgs.siteContext } : {}),
       });
 
       if (abort.signal.aborted) {
@@ -170,11 +284,35 @@ export class TaskDispatcher {
       if (result.kind === 'paused') {
         // Record the pause state via the registry so it lands in the DB
         // (so a daemon restart doesn't drop the question + buffer).
-        this.registry.recordPauseState(
-          record.id,
-          result.question,
-          result.conversation as import('../../llm/provider.ts').LLMMessage[],
-        );
+        //
+        // System messages are dropped first (#571). They are rebuilt fresh by
+        // `processTaskCall` on resume, and persisting them was a real leak of
+        // the per-turn guarantee: the site prompt block interpolates
+        // repo-written file names framed as untrusted data, and
+        // sites/prompt-context.ts states the design intent as "rebuilt into
+        // the system prompt on EVERY later turn" precisely so planted text
+        // cannot outlive the turn that planted it. Serialized into
+        // `tasks.paused_conversation` it outlived the turn, the conversation
+        // and the daemon process. Dropping them also shrinks the blob and
+        // makes the scope notice live on the resume path instead of being
+        // shadowed by a stale copy.
+        //
+        // Safe for tool_use/tool_result pairing: these buffers only ever
+        // carry system messages at the head (processTaskCall builds them that
+        // way, and the only mid-buffer insert is NO_WORK_NUDGE, which is a
+        // `user` message), so removing them leaves the assistant/tool sequence
+        // untouched and the resume re-prepends them in the same position.
+        //
+        // What this does NOT do, so the claim above is not read wider than it
+        // is: the persisted buffer still contains this task's TOOL RESULTS,
+        // including whatever `site_read_file` returned from the project. That
+        // content is framed when it is stored and replayed framed, which is the
+        // shape the untrusted-content rule expects; the per-turn guarantee this
+        // restores is specifically the one about the PROMPT blocks, which are
+        // rebuilt rather than replayed.
+        const buffer = (result.conversation as import('../../llm/provider.ts').LLMMessage[])
+          .filter((m) => m.role !== 'system');
+        this.registry.recordPauseState(record.id, result.question, buffer);
         const envelope: TaskResultEnvelope = {
           task_id: record.id,
           status: 'needs_input',
@@ -183,6 +321,26 @@ export class TaskDispatcher {
         };
         this.registry.transition(record.id, 'needs_input', envelope);
         return envelope;
+      }
+
+      // A task that finished without touching a single tool is the signature
+      // of a model that announced its plan instead of executing it - the
+      // result the conversation tier then reads out as a progress note. It is
+      // model-family dependent, so it can reappear on any upstream swap:
+      // log it loudly rather than letting it look like a normal completion.
+      // `grep 'completed without using any tool'` on the daemon log is the
+      // fastest check after changing which model backs a tier.
+      // `write` is exempt: it drafts prose and is dispatched with
+      // requireToolUse off, so a tool-less completion is the expected shape -
+      // warning on it would bury the real signal in the log.
+      const usedTools = (result.conversation as { role?: string }[])
+        .some((m) => m?.role === 'tool');
+      if (!usedTools && request.template !== 'write') {
+        console.warn(
+          `[TaskDispatcher] task ${record.id} (${request.template}, tier=${request.tier}) ` +
+          `completed without using any tool - the model answered with text only. ` +
+          `Result: ${JSON.stringify(result.text.slice(0, 160))}`,
+        );
       }
 
       const summary = await this.summarize(record, request, result.text);

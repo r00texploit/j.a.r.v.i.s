@@ -52,6 +52,7 @@ export function useLiveThread() {
         kind: "approval",
         id: a.id,
         intent: a.intent,
+        reason: a.intentReason,
         category: a.category,
         impact: a.impact as Impact,
         t: formatTime(a.timestamp),
@@ -278,6 +279,8 @@ export function useLiveThread() {
     items,
     isConnected: ws.isConnected,
     send: ws.sendMessage,
+    stopResponse: ws.cancelResponse,
+    isResponding: ws.isResponding,
     notices: ws.notices,
     dismissNotice: ws.dismissNotice,
     approve,
@@ -308,6 +311,8 @@ export function useLiveThread() {
     contentEvents: ws.contentEvents,
     /** Live agent delegation events (drives Logs Room live tail). */
     agentActivity: ws.agentActivity,
+    /** Settings hot-apply results (drives the Settings Room status card + toasts). */
+    settingsEvents: ws.settingsEvents,
     /** Phase 5A: palette pushes synthetic cards into the thread via this. */
     injectCard,
     /** Phase 6.1.5: room-window helpers. */

@@ -7,8 +7,10 @@
  * src/workflows/activepieces/packages/shared/src/lib/automation/flow-run/execution/flow-execution.ts
  */
 
-import type { Database } from "bun:sqlite";
-import { getWorkflowDb, DEFAULT_IDS } from "../index";
+import type { Database, SQLQueryBindings } from "bun:sqlite";
+import { getRunCancellation, type RunCancellation } from "./run-cancellation";
+import { getRunMachineBinding, type RunMachineBinding } from "./run-machine-binding";
+import { getWorkflowDb } from "../index";
 import { apId } from "../ids";
 
 export type FlowRunStatus =
@@ -26,6 +28,45 @@ export type FlowRunStatus =
 
 export type RunEnvironment = "PRODUCTION" | "TESTING";
 
+/** Immutable per-run preview scope and inputs, retained independently of queue history. */
+export interface RunExecutionConfig {
+  stepNameToTest?: string;
+  sampleData?: Record<string, unknown>;
+  sampleInputOverride?: Record<string, Record<string, unknown>>;
+}
+
+/** Freeze before the first engine invocation. RESUME never trusts its job's preview settings. */
+export function ensureRunExecutionConfig(runId: string, initial?: RunExecutionConfig): RunExecutionConfig {
+  return db().transaction(() => {
+    const row = db().query('SELECT execution_config, step_name_to_test FROM flow_run WHERE id=?')
+      .get(runId) as { execution_config: string | null; step_name_to_test: string | null } | null;
+    if (!row) throw new Error(`Run ${runId} not found`);
+    if (row.execution_config !== null) return JSON.parse(row.execution_config) as RunExecutionConfig;
+    let source = initial;
+    if (!source) {
+      // Upgrade recovery for runs parked before this column existed. Only the original
+      // BEGIN payload can supply the snapshot; live version samples may have changed.
+      const job = db().query(`SELECT payload FROM workflow_job WHERE flow_run_id=? AND job_type='RUN_FLOW'
+        AND COALESCE(json_extract(payload, '$.executionType'), 'BEGIN')='BEGIN' ORDER BY created, id LIMIT 1`)
+        .get(runId) as { payload: string } | null;
+      if (!job) throw new Error('Original run configuration unavailable; start a new run to preserve preview scope');
+      source = JSON.parse(job.payload) as RunExecutionConfig;
+    }
+    if (row.step_name_to_test && source.stepNameToTest && row.step_name_to_test !== source.stepNameToTest) {
+      throw new Error('Run preview scope does not match the original job');
+    }
+    const stepNameToTest = row.step_name_to_test ?? source.stepNameToTest;
+    const config: RunExecutionConfig = {
+      ...(stepNameToTest ? { stepNameToTest } : {}),
+      ...(source.sampleData ? { sampleData: source.sampleData } : {}),
+      ...(source.sampleInputOverride ? { sampleInputOverride: source.sampleInputOverride } : {}),
+    };
+    const snapshot = JSON.stringify(config);
+    db().run('UPDATE flow_run SET execution_config=?, step_name_to_test=? WHERE id=?', [snapshot, stepNameToTest ?? null, runId]);
+    return JSON.parse(snapshot) as RunExecutionConfig;
+  })();
+}
+
 export interface FlowRunRow {
   id: string;
   flow_id: string;
@@ -39,6 +80,7 @@ export interface FlowRunRow {
   steps: string | null;
   failed_step: string | null;
   step_name_to_test: string | null;
+  execution_config: string | null;
   start_time: number | null;
   finish_time: number | null;
   archived_at: number | null;
@@ -62,6 +104,8 @@ export interface FailedStep {
 }
 
 export interface FlowRun {
+  machineBinding: RunMachineBinding | null;
+  cancellation: RunCancellation | null;
   id: string;
   flowId: string;
   flowVersionId: string;
@@ -87,7 +131,13 @@ export interface FlowRun {
 export interface CreateFlowRunInput {
   flowId: string;
   flowVersionId: string;
-  projectId?: string;
+  // No `projectId` (#843). A run belongs to its flow's project, and that is
+  // read from the flow row inside the INSERT below rather than taken from the
+  // caller. While this was an optional input no caller ever passed it, so
+  // every run landed in DEFAULT_IDS.project whatever project its flow was in,
+  // and that column is what the effect record copies and what the engine
+  // token's projectId -- the scope for store and connection access -- is
+  // minted from. Leaving it out of the type means no caller can disagree.
   parentRunId?: string | null;
   failParentOnFailure?: boolean;
   triggeredBy?: string;
@@ -102,7 +152,7 @@ export interface UpdateRunInput {
   status?: FlowRunStatus;
   steps?: Record<string, unknown> | null;
   failedStep?: FailedStep | null;
-  finishTime?: number;
+  finishTime?: number | null;
   startTime?: number;
   stepsCount?: number;
   logsFileId?: string | null;
@@ -118,6 +168,8 @@ function now(): number {
 
 function rowToRun(row: FlowRunRow): FlowRun {
   return {
+    machineBinding: getRunMachineBinding(row.id),
+    cancellation: getRunCancellation(row.id),
     id: row.id,
     flowId: row.flow_id,
     flowVersionId: row.flow_version_id,
@@ -144,16 +196,25 @@ function rowToRun(row: FlowRunRow): FlowRun {
 export function createFlowRun(input: CreateFlowRunInput): FlowRun {
   const id = apId();
   const ts = now();
-  db().run(
+  // INSERT ... SELECT so the project is the flow's own, read in the same
+  // statement as the write (#843): there is no window in which a separate
+  // lookup and the insert could see different rows. A flow that does not exist
+  // matches nothing and inserts nothing, which is answered below.
+  //
+  // The version must be one of THIS flow's, which the schema's foreign key
+  // does not say (it only requires the version to exist). Taking the project
+  // from the flow makes the pairing matter: a run of flow A naming flow B's
+  // version would execute B's definition under A's project token and merge
+  // its outputs into B's sample data. No caller does that today; this keeps it
+  // so rather than leaving it to each of them.
+  const inserted = db().run(
     `INSERT INTO flow_run (
       id, flow_id, flow_version_id, project_id, parent_run_id, fail_parent_on_failure,
       triggered_by, status, environment, start_time, step_name_to_test, tags, created, updated
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) SELECT ?, f.id, v.id, f.project_id, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      FROM flow f JOIN flow_version v ON v.id = ? AND v.flow_id = f.id WHERE f.id = ?`,
     [
       id,
-      input.flowId,
-      input.flowVersionId,
-      input.projectId ?? DEFAULT_IDS.project,
       input.parentRunId ?? null,
       input.failParentOnFailure ? 1 : 0,
       input.triggeredBy ?? null,
@@ -164,8 +225,16 @@ export function createFlowRun(input: CreateFlowRunInput): FlowRun {
       input.tags ? JSON.stringify(input.tags) : null,
       ts,
       ts,
+      input.flowVersionId,
+      input.flowId,
     ],
   );
+  if (inserted.changes !== 1) {
+    const flowExists = db().query("SELECT 1 FROM flow WHERE id = ?").get(input.flowId);
+    throw new Error(flowExists
+      ? `createFlowRun: version ${input.flowVersionId} is not a version of flow ${input.flowId}`
+      : `createFlowRun: flow not found (id=${input.flowId})`);
+  }
   const row = getFlowRunRow(id);
   if (!row) throw new Error(`createFlowRun: row missing after insert (id=${id})`);
   return rowToRun(row);
@@ -182,9 +251,47 @@ export function getFlowRun(id: string): FlowRun | null {
   return row ? rowToRun(row) : null;
 }
 
+/**
+ * The run with this id whose FLOW is in this project, or null (#729).
+ *
+ * Scoped through the flow rather than `flow_run.project_id`. When #729 wrote
+ * this, no caller of `createFlowRun` passed a project, so that column was
+ * always `DEFAULT_IDS.project`, even for a run of a flow in another project.
+ * Since #843 `createFlowRun` copies the flow's project into the column, so for
+ * a run created from then on the two agree and this JOIN gives the same answer
+ * as `WHERE project_id = ?` would.
+ *
+ * And since #843 `createSchema` backfills older rows to their flow's project
+ * at boot, so the column is now right for every row.
+ *
+ * KEPT ANYWAY, deliberately, rather than simplified to the column. It costs a
+ * primary-key lookup, and it does not depend on any writer of `flow_run`
+ * getting the column right: the flow's `project_id` is written once where the
+ * flow is created and never changes, so a future writer that put a run in the
+ * wrong project would still not widen this scope. Dropping it would trade a
+ * guard that cannot drift for one that holds only while every writer is
+ * correct, for no gain.
+ */
+export function getFlowRunInProject(projectId: string, id: string): FlowRun | null {
+  const row = db()
+    .query<FlowRunRow, [string, string]>(
+      `SELECT r.* FROM flow_run r JOIN flow f ON f.id = r.flow_id WHERE r.id = ? AND f.project_id = ?`,
+    )
+    .get(id, projectId);
+  return row ? rowToRun(row) : null;
+}
+
 export function updateRun(id: string, patch: UpdateRunInput): FlowRun {
   const existing = getFlowRunRow(id);
   if (!existing) throw new Error(`updateRun: not found (id=${id})`);
+  const cancellation = getRunCancellation(id);
+  if (cancellation) {
+    // Late engine/handler writes may enrich evidence but cannot revoke a
+    // user's stop decision or erase outputs recorded before cancellation.
+    const steps = { ...(existing.steps ? JSON.parse(existing.steps) : {}), ...(patch.steps ?? {}) };
+    patch = { ...patch, status: "STOPPED", finishTime: cancellation.acknowledgedAt,
+      steps, stepsCount: Math.max(existing.steps_count ?? 0, patch.stepsCount ?? 0, Object.keys(steps).length) };
+  }
   const next: FlowRunRow = {
     ...existing,
     status: patch.status ?? existing.status,
@@ -229,44 +336,95 @@ export function updateRun(id: string, patch: UpdateRunInput): FlowRun {
 
 export interface ListRunsOptions {
   flowId?: string;
+  /**
+   * Only runs whose FLOW is in this project (#844), scoped through the flow
+   * for the reason `getFlowRunInProject` gives: it holds whatever any writer
+   * put in `flow_run.project_id`.
+   */
+  projectId?: string;
   status?: FlowRunStatus;
   limit?: number;
   offset?: number;
 }
 
+/**
+ * A page of runs, newest first.
+ *
+ * ORDER BY `created DESC, rowid DESC`, and the tiebreak is the whole point
+ * (#636). `created` is a millisecond timestamp with no uniqueness, so two runs
+ * created in the same millisecond had no defined order between them.
+ *
+ * WHAT THAT ACTUALLY COST, measured rather than assumed, because the filed
+ * symptom and the real one turned out not to be the same thing:
+ *
+ *   - THE LISTING WAS BACKWARDS for same-millisecond runs. With no tiebreak
+ *     SQLite's sorter leaves equal keys in scan order, so `created DESC`
+ *     returned a block of same-millisecond rows OLDEST first. A flow that
+ *     enqueued 120 runs inside one millisecond showed the 50 OLDEST of them on
+ *     the first page of a listing whose whole contract is "newest first". That
+ *     is the reproducible defect, and it is what the tests pin.
+ *   - SKIP AND REPEAT ACROSS PAGES, which the issue leads with, is NOT fixed by
+ *     a tiebreak, and was not reproducible without one either: measured both
+ *     ways on a static table, paging returns every row exactly once. What
+ *     breaks OFFSET paging is a row inserted or deleted BETWEEN two page reads,
+ *     and that is true under any total order -- a new newest-first row shifts
+ *     every later row down by one, so page 2 repeats page 1's last entry. Only
+ *     keyset pagination fixes that, and it needs the route to hand back a
+ *     cursor. So this makes the order DEFINED; it does not make OFFSET paging
+ *     concurrency-safe, and saying otherwise would be false comfort.
+ *
+ * The defined order is worth having on its own terms even so: SQL guarantees
+ * nothing about equal keys, so the old query's page-to-page consistency was an
+ * accident of this planner that an index on `created`, a spilled sort or a
+ * version bump could take away silently.
+ *
+ * #609 is what made any of it matter: once `GET /api/workflows/:id/runs`
+ * clamped `limit` to 100, paging became the only way to read past 100 runs.
+ *
+ * `rowid` rather than `id`, which is the other obvious tiebreak and is also
+ * total (`id` is the PRIMARY KEY). `id` is `apId()`, i.e. nanoid, so ordering
+ * by it would break same-millisecond ties at RANDOM -- total and stable, which
+ * is all paging strictly needs, but it would replace today's de-facto
+ * insertion order with noise in the listing a user reads. `flow_run` is an
+ * ordinary rowid table (`id TEXT PRIMARY KEY`, not WITHOUT ROWID), so `rowid`
+ * is unique, never reused while rows live, and ascends with insertion: it is
+ * total AND chronological, which is what "newest first" is supposed to mean.
+ *
+ * ONE query rather than the four near-identical branches this replaces. The
+ * four each carried their own copy of the ORDER BY, which is four places for a
+ * tiebreak to be added to three of them. Only literal SQL fragments are
+ * concatenated; every value stays a bound parameter.
+ *
+ * Still OFFSET paging, so cost stays O(offset) and there is no index on
+ * `created` to help (`schema.ts` indexes `flow_id`, `status`, `project_id`,
+ * `start_time`, `parent_run_id`). Unchanged by this, since the sort was a full
+ * sort of the filtered set before too. Keyset pagination would fix both, and
+ * wants the route to hand back a cursor -- which `rowid` is not meant to be,
+ * so that is a separate change.
+ */
 export function listRuns(opts: ListRunsOptions = {}): FlowRun[] {
   const limit = opts.limit ?? 50;
   const offset = opts.offset ?? 0;
 
-  // Manually compose a small WHERE clause; flow_id and status are the only filters.
-  if (opts.flowId !== undefined && opts.status !== undefined) {
-    return db()
-      .query<FlowRunRow, [string, FlowRunStatus, number, number]>(
-        `SELECT * FROM flow_run WHERE flow_id = ? AND status = ? ORDER BY created DESC LIMIT ? OFFSET ?`,
-      )
-      .all(opts.flowId, opts.status, limit, offset)
-      .map(rowToRun);
-  }
+  const filters: string[] = [];
+  const args: SQLQueryBindings[] = [];
   if (opts.flowId !== undefined) {
-    return db()
-      .query<FlowRunRow, [string, number, number]>(
-        `SELECT * FROM flow_run WHERE flow_id = ? ORDER BY created DESC LIMIT ? OFFSET ?`,
-      )
-      .all(opts.flowId, limit, offset)
-      .map(rowToRun);
+    filters.push("flow_id = ?");
+    args.push(opts.flowId);
   }
   if (opts.status !== undefined) {
-    return db()
-      .query<FlowRunRow, [FlowRunStatus, number, number]>(
-        `SELECT * FROM flow_run WHERE status = ? ORDER BY created DESC LIMIT ? OFFSET ?`,
-      )
-      .all(opts.status, limit, offset)
-      .map(rowToRun);
+    filters.push("status = ?");
+    args.push(opts.status);
   }
+  if (opts.projectId !== undefined) {
+    filters.push("flow_id IN (SELECT id FROM flow WHERE project_id = ?)");
+    args.push(opts.projectId);
+  }
+  const where = filters.length ? ` WHERE ${filters.join(" AND ")}` : "";
   return db()
-    .query<FlowRunRow, [number, number]>(
-      `SELECT * FROM flow_run ORDER BY created DESC LIMIT ? OFFSET ?`,
+    .query<FlowRunRow, SQLQueryBindings[]>(
+      `SELECT * FROM flow_run${where} ORDER BY created DESC, rowid DESC LIMIT ? OFFSET ?`,
     )
-    .all(limit, offset)
+    .all(...args, limit, offset)
     .map(rowToRun);
 }

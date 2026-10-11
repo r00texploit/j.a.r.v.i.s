@@ -19,11 +19,12 @@
  */
 
 import type { Server } from "bun";
+import { WorkflowCancellationError } from "../runtime/cancellation";
 
 // We don't attach per-connection state to upgrades on this server (yet --
 // socket.io will own that in B4), so the Bun.Server generic gets `unknown`.
 type ServerNoData = Server<unknown>;
-import { EngineTokenSigner } from "./engine-token";
+import { EngineTokenSigner, engineTokensEqual } from "./engine-token";
 import { SandboxRegistry } from "./sandbox-registry";
 import type { EngineTokenClaims } from "./types";
 import type { CredentialResolver } from "../credentials/adapter";
@@ -52,6 +53,10 @@ import {
   type ToolsInvokeFn,
 } from "./routes/jarvis-tools";
 import {
+  createJarvisPieceAuthorizeRoute,
+  type PieceAuthorizeFn,
+} from "./routes/jarvis-pieces";
+import {
   createJarvisNotifyRoute,
   type NotifyFn,
 } from "./routes/jarvis-notify";
@@ -75,6 +80,7 @@ import {
   type WorkflowsStartFn,
 } from "./routes/jarvis-workflows";
 import { json, err, type RouteContext, type RouteHandler } from "./routes/shared";
+import { runWithOrigin } from "../../llm/origin.ts";
 
 export interface SandboxApiServices {
   credentialResolver: CredentialResolver;
@@ -107,6 +113,12 @@ export interface SandboxApiServices {
    * endpoint returns 503. The daemon wires this in with `ToolRegistry`.
    */
   toolsInvoke?: ToolsInvokeFn;
+  /**
+   * Admission backend for a governed piece's action, called by the engine
+   * before the piece runs. If unset the endpoint returns 503, which fails the
+   * step closed -- the engine only calls it for a piece with an adapter.
+   */
+  pieceAuthorize?: PieceAuthorizeFn;
   /**
    * Notification backend for the `jarvis-notify` piece. If unset, returns 503.
    */
@@ -254,6 +266,11 @@ export class SandboxApi {
         handler: createJarvisToolsInvokeRoute(this.services),
       },
       {
+        path: "/v1/jarvis/pieces/authorize",
+        method: "POST",
+        handler: createJarvisPieceAuthorizeRoute(this.services),
+      },
+      {
         path: "/v1/jarvis/notify",
         method: "POST",
         handler: createJarvisNotifyRoute(this.services),
@@ -294,6 +311,16 @@ export class SandboxApi {
         handler: createJarvisWorkflowsStartRoute(this.services),
       },
     );
+  }
+
+  /**
+   * Every authenticated `(method, path)` pair this server serves, in match
+   * order. Exposed so a test can sweep the whole surface that sits behind the
+   * auth middleware rather than re-listing it by hand, which is how a newly
+   * added route quietly escapes an auth-behaviour test.
+   */
+  get routeTable(): ReadonlyArray<{ method: RouteEntry["method"]; path: string }> {
+    return this.routes.map((r) => ({ method: r.method, path: r.path }));
   }
 
   async start(opts: { host?: string; port?: number } = {}): Promise<void> {
@@ -383,8 +410,27 @@ export class SandboxApi {
     } catch {
       return err("invalid engine token", 401);
     }
-    if (!this.registry.get(claims.sandboxId)) {
+    const record = this.registry.get(claims.sandboxId);
+    if (!record) {
       return err("sandbox terminated", 401);
+    }
+    // A live sandbox is not the same thing as a live token. The engine pool
+    // reuses one warm subprocess across runs, so `rebind()` re-points this
+    // sandboxId at a new (runId, projectId) and overwrites `engineToken`,
+    // while every token it ever issued stays signature-valid for the rest of
+    // its TTL. Without this comparison a token retained from a retired run --
+    // stashed in module-level state by piece code, which survives because the
+    // process does -- keeps being served under its OLD `projectId` claim, and
+    // every route that scopes work by `ctx.claims.projectId` hands it the
+    // previous project's data (credentials included).
+    //
+    // Comparing `claims.runId` to `record.runId` instead would not be enough:
+    // a RESUME re-acquires the SAME runId, mints a fresh token and rebinds, so
+    // the pre-pause token would still match on runId. Acceptance has to be
+    // tied to the one token the sandbox is currently running under, which is
+    // exactly what `record.engineToken` holds.
+    if (!engineTokensEqual(token, record.engineToken)) {
+      return err("engine token superseded", 401);
     }
 
     for (const route of this.routes) {
@@ -396,8 +442,11 @@ export class SandboxApi {
       // verified claims and matched params alongside.
       const ctx: RouteContext = { req, claims, params };
       try {
-        return await route.handler(ctx);
+        // Everything a workflow asks the brain for (jarvis-ask, agent
+        // delegation, tools) runs on the workflow's behalf (src/llm/origin.ts).
+        return await runWithOrigin('workflow', () => route.handler(ctx));
       } catch (e) {
+        if (e instanceof WorkflowCancellationError) return err(e.message, 409);
         const message = e instanceof Error ? e.message : String(e);
         return err(`internal error: ${message}`, 500);
       }

@@ -57,6 +57,29 @@ const magicColorKey = 0x00FE00FE
 // HWND_TOPMOST is officially -1, encoded as the largest uintptr.
 const hwndTopmost = ^uintptr(0)
 
+// WM_SETICON assigns a window its title-bar (small) / Alt-Tab + taskbar (big)
+// icon. WebView2 windows don't inherit the .exe icon on their own, so framed
+// panels (the dashboard) show WebView2's default until we set it explicitly.
+const (
+	wmSetIcon = 0x0080
+	iconSmall = 0
+	iconBig   = 1
+)
+
+// setPanelBrandIcon stamps the Brand Book III drop mark (the same resource the
+// .exe and tray load, ID trayIconBrandID) onto a framed panel window so its
+// title bar and taskbar entry read as usejarvis rather than WebView2's stock
+// icon. hInstance/LoadIconW are reused from the tray + pebble overlay decls.
+func setPanelBrandIcon(hwnd uintptr) {
+	hInstance, _, _ := procGetModuleHandleW.Call(0)
+	hIcon, _, _ := procLoadIconW.Call(hInstance, uintptr(trayIconBrandID))
+	if hIcon == 0 {
+		return
+	}
+	procSendMessageW.Call(hwnd, wmSetIcon, iconBig, hIcon)
+	procSendMessageW.Call(hwnd, wmSetIcon, iconSmall, hIcon)
+}
+
 // user32, procSetForegroundWindow, procShowWindow are already declared in
 // uia_windows.go — reuse those. The procs below are panel-service specific.
 var (
@@ -69,6 +92,7 @@ var (
 	procGetCursorPos               = user32.NewProc("GetCursorPos")
 	procSetWindowRgn               = user32.NewProc("SetWindowRgn")
 	procGetSystemMetrics           = user32.NewProc("GetSystemMetrics")
+	procSendMessageW               = user32.NewProc("SendMessageW")
 
 	gdi32                  = syscall.NewLazyDLL("gdi32.dll")
 	procCreateRectRgn      = gdi32.NewProc("CreateRectRgn")
@@ -207,6 +231,9 @@ func applyPlatformFlags(handle unsafe.Pointer, spec PanelSpec) error {
 	// with custom rendering). Calls silently fail on older Windows.
 	if !spec.Frameless && !spec.Transparent && !spec.ClickThrough && !spec.AlwaysOnTop {
 		applyWin11ChromePolish(hwnd)
+		// Framed panels (the dashboard) show a real title bar + taskbar entry,
+		// so give them the brand drop icon instead of WebView2's default.
+		setPanelBrandIcon(hwnd)
 	}
 
 	return nil
@@ -285,15 +312,144 @@ func platformReassertTopmost(handle unsafe.Pointer) error {
 	return nil
 }
 
+// HWND_NOTOPMOST is officially -2.
+const hwndNoTopmost = ^uintptr(1)
+
+// FlashWindowEx flags: flash the taskbar button until the window comes to the
+// foreground.
+const (
+	flashwTray      = 0x00000002
+	flashwTimerNoFG = 0x0000000C
+)
+
+// flashWInfo mirrors Win32 FLASHWINFO.
+type flashWInfo struct {
+	cbSize    uint32
+	hwnd      uintptr
+	dwFlags   uint32
+	uCount    uint32
+	dwTimeout uint32
+}
+
+var procFlashWindowEx = user32.NewProc("FlashWindowEx")
+
+// platformFocusWindow brings a panel forward. Most panels open with nobody
+// clicking anything: the first-run dashboard when the sidecar connects, the
+// "open dashboard at startup" window at login, rooms the brain opens. Windows
+// only lets the process that received the user's last input take the
+// foreground, so SetForegroundWindow alone is refused there and the window used
+// to open BEHIND whatever the user was in, with no sign it had opened at all.
+//
+// So the window is first raised above every normal window without activating
+// it, which Windows does allow (a round trip through the topmost band leaves it
+// at the top of the normal band). Then the foreground is requested, which
+// Windows grants when the user just interacted with Jarvis (its hotkey, the
+// tray), and when the window still is not in the foreground the taskbar button
+// flashes until the user switches to it; keyboard focus stays where the user
+// left it. Topmost panels (the palette, overlays) are already above normal
+// windows and keep their band. The raise, and only the raise, is skipped while
+// a fullscreen app covers the panel's monitor or presentation mode is on.
 func platformFocusWindow(handle unsafe.Pointer) error {
 	if handle == nil {
 		return fmt.Errorf("nil HWND")
 	}
 	hwnd := uintptr(handle)
-	const swShow = 5
-	procShowWindow.Call(hwnd, swShow)
+	const swShow, swRestore = 5, 9
+	if iconic, _, _ := procIsIconic.Call(hwnd); iconic != 0 {
+		procShowWindow.Call(hwnd, swRestore)
+	} else {
+		procShowWindow.Call(hwnd, swShow)
+	}
+	if getWindowLong(hwnd, gwlExStyle)&wsExTopmost == 0 && !fullscreenAppCovers(hwnd) {
+		procSetWindowPos.Call(hwnd, hwndTopmost, 0, 0, 0, 0, swpNoMove|swpNoSize|swpNoActivate)
+		procSetWindowPos.Call(hwnd, hwndNoTopmost, 0, 0, 0, 0, swpNoMove|swpNoSize|swpNoActivate)
+	}
 	procSetForegroundWindow.Call(hwnd)
+	// Judged by the outcome rather than SetForegroundWindow's return value,
+	// which can report success when Windows only flashed the button.
+	if fg, _, _ := procGetForegroundWindow.Call(); fg != hwnd {
+		flashTaskbarButton(hwnd)
+	}
 	return nil
+}
+
+func flashTaskbarButton(hwnd uintptr) {
+	fi := flashWInfo{hwnd: hwnd, dwFlags: flashwTray | flashwTimerNoFG}
+	fi.cbSize = uint32(unsafe.Sizeof(fi))
+	procFlashWindowEx.Call(uintptr(unsafe.Pointer(&fi)))
+}
+
+var (
+	procSHQueryUserNotificationState = syscall.NewLazyDLL("shell32.dll").NewProc("SHQueryUserNotificationState")
+	procPanelMonitorFromWindow       = user32.NewProc("MonitorFromWindow")
+	procPanelIsZoomed                = user32.NewProc("IsZoomed")
+)
+
+// QUERY_USER_NOTIFICATION_STATE values that mean the user should not have
+// windows popped over what they are doing.
+const (
+	qunsBusy                 = 2 // the shell considers a fullscreen app to be running
+	qunsRunningD3DFullScreen = 3 // a Direct3D fullscreen app (games)
+	qunsPresentationMode     = 4 // presentation settings are on
+)
+
+const monitorDefaultToNearest = 2
+
+// panelMonitorInfo mirrors Win32 MONITORINFO.
+type panelMonitorInfo struct {
+	cbSize    uint32
+	rcMonitor w32Rect
+	rcWork    w32Rect
+	dwFlags   uint32
+}
+
+// fullscreenAppCovers reports whether raising hwnd would pop it over a
+// fullscreen app or a presentation. The shell's busy states alone are too
+// broad (they can come from a fullscreen video on another monitor), so they
+// count only when the foreground window is on the panel's monitor, covers that
+// whole monitor, and is not just a maximized window. A maximized window can
+// cover its monitor too, with an auto-hidden taskbar, but it is in the
+// maximized state and keeps its caption; fullscreen browsers, players and
+// games drop the caption or are not maximized. Presentation mode counts
+// everywhere. Errors read as "no", so the panel is raised as usual.
+func fullscreenAppCovers(hwnd uintptr) bool {
+	var state int32
+	if hr, _, _ := procSHQueryUserNotificationState.Call(uintptr(unsafe.Pointer(&state))); hr != 0 {
+		return false
+	}
+	switch state {
+	case qunsPresentationMode:
+		return true
+	case qunsBusy, qunsRunningD3DFullScreen:
+		// Only when a fullscreen window really covers the panel's monitor; below.
+	default:
+		return false
+	}
+	fg, _, _ := procGetForegroundWindow.Call()
+	if fg == 0 || fg == hwnd {
+		return false
+	}
+	monitor, _, _ := procPanelMonitorFromWindow.Call(fg, monitorDefaultToNearest)
+	panelMonitor, _, _ := procPanelMonitorFromWindow.Call(hwnd, monitorDefaultToNearest)
+	if monitor == 0 || monitor != panelMonitor {
+		return false
+	}
+	mi := panelMonitorInfo{}
+	mi.cbSize = uint32(unsafe.Sizeof(mi))
+	if ok, _, _ := procGetMonitorInfoW.Call(monitor, uintptr(unsafe.Pointer(&mi))); ok == 0 {
+		return false
+	}
+	var r w32Rect
+	if ok, _, _ := procGetWindowRect.Call(fg, uintptr(unsafe.Pointer(&r))); ok == 0 {
+		return false
+	}
+	m := mi.rcMonitor
+	if r.Left > m.Left || r.Top > m.Top || r.Right < m.Right || r.Bottom < m.Bottom {
+		return false
+	}
+	zoomed, _, _ := procPanelIsZoomed.Call(fg)
+	hasCaption := getWindowLong(fg, gwlStyle)&wsCaption == wsCaption
+	return zoomed == 0 || !hasCaption
 }
 
 // POINT mirrors Win32 POINT — two LONGs (32-bit signed).

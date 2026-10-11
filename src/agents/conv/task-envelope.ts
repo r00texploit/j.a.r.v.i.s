@@ -57,6 +57,37 @@ export type TaskRequest = {
 };
 
 /**
+ * The templates a `delegate` call may name. `TaskTemplate` is a compile-time
+ * union and the conv LLM's arguments are runtime strings, so the two need a
+ * runtime bridge or an invented template reaches `TEMPLATE_PROMPTS[template]`
+ * and puts the literal string `undefined` into the task tier's system prompt.
+ */
+const TEMPLATE_SET: Record<TaskTemplate, true> = {
+  research: true, code: true, plan: true, write: true, general: true,
+};
+export const TASK_TEMPLATES: readonly TaskTemplate[] =
+  Object.keys(TEMPLATE_SET) as TaskTemplate[];
+
+/**
+ * The tiers a `delegate` call may name. `conversation` is the router itself.
+ *
+ * Both lists are derived from a `Record<union, true>` rather than written out,
+ * so adding a member to `TaskTemplate` or `Tier` is a compile error here
+ * instead of a validator that silently rejects the new value at run time.
+ */
+const TIER_SET: Record<TaskRequest['tier'], true> = { high: true, medium: true, low: true };
+export const TASK_TIERS: readonly TaskRequest['tier'][] =
+  Object.keys(TIER_SET) as TaskRequest['tier'][];
+
+export function isTaskTemplate(value: unknown): value is TaskTemplate {
+  return typeof value === 'string' && (TASK_TEMPLATES as readonly string[]).includes(value);
+}
+
+export function isTaskTier(value: unknown): value is TaskRequest['tier'] {
+  return typeof value === 'string' && (TASK_TIERS as readonly string[]).includes(value);
+}
+
+/**
  * What flows back into the conversation LLM's context after a task runs.
  * `summary` is what the conv LLM verbalizes; `details_ref` is a pointer to
  * fetch the full task transcript if the user drills in. `followup_hints`
@@ -81,6 +112,37 @@ export type TaskResultEnvelope = {
 export type TaskRecord = {
   id: string;
   request: TaskRequest;
+  /**
+   * Which CHAT CONTEXT this task was created in (#571). `undefined` means the
+   * ordinary main chat.
+   *
+   * A chat identity, not a policy id, and the distinction is the point. The
+   * product has exactly one tool scope (`PROJECT_SITE_CHAT_SCOPE`), so storing
+   * the scope's id here would make every site chat look like the same context
+   * and two different projects' chats indistinguishable -- project A's task
+   * summaries would render into project B's router prompt, and a task paused
+   * in A would be resumable from B, replaying A's persisted tool results. The
+   * key therefore carries the project too (`site:<projectId>`), which is what
+   * `sameContext` and `TaskDispatcher.resume` compare.
+   *
+   * It is never resolved back into a policy: the scope a turn RUNS under
+   * always comes from the live turn, never from this row, so an unrecognised
+   * or stale key can only fail to match and refuse.
+   *
+   * On the RECORD and not on `TaskRequest`, deliberately. `TaskRequest` is the
+   * one object built from the conv LLM's tool-call arguments -- `handleToolCall`
+   * does `call.arguments as Partial<TaskRequest>` -- so a control field on it
+   * would be a type-valid thing for the model to send, and the only reason it
+   * could not set one today is the convention that the request is assembled
+   * field by field. A later refactor to `{ ...args }` would compile clean and
+   * hand the model its own context. `TaskRecord` is constructed only by the
+   * registry and by `rowToRecord`, never from model output.
+   *
+   * Persisted (`tasks.context_key`): a delegated task can pause on
+   * `ask_for_clarification` and resume minutes later or after a daemon
+   * restart, and the resumed turn must be the same chat.
+   */
+  contextKey?: string;
   subsystem: string;          // attribution label for token tracking
   status: TaskStatus;
   startedAt: number;

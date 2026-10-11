@@ -6,6 +6,7 @@
  * starts health monitoring, and handles graceful shutdown.
  */
 
+import { configureWorkflowReadiness } from '../workflows/db/repos/flow-readiness';
 import { mkdirSync, existsSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -14,54 +15,118 @@ import { flushWindowState } from "./window-state.ts";
 import { ServiceRegistry } from "./services.ts";
 import { HealthMonitor } from "./health.ts";
 import { loadConfig } from "../config/loader.ts";
+import { installLogFileSink, logFileIsProcessStdio } from "../util/log-file.ts";
+import { resolveEngineCacheRetention, resolveEngineIdleTtlMs } from "./config-merge.ts";
+import { activeTurns } from "./active-turns.ts";
 import { writeLockedPort } from "./pid.ts";
 import { AgentService } from "./agent-service.ts";
+import { initDebugRpcGate, MIN_SECRET_LENGTH } from "./debug-rpc-gate.ts";
+import { hardenProcessInspection } from "./process-hardening.ts";
+import { modelExecDaemonWarning } from "../util/model-exec-marker.ts";
+import { getRecorder, parseInteractionEvent } from "../skills/recorder.ts";
+import { onRecordingStopped } from "../actions/tools/skills.ts";
 import { createObservation } from "../vault/observations.ts";
 import { ObserverService, mapEventType } from "./observer-service.ts";
 import { WebSocketService } from "./ws-service.ts";
+import { PebbleRealtimeManager, wireRealtimeReadvertisement } from "./pebble-realtime.ts";
+import { hostedRealtimeIncluded, warmRealtimeGateFor } from './realtime-gate.ts';
+import { resolveRealtimeVoice } from "../config/realtime.ts";
+import { pebbleHotkeyRequestKey, resolvePebbleHotkeys, shouldCloseBeforeSpawn } from "../config/pebble-hotkeys.ts";
+import { isHostedInstall, realtimeEnablement } from "./usejarvis-ai.ts";
+import { REALTIME_NAV_TOOLS, REALTIME_NAV_TOOL_NAMES } from "./realtime-nav-tools.ts";
 import { EventReactor } from "./event-reactor.ts";
 import { EventCoalescer } from "./event-coalescer.ts";
 import { CommitmentExecutor } from "./commitment-executor.ts";
 import { classifyEvent } from "./event-classifier.ts";
 import { createApiRoutes, setCorsOrigin } from "./api-routes.ts";
 import { GoogleAuth } from "../integrations/google-auth.ts";
+import { classifyGoogle, googleIdentity, makeGoogleAuth } from "../integrations/google-managed-refresh.ts";
 import { ResearchQueue } from "./research-queue.ts";
 import { researchQueueTool, setResearchQueueRef } from "../actions/tools/research.ts";
 import { spawnPersistentAgent, assignPersistentAgentTask } from "../actions/tools/agents.ts";
+import { collectExecutionTargets } from "../actions/tools/sidecar-route.ts";
 import { ChannelService } from "./channel-service.ts";
 import { BackgroundAgentService } from "./background-agent-service.ts";
 import { AuthorityEngine } from "../authority/engine.ts";
 import { ApprovalManager } from "../authority/approval.ts";
 import { AuditTrail } from "../authority/audit.ts";
+import { wrapUntrusted, inlineUntrusted } from "../roles/untrusted.ts";
+import { isUpdateAvailable, SIDECAR_LATEST_VERSION, SIDECAR_RECOMMENDED_VERSION } from "../sidecar/compat.ts";
+import { containsWakePhrase, hasSpokenContent, wakeCommandFrom } from "../voice/wake-phrase.ts";
 import { AuthorityLearner } from "../authority/learning.ts";
 import { EmergencyController } from "../authority/emergency.ts";
-import { ApprovalDelivery } from "../authority/approval-delivery.ts";
+import { ApprovalDelivery, approvalToast, taskCompleteBody } from "../authority/approval-delivery.ts";
 import { DeferredExecutor } from "../authority/deferred-executor.ts";
+import { buildBackgroundProfile } from "../authority/background-profile.ts";
+import { buildTaintGating } from "../authority/taint-gating.ts";
+import { channelApprovalReply, notificationApprovalDecision } from "./approval-decision.ts";
 import { sendDesktopNotification } from "../comms/desktop-notify.ts";
+import { ensureUiBuilt } from "./ui-autobuild.ts";
+import { deliverOpportunityNotification } from './opportunity-notification.ts';
 import { SidecarManager, buildEnrollmentUrls } from "../sidecar/manager.ts";
+import {
+  beginDashboardIntro,
+  finishDashboardIntro,
+  dashboardSpawnOutcome,
+  type DashboardSpawnSettled,
+} from "../sidecar/first-run.ts";
+import type { ConnectedSidecar } from "../sidecar/types.ts";
+import { resolveExternalOrigin } from "../util/external-origin.ts";
 import { ensureWorkflowSchema } from "../workflows/db/index.ts";
 import { Worker as WorkflowWorker } from "../workflows/queue/worker.ts";
+import { recoverOrphanedJobs } from "../workflows/db/repos/job-queue.ts";
+import { TimerWaitpointScheduler } from "../workflows/timer-scheduler.ts";
 import { createRunFlowHandler, RUN_FLOW } from "../workflows/runner/handler.ts";
 import { createWorkflowRoutes } from "../workflows/api/routes.ts";
 import { TriggerManager } from "../workflows/runner/triggers/manager.ts";
 import { AWARENESS_EVENT_TYPE_MAP, OBSERVER_EVENT_TYPE_MAP } from "../workflows/runtime/event-types.ts";
 import { WorkflowEventBus } from "../workflows/runtime/event-bus.ts";
 import { WorkflowEventBuffer } from "../workflows/runtime/event-buffer.ts";
-import type {
-  ComposerChatMessage,
-  ComposerChatReply,
-  ComposerToolDef,
-} from "../actions/tools/workflow-composer.ts";
+import { createComposerLlmClient } from "../actions/tools/composer-llm.ts";
+import { composePersistedFlow } from '../actions/tools/persisted-workflow-composer.ts';
+import { SuggestionComposer } from '../awareness/suggestion-composer.ts';
 import {
   bootstrapWorkflowEngine,
   type BootstrapWorkflowEngineResult,
 } from "../workflows/runtime/engine-bootstrap.ts";
 import { CredentialResolver } from "../workflows/credentials/adapter.ts";
 import { metadataToCatalogEntry } from "../workflows/runtime/piece-catalog.ts";
+import { resolveSharedRuntimePaths } from "../workflows/runtime/shared-runtime-paths.ts";
 import { DEFAULT_IDS } from "../workflows/db/schema.ts";
 import { apId } from "../workflows/db/ids.ts";
 import { buildSandboxServiceBackends } from "../workflows/runtime/service-backends.ts";
 import { EngineFlowExecutor } from "../workflows/runner/engine-runtime/engine-flow-executor.ts";
+import { createLimiter } from "../util/concurrency.ts";
+import { runWithOrigin } from "../llm/origin.ts";
+import { getMachineScope } from "../actions/machine-scope.ts";
+import {
+  browserElementNarration, localBrowserWillServe, pebbleIsOnThisHost, snapshotElementId,
+  unplacedLabel, type NarrationRouting, type PebbleNarration,
+} from "./pebble-narration.ts";
+import { remoteBrowserNarration } from "../actions/browser/remote-element-point.ts";
+import {
+  logSafeLabel, MAX_POINT_COORD, PEBBLE_SCREEN_SPACE, pointingGuidance, pointTagRegex,
+} from "./pebble-point-prompt.ts";
+import { osFamily } from "../util/execution-environment.ts";
+import { isLocalBrowserDisabled, isNoLocalTools } from "../actions/tools/local-tools-guard.ts";
+
+/** Sentences synthesized at once for one sidecar's Pebble speech (see runResponseCycle). */
+const PEBBLE_TTS_CONCURRENCY = 4;
+
+/**
+ * One synthesis limiter per sidecar, shared by every response cycle on it. A
+ * barge-in cancels a cycle whose in-flight syntheses cannot be stopped, and a
+ * limiter per cycle would let the next cycle start four more beside them.
+ */
+const pebbleSynthLimiters = new Map<string, ReturnType<typeof createLimiter>>();
+function pebbleSynthLimiter(sidecarId: string): ReturnType<typeof createLimiter> {
+  let limiter = pebbleSynthLimiters.get(sidecarId);
+  if (!limiter) {
+    limiter = createLimiter(PEBBLE_TTS_CONCURRENCY);
+    pebbleSynthLimiters.set(sidecarId, limiter);
+  }
+  return limiter;
+}
 
 // Constants
 const DEFAULT_PORT = 3142;  // JARVIS port
@@ -76,6 +141,7 @@ export interface DaemonConfig {
 }
 
 let shutdownInProgress = false;
+let suggestionComposer: SuggestionComposer | null = null;
 let registry: ServiceRegistry | null = null;
 let healthMonitor: HealthMonitor | null = null;
 let commitmentExecutor: CommitmentExecutor | null = null;
@@ -86,6 +152,11 @@ let workflowWorker: WorkflowWorker | null = null;
 let triggerManager: TriggerManager | null = null;
 let workflowEngineShutdown: (() => Promise<void>) | null = null;
 let systemCron: import('./system-cron.ts').SystemCronService | null = null;
+let usageAlerts: import('./usage-alerts-service.ts').UsageAlertsService | null = null;
+let timerScheduler: TimerWaitpointScheduler | null = null;
+let settingsReload: import('./settings-reload.ts').SettingsReloadCoordinator | null = null;
+/** Graceful-drain deadline (ms), set from config at boot. Default 75s. */
+let drainDeadlineMs = 75_000;
 
 /**
  * Parse command line arguments
@@ -125,8 +196,9 @@ Options:
   --db-path <path>         Database file path (default: ~/.jarvis/jarvis.db)
   --data-dir <path>        Data directory (default: ~/.jarvis)
   --health-interval <ms>   Health check interval in ms (default: 30000)
-  --no-local-tools         Disable local tool execution (run_command, read_file, etc).
-                           Tools will only work when routed to a sidecar via target param.
+  --no-local-tools         Keep the general tools (run_command, read_file, desktop, browser...) off
+                           this host: they only run on a connected sidecar, i.e. your machine.
+                           The site builder still builds and runs projects on this host.
   --help, -h               Show this help message
 
 Example:
@@ -158,22 +230,130 @@ function logWithTimestamp(message: string): void {
 }
 
 /**
+ * Exit status per fatal reason, following the workflow engine's shape
+ * (src/workflows/activepieces/packages/server/engine/src/main.ts, which exits 3
+ * and 4 for the same two reasons).
+ *
+ * The status is the ONLY thing a supervisor sees: the generated systemd unit
+ * uses `Restart=on-failure` (src/cli/autostart.ts), and a crash that exits 0
+ * left Jarvis down until someone restarted it by hand (#543). Anything not
+ * listed here shuts down with 0 on purpose -- a signal, a drain, `jarvis stop`.
+ */
+const FATAL_EXIT_CODES: Partial<Record<ShutdownReason, number>> = {
+  uncaughtException: 3,
+  unhandledRejection: 4,
+};
+
+/**
+ * Why the daemon is shutting down. A closed set, so a reason that is meant to
+ * be fatal cannot become a silent clean exit through a typo -- the #543 bug.
+ */
+type ShutdownReason = 'SIGINT' | 'SIGTERM' | 'uncaughtException' | 'unhandledRejection';
+
+/**
+ * Teardown budget on a fatal path, instead of the configured `drainDeadlineMs`
+ * (75s by default). The process is already in an undefined state, so there is
+ * nothing to be gained by holding it there: give the durable parts a bounded
+ * chance to finish and let the supervisor start a healthy daemon. Best effort,
+ * not a guarantee -- the teardown awaits service stops that nothing bounds, and
+ * armFatalExit is what makes sure the process leaves either way.
+ */
+const FATAL_DRAIN_DEADLINE_MS = 10_000;
+
+/**
+ * Grace on top of that budget before a fatal shutdown is forced. The drain
+ * awaits several service `stop()`s that are not individually bounded, so a
+ * handler that hangs there would leave the process alive-but-broken and
+ * `Restart=on-failure` would never fire.
+ */
+const FATAL_FLUSH_GRACE_MS = 10_000;
+
+/**
+ * Make every exit from here on a failure, and guarantee one happens.
+ *
+ * `process.exitCode` covers an exit we do not reach on purpose (the loop
+ * emptying, a later `process.exit()` with no argument). The timer covers the
+ * drain hanging or throwing on its way out; it is deliberately NOT unref'd, so
+ * an empty loop cannot exit 0 out from under it.
+ */
+function armFatalExit(code: number, budgetMs: number): void {
+  process.exitCode = code;
+  setTimeout(() => {
+    console.error(`[Daemon] shutdown did not finish within ${budgetMs}ms; exiting ${code}`);
+    process.exit(code);
+  }, budgetMs);
+}
+
+/**
  * Handle graceful shutdown
  */
-async function handleShutdown(signal: string): Promise<void> {
+async function handleShutdown(signal: ShutdownReason): Promise<void> {
+  // undefined for every deliberate shutdown, which must keep exiting 0:
+  // something depends on `jarvis stop` succeeding.
+  const fatalCode = FATAL_EXIT_CODES[signal];
+
   if (shutdownInProgress) {
-    console.log('\n[Daemon] Force shutdown requested, exiting immediately');
-    process.exit(1);
+    // A repeated SIGNAL means the operator/user wants to force-quit now. Status
+    // 0, because this is still a shutdown they asked for: `jarvis drain` takes
+    // up to 85s, a `jarvis stop` during it sends the second SIGTERM, and under
+    // Restart=on-failure a non-zero status here brought JARVIS back five seconds
+    // after the CLI reported it stopped (#543).
+    if (signal === 'SIGINT' || signal === 'SIGTERM') {
+      console.log('\n[Daemon] Second signal - forcing immediate exit');
+      process.exit(0);
+    }
+    // But an internal error (uncaughtException/unhandledRejection) while we're
+    // already draining -- e.g. a stray rejection from a still-streaming turn --
+    // must NOT abort the drain (that would skip teardown + lose window state).
+    // Nor does it change the status: a crash on the way out of a shutdown we
+    // asked for is still a shutdown we asked for.
+    console.warn(`[Daemon] ${signal} during drain (ignored; drain continues)`);
+    return;
   }
 
   shutdownInProgress = true;
-  console.log(`\n[Daemon] Received ${signal}, shutting down gracefully...`);
+  const budgetMs = fatalCode === undefined ? drainDeadlineMs : Math.min(drainDeadlineMs, FATAL_DRAIN_DEADLINE_MS);
+  // Before anything that can throw or hang, including the stop() below.
+  if (fatalCode !== undefined) {
+    armFatalExit(fatalCode, budgetMs + FATAL_FLUSH_GRACE_MS);
+    // The cheap write, up front: on a fatal path the teardown that normally
+    // reaches it sits behind service stops that nothing bounds, so the last
+    // ~400ms of debounced per-room window bounds would be the first thing lost.
+    // A no-op when nothing touched window state, it swallows its own I/O errors
+    // (window-state.ts), and phase 3 still calls it on the way out.
+    flushWindowState();
+  }
+  suggestionComposer?.stop();
+  suggestionComposer = null;
+  console.log(`\n[Daemon] Received ${signal}, draining gracefully (deadline ${budgetMs}ms)...`);
 
   try {
+    // One wall-clock budget for the whole drain (turns + workflow), kept under
+    // the supervisor's SIGKILL grace.
+    const drainUntil = Date.now() + budgetMs;
+
+    // ---- Phase 1: QUIESCE -- stop accepting NEW work; keep in-flight alive ----
+    // New agent turns are refused (agent-service throws DrainingError); stop the
+    // timer/event SOURCES that would spawn turns or workflow jobs. The agent, WS,
+    // sidecar, and workflow worker stay UP so in-flight work can finish + stream.
+    activeTurns.quiesce();
+
+    // Stop the TIMER scheduler so it doesn't enqueue new resume jobs mid-drain.
+    if (timerScheduler) {
+      timerScheduler.stop();
+      timerScheduler = null;
+    }
+
     // Stop system cron (publishes cron.* events on the shared bus)
     if (systemCron) {
       systemCron.stop();
       systemCron = null;
+    }
+
+    // Stop the hosted usage threshold check
+    if (usageAlerts) {
+      usageAlerts.stop();
+      usageAlerts = null;
     }
 
     // Stop commitment executor
@@ -200,26 +380,71 @@ async function handleShutdown(signal: string): Promise<void> {
       bgAgent = null;
     }
 
-    // Stop health monitor
-    if (healthMonitor) {
-      healthMonitor.stop();
-    }
-
-    // Stop all services (reverse order: websocket -> observers -> agent)
-    if (registry) {
-      await registry.stopAll();
-    }
-
-    // Stop the trigger manager first so no new RUN_FLOW jobs get enqueued
-    // while the worker drains.
+    // Stop the trigger manager so no NEW RUN_FLOW jobs get enqueued while we
+    // drain (in-flight runs already claimed keep going).
     if (triggerManager) {
       await triggerManager.stop();
       triggerManager = null;
     }
 
-    // Stop the workflow worker (drains in-flight jobs, then exits the poll loop)
+    // Begin stopping the workflow worker NOW, unawaited: stop() flips
+    // `running=false` synchronously so it won't claim a FRESH job during the
+    // drain window (which would then get only a sliver of budget and orphan),
+    // while its already-in-flight run keeps going. Awaited, bounded, in phase 3.
+    const workerStopping = workflowWorker ? workflowWorker.stop() : null;
+
+    // ---- Phase 2: DRAIN -- await in-flight agent turns up to the deadline ----
+    // Per UPDATES.md a turn is NOT checkpointed mid-flight: if it overruns we
+    // abandon it (the process exits, the user re-asks). Workflow runs ARE
+    // durable (per-step checkpoint + resume), so they're handled in teardown.
+    //
+    // Which is why a fatal shutdown does not wait here at all: the turn would be
+    // abandoned either way, and everything it waited would come off the workflow
+    // worker's share of the budget in phase 3, where the wait CAN save a run.
+    const turnBudget = fatalCode === undefined ? Math.max(0, drainUntil - Date.now()) : 0;
+    const active = activeTurns.active;
+    if (active > 0 && turnBudget > 0) console.log(`[Drain] waiting for ${active} in-flight turn(s)...`);
+    const { drained, remaining } = await activeTurns.drain(turnBudget);
+    if (drained) {
+      if (active > 0) console.log('[Drain] all in-flight turns completed');
+    } else if (turnBudget > 0) {
+      console.log(`[Drain] deadline reached; abandoning ${remaining} in-flight turn(s) (user re-asks)`);
+    } else {
+      console.log(`[Drain] ${signal}: abandoning ${remaining} in-flight turn(s) at once (a turn cannot be resumed anyway)`);
+    }
+
+    // ---- Phase 3: TEARDOWN ----
+    // Stop health monitor
+    if (healthMonitor) {
+      healthMonitor.stop();
+    }
+
+    // Stop all services (reverse order: websocket -> observers -> agent).
+    // On a deliberate shutdown the turns above are drained first, so this drops
+    // nothing live. On a fatal one they are deliberately NOT waited for, and
+    // this still tears down under a running turn: AgentService.stop terminates
+    // the primary agent anyway, so the turn ends here either way -- waiting for
+    // it would only have spent the budget that phase 3 can still use.
+    if (registry) {
+      await registry.stopAll();
+    }
+
+    // Stop the workflow worker (drains its in-flight run, then exits the poll
+    // loop) -- but bounded by the remaining budget. If a long run overruns, we
+    // leave it RUNNING; the next boot's recoverOrphanedJobs retires it with
+    // reconciliation guidance, since its effects cannot safely be replayed.
     if (workflowWorker) {
-      await workflowWorker.stop();
+      const wfBudget = Math.max(2000, drainUntil - Date.now());
+      const stopped = await Promise.race([
+        (workerStopping ?? Promise.resolve()).then(() => true),
+        new Promise<boolean>((r) => {
+          const t = setTimeout(() => r(false), wfBudget);
+          t.unref?.();
+        }),
+      ]);
+      if (!stopped) {
+        console.log('[Drain] workflow worker over deadline; in-flight run left RUNNING for boot-recovery');
+      }
       workflowWorker = null;
     }
 
@@ -243,10 +468,14 @@ async function handleShutdown(signal: string): Promise<void> {
     console.log('[Daemon] Database closed');
 
     console.log('[Daemon] Shutdown complete');
-    process.exit(0);
+    process.exit(fatalCode ?? 0);
   } catch (error) {
+    // Logged, but not a failure status on a deliberate shutdown: the daemon is
+    // going down because it was asked to, and a non-zero status here would have
+    // Restart=on-failure start it again right after `jarvis stop` reported
+    // success (#543). A crash still carries its own code out.
     console.error('[Daemon] Error during shutdown:', error);
-    process.exit(1);
+    process.exit(fatalCode ?? 0);
   }
 }
 
@@ -281,13 +510,89 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     jarvisConfig = await loadConfig();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`\n[Daemon] Failed to parse config file: ${message}`);
-    console.error('[Daemon] Fix the YAML syntax in ~/.jarvis/config.yaml or delete it to use defaults.\n');
+    // "Failed to load", not "Failed to parse": loadConfig also rejects a value
+    // it CAN parse but cannot honour, such as a daemon.port that is not a port
+    // (#550), and "fix the YAML syntax or delete it" is bad advice for a working
+    // config with one bad key. The message already says which one.
+    console.error(`\n[Daemon] Failed to load config file: ${message}`);
+    console.error('[Daemon] Fix the reported value in ~/.jarvis/config.yaml, or delete the file to use defaults.\n');
     process.exit(1);
+  }
+
+  // Resolve the bench debug gate once, before any service starts: it refuses a
+  // hosted install and deletes JARVIS_DEBUG_RPC from process.env so explicit
+  // `{ ...process.env }` spawns stop copying it (defense in depth only, see
+  // debug-rpc-gate.ts). The outcome is logged next to the sidecar manager (6c).
+  const debugRpcState = initDebugRpcGate({ hosted: isHostedInstall(jarvisConfig) });
+
+  // File sink, installed here - the first thing after the config is readable
+  // and before anything else boots - so the log captures startup too. A hosted
+  // brain is a plain systemd process with no `StandardOutput=`, so without this
+  // there is no per-instance file for the control plane to read (docs/LOGS.md).
+  // Unset log_file_path = no file, which is the self-host default.
+  const logFilePath = jarvisConfig.daemon.log_file_path?.trim();
+  if (logFilePath) {
+    // Skip the sink when the launcher ALREADY has our stdout/stderr open on
+    // that exact file - `jarvis start -d`, `jarvis update`'s restart, the
+    // launchd plist's StandardOutPath, a StandardOutput=append: someone put in
+    // their own unit. Those hand us a descriptor bound to an inode, and the
+    // sink's first compaction renames a new file over the path, leaving fds
+    // 1/2 writing into an unlinked inode that grows without bound and that
+    // `ls` cannot show (measured: 4 KB visible, 226 KB orphaned, nlink=0).
+    // fstat on dev+ino rather than a string compare in each launcher, so this
+    // covers launchers we have not written yet and is immune to symlinks,
+    // bind mounts and $JARVIS_HOME spellings of the same file.
+    if (logFileIsProcessStdio(logFilePath)) {
+      console.log(`[Daemon] Log file: ${logFilePath} (written directly by the launcher; in-process sink not needed)`);
+    } else {
+      installLogFileSink({ path: logFilePath, maxBytes: jarvisConfig.daemon.log_file_max_bytes });
+      // Logged AFTER the install so the file's own first line says where it is.
+      console.log(`[Daemon] Log file: ${logFilePath}`);
+    }
+  }
+
+  // Close this daemon's own /proc entries to every other process running as
+  // this user (#546): its environment, its open files, its memory, ptrace
+  // attach and core dumps. Linux only, a no-op elsewhere, and never fatal --
+  // see process-hardening.ts for what survives and why engine reaping does.
+  //
+  // HERE in the order, and not earlier, because it needs the config to know
+  // whether the operator turned it off, and not later because everything after
+  // this point boots services, opens the database and spawns subprocesses.
+  // Nothing between loadConfig() and this line reads /proc/self/environ,
+  // /proc/self/io or /proc/self/fd: the config is YAML, the debug-RPC gate and
+  // the model-exec marker read `process.env` in memory, and the log sink's
+  // "are we already writing to this file" test is fstat on fds 1 and 2. After
+  // the sink, so the outcome lands in the configured log file too.
+  hardenProcessInspection({ allowInspection: jarvisConfig.daemon.allow_process_inspection });
+
+  // Started from a command the assistant ran (#514): its env was stripped of
+  // the daemon's secrets. After the file sink, so the configured log has it.
+  const modelExecWarning = modelExecDaemonWarning();
+  if (modelExecWarning) console.warn(`[Daemon] ${modelExecWarning}`);
+
+  // Drain budget: default 75s; a non-positive value falls back; cap at 85s so a
+  // misconfig can't push the drain past the supervisor's kill grace (systemd
+  // TimeoutStopSec=90) and get SIGKILLed mid-drain.
+  const configuredDrain = jarvisConfig.daemon.drain_deadline_ms;
+  drainDeadlineMs = configuredDrain && configuredDrain > 0 ? configuredDrain : 75_000;
+  if (drainDeadlineMs > 85_000) {
+    console.warn(`[Daemon] drain_deadline_ms=${drainDeadlineMs} exceeds the safe ceiling; capping at 85000`);
+    drainDeadlineMs = 85_000;
   }
 
   // Determine data directory: CLI args > config file > default
   const dataDir = userConfig?.dataDir ?? jarvisConfig.daemon.data_dir ?? DEFAULT_DATA_DIR;
+  // browser_upload_file never sends files from here, wherever it is (#521), and
+  // sends them only from the allowed roots (#527).
+  {
+    const uploadPolicy = await import('../actions/browser/upload-policy.ts');
+    uploadPolicy.registerJarvisDataDir(dataDir);
+    uploadPolicy.registerUploadRoots(jarvisConfig.browser?.upload_roots);
+    // The refusal message tells the assistant to put files here, so it has to
+    // exist. 0700: what is queued for upload is nobody else's business.
+    uploadPolicy.ensureUploadStagingDir();
+  }
 
   // If user specified a custom data dir but no db path, use jarvis.db in that dir
   const dbPath = userConfig?.dbPath ?? jarvisConfig.daemon.db_path ?? path.join(dataDir, 'jarvis.db');
@@ -348,6 +653,19 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       try { return getDb(); } catch { return null; }
     });
 
+    // 2.0b. Relocate a workflow encryption key still sitting in `cache/` into
+    // the data-dir root, BEFORE the workflow schema check below and before any
+    // credential is read. `cache/` is documented as disposable and is excluded
+    // from `jarvis export`, so a key left there is absent from every backup of
+    // the database it protects. Resolution still reads the old path, so this
+    // having failed is never fatal: worst case the key stays where it is.
+    const { migrateWorkflowEncryptionKeyToDataDir } = await import('../workflows/db/encryption.ts');
+    try {
+      migrateWorkflowEncryptionKeyToDataDir();
+    } catch (err) {
+      console.error('[Daemon] Workflow encryption key relocation failed; continuing with the existing path:', err);
+    }
+
     // 2.1. Add workflow tables (flow / flow_run / flow_version /
     // app_connection / waitpoint / store_entry / workflow_file /
     // workflow_job / trigger_event) to the shared Jarvis DB. Idempotent.
@@ -355,9 +673,43 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     ensureWorkflowSchema();
     logWithTimestamp('Workflow schema ready');
 
+    // 2.1a. Opt-in strict credential encryption. Off unless the operator sets
+    // JARVIS_REQUIRE_ENCRYPTED_CREDENTIALS=1, because every release from
+    // v0.6.0 to v0.13.7 wrote plaintext `app_connection.value` rows and
+    // refusing those before a deployment has converted would lock it out of
+    // credentials it still needs. The gate refuses if unconverted rows
+    // remain, and that refusal reaches the startup catch below, so the daemon
+    // does not come up on a false assertion. See the helper for why.
+    const { applyStrictCredentialEncryptionSetting } = await import('../workflows/db/credential-migration.ts');
+    const { getWorkflowDb } = await import('../workflows/db/index.ts');
+    if (applyStrictCredentialEncryptionSetting(getWorkflowDb())) {
+      logWithTimestamp('Strict credential encryption enabled (plaintext credentials refused)');
+    }
+
     // 2a. Seed webapp templates (upserts, safe to run every startup)
     const { seedWebappTemplates } = await import('../vault/webapp-template-seeds.ts');
     seedWebappTemplates();
+
+    // 2a-bis. Relocate a pre-JARVIS_HOME keychain into the data dir before
+    // anything reads a credential, so hydration below sees the moved store and
+    // a data-dir backup finally includes it. No-op on a normal ~/.jarvis
+    // install, and it never removes the legacy pair unless the copy verified.
+    const { migrateKeychainToDataDir } = await import('../vault/keychain.ts');
+    try {
+      migrateKeychainToDataDir();
+    } catch (err) {
+      console.error('[Daemon] Keychain relocation failed; continuing with the existing store:', err);
+    }
+
+    // 2a-ter. Seed the starter skills (structural replacement for templates).
+    // Only fills absent skills, so recorded skills are preserved. Signing
+    // needs the keychain, which is why this runs after the relocation above.
+    try {
+      const { seedSkills } = await import('../skills/seeds.ts');
+      seedSkills();
+    } catch (err) {
+      console.error('[Daemon] Seeding starter skills failed; continuing without them:', err);
+    }
 
     // 2b. Load all LLM settings (providers, credentials, single-LLM default,
     // tiers) from the DB + encrypted keychain. This is the sole source of LLM
@@ -397,6 +749,26 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     // 3. Create service registry
     registry = new ServiceRegistry();
 
+    // 3a. Settings hot reload: constructed right after DB hydration so every
+    // later block can register per-section appliers as its targets come into
+    // scope (pebble providers, channels, observers, ...). The choke-point
+    // listener makes EVERY saveUserSection/saveGoogleSettings — HTTP route,
+    // voice intent, pebble toggle — schedule the section's appliers.
+    const { SettingsReloadCoordinator } = await import('./settings-reload.ts');
+    const { setSectionSavedListener } = await import('./user-settings.ts');
+    const { reloadUsejarvisAiBlock, reloadUsejarvisBillingBlock } = await import('../config/loader.ts');
+    settingsReload = new SettingsReloadCoordinator(jarvisConfig, {
+      // File-authoritative SYSTEM sections are re-read on every reloadAll so
+      // a provisioner rotation of the usejarvis_ai key (or un-hosting) takes
+      // effect on SIGHUP / POST /api/config/reload without a restart. Same
+      // for the billing read's block.
+      reloadSystemSections: async (cfg) => {
+        await reloadUsejarvisAiBlock(cfg);
+        await reloadUsejarvisBillingBlock(cfg);
+      },
+    });
+    setSectionSavedListener((section) => settingsReload?.sectionChanged(section));
+
     // 3b. Anonymous usage telemetry (opt-out). Constructed here so it can be
     //     registered before the LLM-dependent services and counts installs
     //     even while the daemon is still in onboarding/setup mode.
@@ -413,8 +785,18 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
 
     // 4b. Create GoogleAuth if configured
     let googleAuth: GoogleAuth | null = null;
-    if (jarvisConfig.google?.client_id && jarvisConfig.google?.client_secret) {
-      googleAuth = new GoogleAuth(jarvisConfig.google.client_id, jarvisConfig.google.client_secret);
+    // Managed instances have NO client credentials — the control plane holds
+    // them — so this cannot key on their presence or hosted Google would never
+    // start.
+    googleAuth = makeGoogleAuth(jarvisConfig);
+    // A config we REFUSED (a mis-rendered managed block) is logged HERE, once,
+    // rather than by the classifier: that runs on every status poll too, and
+    // logging inside it printed the same line twice per poll forever.
+    const googleShape = classifyGoogle(jarvisConfig);
+    if (googleShape.mode === 'none' && googleShape.reason) {
+      console.error(`[Daemon] Google is disabled: ${googleShape.reason}`);
+    }
+    if (googleAuth) {
       if (googleAuth.isAuthenticated()) {
         console.log('[Daemon] Google OAuth: authenticated (Gmail + Calendar observers enabled)');
       } else {
@@ -433,6 +815,13 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     const observerService = config.noLocalTools
       ? null
       : new ObserverService(reactor, coalescer, googleAuth ?? undefined, config.dataDir);
+    // Hosted push bridge targets (GOOGLE.md). All absent on self-hosted, where
+    // the observers' own poll timers are the whole story.
+    observerService?.setPushTargets({
+      pubsubTopic: jarvisConfig.google?.pubsub_topic,
+      pushCallback: jarvisConfig.google?.push_callback,
+      channelToken: jarvisConfig.google?.channel_token,
+    });
     // Hosted mode: daemon.listen = unix:/run/jarvis/u_<id>.sock binds a unix
     // socket and no TCP port at all (Caddy is the only way in). `listen` was
     // resolved (and validated) once, before the lockfile write above.
@@ -486,16 +875,28 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
 
     // 6c. Create sidecar manager
     const sidecarManager = new SidecarManager(jarvisConfig.daemon.data_dir.replace('~', os.homedir()));
-    // Brain URL precedence: env > config.yaml > default fallback. The loader
-    // already collapses env into config.daemon.brain_domain, so we re-check
-    // the env var here only to attribute the source in the startup log —
-    // the operator needs to see which knob is active when debugging.
-    const brainSource: 'env' | 'config' | 'default' = process.env.JARVIS_BRAIN_DOMAIN
-      ? 'env'
-      : jarvisConfig.daemon.brain_domain
-        ? 'config'
+
+    // The bench harness backdoor must never be on quietly. Say so at startup,
+    // every time, and say why a set secret did not enable it.
+    if (debugRpcState === 'open') {
+      console.warn('[Daemon] JARVIS_DEBUG_RPC is set: /api/debug/rpc is OPEN (secret-gated). Whoever holds the secret can call any RPC on every connected sidecar (shell commands, file read/write, clipboard, browser JavaScript, desktop input) with no approval step or audit trail. This exists for the control-plane acceptance harness only; unset it for normal use.');
+    } else if (debugRpcState === 'too-short') {
+      console.warn(`[Daemon] JARVIS_DEBUG_RPC is set but shorter than ${MIN_SECRET_LENGTH} characters; /api/debug/rpc stays disabled.`);
+    } else if (debugRpcState === 'refused-hosted') {
+      console.warn('[Daemon] JARVIS_DEBUG_RPC is ignored because this install counts as hosted (a usejarvis_ai block is configured, or daemon.listen is a unix: socket); /api/debug/rpc stays disabled.');
+    }
+    // Public-origin precedence: env > public_url > legacy brain_domain >
+    // local fallback. Re-check env only to attribute the startup log source.
+    const externalOrigin = resolveExternalOrigin(jarvisConfig);
+    for (const warning of externalOrigin.warnings) {
+      console.warn(`[ExternalOrigin] ${warning}`);
+    }
+    const brainSource: 'env' | 'config' | 'public_url' | 'default' = externalOrigin.source === 'public_url'
+      ? (process.env.JARVIS_PUBLIC_URL ? 'env' : 'public_url')
+      : externalOrigin.source === 'brain_domain'
+        ? (process.env.JARVIS_BRAIN_DOMAIN ? 'env' : 'config')
         : 'default';
-    const brainDomain = jarvisConfig.daemon.brain_domain ?? `localhost:${config.port}`;
+    const brainDomain = externalOrigin.httpOrigin;
     sidecarManager.setBrainUrl(brainDomain, brainSource);
 
     // Panel webviews must render the same brain origin the JWT pins: the sidecar
@@ -515,7 +916,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     //
     // The daemon (brain) is the source of truth for pebble state. The
     // sidecar emits a `pebble.summon` event when the user presses the
-    // summon hotkey (Ctrl+Space); the daemon receives it and drives the
+    // summon hotkey (pebble.summon_hotkey); the daemon receives it and drives the
     // state machine via `pebble.set_state` RPC. For now this runs a fixed
     // demo cycle (listening → thinking → speaking → idle) so we can
     // verify all the state renderers end-to-end. Real voice/LLM
@@ -530,7 +931,11 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // Per-sidecar in-flight summon control. Tracks whether a summon is
       // active and lets us cancel mid-flight when the user dismisses with
       // a second hotkey press.
-      const pendingSummons = new Map<string, { cancelled: boolean }>();
+      // `sessionId` is set only for hotkey summons (the sidecar mints it and
+      // stamps it on both `pebble.summon` and any later `pebble.mic_blocked`),
+      // so a mic refusal can unwind exactly the slot it belongs to and never a
+      // turn that happens to be in flight.
+      const pendingSummons = new Map<string, { cancelled: boolean; sessionId?: string }>();
 
       // Fallback timers for the bare-"Jarvis" listening state. If the sidecar's
       // session capture never produces an `audio.session_end` (dropped event,
@@ -558,15 +963,248 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // text wins over the per-state placeholder ("speaking…", "listening —
       // go ahead.") so we can surface the live LLM response instead of the
       // generic copy. Empty/undefined text falls back to the placeholder.
+      // Last state mirrored to each sidecar's tray menu, so we only push
+      // `tray.status` when the state actually changes (state churns fast during
+      // a turn; the tray only reads it on menu-open, so a per-change push would
+      // be pure waste otherwise).
+      const lastTrayState = new Map<string, string>();
       const setState = async (sidecarId: string, state: string, text?: string) => {
         try {
           const params: { state: string; text?: string } = { state };
           if (text !== undefined) params.text = text;
           await sidecarManager.dispatchRPC(sidecarId, 'pebble.set_state', params);
+          // Mirror the state to the tray menu header (best-effort, deduped).
+          if (lastTrayState.get(sidecarId) !== state) {
+            lastTrayState.set(sidecarId, state);
+            void sidecarManager.dispatchRPC(sidecarId, 'tray.status', { state }).catch(() => {});
+          }
         } catch (err) {
           console.warn(`[ambient-ui] pebble.set_state(${state}) on ${sidecarId} failed:`, err);
         }
       };
+
+      // Realtime nav-tool execution for the pebble: open a native room panel (or
+      // window-manage it) on the pebble's machine, mirroring the one-shot intent
+      // path. (ROOMS/dashboardURL/boundsForRoom/trackPanel/findPanel are defined
+      // further down in this same scope; this closure runs at tool-call time, by
+      // when they're initialised.) Returns a confirmation, or null if `name`
+      // isn't a nav tool so the caller falls through to the agent tool bridge.
+      const executePebbleNavTool = async (
+        sidecarId: string,
+        name: string,
+        args: Record<string, unknown>,
+      ): Promise<string | null> => {
+        if (!REALTIME_NAV_TOOL_NAMES.has(name)) return null;
+        const openRoom = async (key: string): Promise<string> => {
+          const meta = ROOMS[key];
+          if (!meta) return `I don't have a "${key}" screen.`;
+          try {
+            const result = await sidecarManager.dispatchRPC(sidecarId, 'panel.spawn', {
+              url: dashboardURL(key),
+              title: meta.title,
+              bounds: boundsForRoom(key, meta.w, meta.h),
+              resizable: true,
+              always_on_top: meta.alwaysOnTop ?? false,
+              multi_instance: false,
+            });
+            const id = (result && typeof result === 'object' && 'id' in (result as object))
+              ? String((result as { id?: unknown }).id ?? '') : '';
+            if (id) trackPanel(sidecarId, { id, key, title: meta.title });
+            return `Opened ${meta.title}.`;
+          } catch (err) {
+            console.warn(`[pebble-realtime] open room "${key}" failed:`, err);
+            return `I couldn't open ${meta.title}.`;
+          }
+        };
+        switch (name) {
+          case 'open_dashboard_room':
+            return openRoom(String(args.room ?? ''));
+          case 'dashboard_room_action':
+            // In-room actions target the dashboard SPA, which a native panel
+            // doesn't receive — opening the room is the useful part here.
+            return openRoom(String(args.room ?? ''));
+          case 'control_dashboard_window': {
+            const action = String(args.action ?? '');
+            const target = findPanel(sidecarId, args.target ? String(args.target) : undefined);
+            if (!target) return "There's no window open to do that with.";
+            const stateMap: Record<string, string> = {
+              maximize: 'maximized', maximized: 'maximized',
+              minimize: 'minimized', minimized: 'minimized',
+              restore: 'normal', normal: 'normal',
+            };
+            try {
+              if (action === 'close') {
+                await sidecarManager.dispatchRPC(sidecarId, 'panel.close', { id: target.id });
+                untrackPanel(sidecarId, target.id);
+                return `Closed ${target.title}.`;
+              }
+              if (action === 'focus') {
+                await sidecarManager.dispatchRPC(sidecarId, 'panel.focus', { id: target.id });
+                return 'Here it is.';
+              }
+              if (stateMap[action]) {
+                await sidecarManager.dispatchRPC(sidecarId, 'panel.set_window_state', { id: target.id, state: stateMap[action] });
+                return `Done.`;
+              }
+              return "I'm not sure how to do that with the window.";
+            } catch {
+              return "I couldn't do that with the window.";
+            }
+          }
+          case 'go_back_to_thread':
+            return 'Okay.'; // the pebble has no dashboard thread to return to
+          default:
+            return null;
+        }
+      };
+
+      // ─────────────────── Native pebble realtime voice ───────────────────
+      // The summon hotkey toggles a perpetual realtime (gpt-realtime) session
+      // when realtime is enabled. The sidecar is the audio device: it streams
+      // mic PCM up (`pebble.audio_frame`) and plays streamed PCM down
+      // (`pebble.play_pcm`); the daemon runs the realtime session itself. See
+      // PebbleRealtimeManager + PebbleAudioTransport — all the OpenAI protocol
+      // logic is reused from the dashboard realtime path.
+      const pebbleRealtime = new PebbleRealtimeManager({
+        dispatchRPC: (sidecarId, method, params) => sidecarManager.dispatchRPC(sidecarId, method, params ?? {}),
+        dispatchNotify: (sidecarId, method, params) => sidecarManager.dispatchNotify(sidecarId, method, params ?? {}),
+        getAudioChannel: (sidecarId) => sidecarManager.getAudioChannel(sidecarId),
+        resolve: () => {
+          const cfg = agentService.getConfig();
+          return resolveRealtimeVoice(cfg, realtimeEnablement(cfg));
+        },
+        // Agent tools + the nav tools (open_dashboard_room, …) so realtime voice
+        // can drive the desktop UI just like the one-shot path ("open settings").
+        tools: () => [...agentService.getOrchestrator().getRealtimeTools(), ...REALTIME_NAV_TOOLS],
+        instructions: () => agentService.buildRealtimeVoiceInstructions(),
+        executeToolCall: async (sidecarId, name, args, blockedCategories) => {
+          // Nav tools open a native panel on the pebble's machine (the realtime
+          // model otherwise had no way to honor "open workflows / settings").
+          const nav = await executePebbleNavTool(sidecarId, name, args);
+          if (nav !== null) return nav;
+          return agentService.getOrchestrator().executeRealtimeToolCall(name, args, { blockedCategories });
+        },
+        // Voice has no turn objects: the user starting to speak is the taint
+        // gating boundary, and on this surface nothing else clears it. Without
+        // it one `capture_screen` (or any page read) left every later
+        // machine-changing action refused as taint-gated for the rest of the
+        // daemon's life, at any authority level.
+        onUserTurnStart: () => { agentService.getOrchestrator().resetRealtimeTaint(); },
+        onState: (sidecarId, state, text) => { void setState(sidecarId, state, text); },
+        onStatus: (sidecarId, status, detail) => {
+          console.log(`[pebble-realtime] ${sidecarId} ${status}${detail ? `: ${detail}` : ''}`);
+          // Echo lifecycle to the sidecar so it can stop capture / show the
+          // reason when the daemon closes or errors the session.
+          void sidecarManager.dispatchRPC(sidecarId, 'pebble.realtime_status', { state: status, detail: detail ?? '' })
+            .catch(() => {/* sidecar may lack the handler / be gone */});
+        },
+        // Plan-gate refusal → re-push configure_realtime with the now-cached
+        // definitive verdict so the summon key downgrades to one-shot capture.
+        // (advertiseRealtime is defined just below; only ever called at runtime.)
+        readvertise: (sidecarId) => {
+          void advertiseRealtime(sidecarId).catch((err) =>
+            console.warn('[pebble-realtime] post-refusal re-advertisement failed:', err),
+          );
+        },
+        // The session never became usable. Re-advertising would not help here:
+        // the advertisement is computed from the plan gate, and the plan gate is
+        // exactly what said yes. Switch this sidecar off realtime directly and
+        // let the summon hotkey do a one-shot capture instead. Without it every
+        // press opened a session the server dropped a moment later: the pebble
+        // flashed listening, went back to idle with nothing captured, and the
+        // reason lived only in the daemon log. Scoped to the connection, since
+        // a reconnect and a settings reload both re-advertise -- so a transient
+        // outage heals itself.
+        onUnusableSession: (sidecarId, detail) => {
+          console.warn(
+            `[pebble-realtime] ${sidecarId} got no usable live session (${detail}) - ` +
+            'falling back to one-shot voice capture for this connection',
+          );
+          void sidecarManager.dispatchRPC(sidecarId, 'pebble.configure_realtime', { enabled: false })
+            .catch((err) => console.warn('[pebble-realtime] fallback downgrade failed:', err));
+        },
+      });
+
+      // Tell each pebble-capable sidecar whether realtime is available so its
+      // summon hotkey knows to toggle a live session vs. the one-shot capture.
+      const advertiseRealtime = async (sidecarId: string) => {
+        const cfg = agentService.getConfig();
+        const res = resolveRealtimeVoice(cfg, realtimeEnablement(cfg));
+        // The advertisement must agree with the starters' plan gate, or the
+        // summon hotkey opens sessions the plan refuses at dial.
+        const enabled = res.ok && (await hostedRealtimeIncluded(res.resolved));
+        // Realtime switched off (or excluded) while a live session is open: end
+        // the billed session here rather than trusting the sidecar to report
+        // back, since the RPC below is swallowed on an older or half-dead
+        // sidecar. stop() is idempotent and its closed echo makes the sidecar
+        // stop without re-emitting.
+        if (!enabled) pebbleRealtime.stop(sidecarId);
+        console.log(`[pebble-realtime] configure_realtime → ${sidecarId} enabled=${enabled}${res.ok ? '' : ` (${res.reason})`}`);
+        await sidecarManager.dispatchRPC(sidecarId, 'pebble.configure_realtime', { enabled })
+          .catch((err) => console.warn(`[pebble-realtime] configure_realtime dispatch failed (older sidecar?):`, err));
+      };
+      // Re-advertise after a settings reload: the advertisement is otherwise
+      // computed once at CONNECT, so a sidecar that attached while the plan
+      // excluded realtime keeps its summon hotkey in one-shot mode until it
+      // reconnects — even after an upgrade. reloadAll clears the gate cache,
+      // so this re-asks the catalog rather than repeating a stale verdict.
+      const readvertiseRealtime = async () => {
+        for (const s of sidecarManager.listConnected()) {
+          if (s.capabilities.includes('pebble')) await advertiseRealtime(s.id);
+        }
+      };
+      // Re-pushed on a `voice` save (the realtime toggle) and on every
+      // reloadAll (SIGHUP and POST /api/config/reload); see
+      // wireRealtimeReadvertisement for why the pebble needs both.
+      if (settingsReload) wireRealtimeReadvertisement(settingsReload, readvertiseRealtime);
+      sidecarManager.onSidecarConnected((sidecar) => {
+        if (!sidecar.capabilities.includes('pebble')) return;
+        // The listener is typed `=> void` and the dispatch loop only catches
+        // SYNCHRONOUS throws, so an async body would surface a rejection as
+        // an unhandled one. Keep the contract: fire and swallow here.
+        void advertiseRealtime(sidecar.id).catch((err) =>
+          console.warn('[pebble-realtime] advertisement failed:', err),
+        );
+      });
+
+      // Sidecar → daemon realtime control + mic stream.
+      const pebbleMicFrames = new Map<string, number>(); // sidecarId -> frame count (diagnostic)
+      sidecarManager.onEvent((sidecarId, event) => {
+        if (event.event_type === 'pebble.realtime_start') {
+          console.log(`[pebble-realtime] realtime_start from ${sidecarId} — opening session`);
+          pebbleMicFrames.set(sidecarId, 0);
+          void pebbleRealtime.start(sidecarId);
+        } else if (event.event_type === 'pebble.realtime_stop') {
+          console.log(`[pebble-realtime] realtime_stop from ${sidecarId}`);
+          pebbleRealtime.stop(sidecarId);
+        } else if (event.event_type === 'pebble.audio_frame') {
+          const data = (event.payload as { data?: unknown })?.data;
+          if (typeof data === 'string') {
+            const n = (pebbleMicFrames.get(sidecarId) ?? 0) + 1;
+            pebbleMicFrames.set(sidecarId, n);
+            // Confirm the mic stream is flowing without spamming: first frame, then every ~5s.
+            if (n === 1 || n % 125 === 0) console.log(`[pebble-realtime] mic frames from ${sidecarId}: ${n}`);
+            pebbleRealtime.pushMicChunk(sidecarId, Buffer.from(data, 'base64'));
+          }
+        }
+      });
+      // Mic PCM arriving on the dedicated audio channel (binary, isolated from
+      // the bulk control connection) — the preferred path; the pebble.audio_frame
+      // event above is the fallback when no audio channel is connected.
+      sidecarManager.onAudioFrame((sidecarId, frame) => {
+        const n = (pebbleMicFrames.get(sidecarId) ?? 0) + 1;
+        pebbleMicFrames.set(sidecarId, n);
+        if (n === 1 || n % 125 === 0) console.log(`[pebble-realtime] mic frames (audio channel) from ${sidecarId}: ${n}`);
+        pebbleRealtime.pushMicChunk(sidecarId, frame);
+      });
+      sidecarManager.onSidecarDisconnected((sidecarId) => {
+        pebbleRealtime.stop(sidecarId);
+        // Per-sidecar transient state — drop with the connection so the maps
+        // stay bounded by connected sidecars, not lifetime-distinct ones.
+        clearListenTimer(sidecarId);
+        lastTrayState.delete(sidecarId);
+        pebbleMicFrames.delete(sidecarId);
+      });
 
       // STT + TTS providers for the pebble's voice loop. Both built from
       // the same jarvisConfig.* the dashboard uses so API keys / provider
@@ -574,28 +1212,60 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // edge-tts / ElevenLabs / Sarvam for TTS) carry over.
       let pebbleSTT: import('../comms/voice.ts').STTProvider | null = null;
       let pebbleTTS: import('../comms/voice.ts').TTSProvider | null = null;
-      if (jarvisConfig.stt) {
-        try {
-          const { createSTTProvider } = await import('../comms/voice.ts');
-          pebbleSTT = createSTTProvider(jarvisConfig.stt);
-          if (pebbleSTT) {
-            console.log(`[ambient-ui] STT provider for pebble: ${jarvisConfig.stt.provider}`);
-          }
-        } catch (err) {
-          console.warn('[ambient-ui] failed to init STT provider:', err);
+      // Guard on the BINDING result, not on config.stt existing (like
+      // channel-service): the hosted default applies even when the section
+      // is absent, and an outer config.stt check would leave pebble STT
+      // dead on a surface where Telegram/Discord transcribe fine.
+      try {
+        const { createSTTProvider } = await import('../comms/voice.ts');
+        const { effectiveSttForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+        const sttBinding = effectiveSttForBinding(jarvisConfig);
+        pebbleSTT = sttBinding
+          ? createSTTProvider(sttBinding, usejarvisVoiceCredentials(jarvisConfig))
+          : null;
+        if (pebbleSTT) {
+          console.log(`[ambient-ui] STT provider for pebble: ${sttBinding!.provider}`);
         }
+      } catch (err) {
+        console.warn('[ambient-ui] failed to init STT provider:', err);
       }
       if (jarvisConfig.tts?.enabled) {
         try {
           const { createTTSProvider } = await import('../comms/voice.ts');
-          pebbleTTS = createTTSProvider(jarvisConfig.tts);
+          const { effectiveTtsForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+          const ttsBinding = effectiveTtsForBinding(jarvisConfig);
+          pebbleTTS = ttsBinding
+            ? createTTSProvider(ttsBinding, usejarvisVoiceCredentials(jarvisConfig))
+            : null;
           if (pebbleTTS) {
-            console.log(`[ambient-ui] TTS provider for pebble: ${jarvisConfig.tts.provider ?? 'edge-tts'}`);
+            console.log(`[ambient-ui] TTS provider for pebble: ${ttsBinding?.provider ?? 'edge-tts'}`);
           }
         } catch (err) {
           console.warn('[ambient-ui] failed to init TTS provider:', err);
         }
       }
+
+      // Settings hot reload: rebuild the pebble's providers whenever the
+      // stt/tts sections change (dashboard save, voice command, reloadAll).
+      // The dashboard-side wsService providers have their own appliers in
+      // the main registration block.
+      settingsReload?.registerApplier('stt', async (cfg) => {
+        const { createSTTProvider } = await import('../comms/voice.ts');
+        const { effectiveSttForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+        const sttBinding = effectiveSttForBinding(cfg);
+        pebbleSTT = sttBinding ? createSTTProvider(sttBinding, usejarvisVoiceCredentials(cfg)) : null;
+        console.log(`[ambient-ui] STT provider ${pebbleSTT ? `set to ${sttBinding?.provider}` : 'cleared'} (settings reload)`);
+      });
+      settingsReload?.registerApplier('tts', async (cfg) => {
+        pebbleTTS = null;
+        if (cfg.tts?.enabled) {
+          const { createTTSProvider } = await import('../comms/voice.ts');
+          const { effectiveTtsForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+          const ttsBinding = effectiveTtsForBinding(cfg);
+          pebbleTTS = ttsBinding ? createTTSProvider(ttsBinding, usejarvisVoiceCredentials(cfg)) : null;
+        }
+        console.log(`[ambient-ui] TTS provider ${pebbleTTS ? 'rebuilt' : 'cleared'} (settings reload)`);
+      });
 
       // ttsMimeType maps the configured TTS provider to a MIME hint the
       // sidecar uses when sniffing audio bytes. (The sidecar primarily
@@ -607,6 +1277,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             return 'audio/wav';
           case 'elevenlabs':
           case 'edge':
+          case 'usejarvis': // proxy /audio/speech is asked for response_format: 'mp3'
           default:
             return 'audio/mp3';
         }
@@ -714,6 +1385,91 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         return Buffer.concat([header, pcm]);
       };
 
+      // The very first sidecar ever to connect to THIS brain gets the dashboard
+      // opened alongside the pebble: a lone pebble on a fresh install reads as
+      // "nothing happened", and on Linux there is no tray to find the dashboard
+      // from. Scoped to the brain (first-run.ts persists the flag in the vault),
+      // so a re-issued enrollment token or a second machine is NOT a first run.
+      // Distinct from the sidecar-local "Open dashboard at startup" preference,
+      // which the sidecar honours itself on every launch.
+      //
+      // Marked shown only when the spawn succeeds; a failed attempt leaves it
+      // for the next connect, up to MAX_DASHBOARD_INTRO_ATTEMPTS.
+      //
+      // Never throws: this is a nicety, and the caller's catch block owns the
+      // pebble's spawn bookkeeping — a failure here must not un-guard that.
+      const openFirstRunDashboard = async (sidecar: ConnectedSidecar): Promise<void> => {
+        // Without the 'windows' capability the sidecar has no panel service at
+        // all, so the spawn could only fail — leave the intro for a capable
+        // sidecar instead of spending an attempt here.
+        if (!sidecar.capabilities.includes('windows')) return;
+        let started = false;
+        let shown = false;
+        // Everything lives inside the try — the intro helpers do synchronous
+        // SQLite I/O and can throw on a sick vault, and the caller's catch owns
+        // the pebble's spawn bookkeeping.
+        try {
+          started = beginDashboardIntro();
+          if (!started) return;
+          let settled: DashboardSpawnSettled;
+          try {
+            // The full dashboard SPA at '#/' — the same window (and the same
+            // panel id) the tray's "Open dashboard" opens, so this can never
+            // produce a duplicate. NOT dashboardURL(), which renders a single
+            // chrome-less room body.
+            const result = await sidecarManager.dispatchRPC(sidecar.id, 'panel.spawn', {
+              id: 'tray:chat',
+              url: `${pebblePanelOrigin}/#/`,
+              title: 'JARVIS',
+              bounds: { x: -1, y: -1, w: 1100, h: 760 },
+              resizable: true,
+              multi_instance: false,
+            });
+            settled = { ok: true, result };
+          } catch (error) {
+            settled = { ok: false, error };
+          }
+          // See dashboardSpawnOutcome for why each outcome counts as it does.
+          const outcome = dashboardSpawnOutcome(settled);
+          shown = outcome !== 'failed';
+          switch (outcome) {
+            case 'opened':
+              console.log(`[ambient-ui] first-run dashboard opened on ${sidecar.id}`);
+              break;
+            case 'already-open':
+              console.log(`[ambient-ui] first-run dashboard already open on ${sidecar.id}`);
+              break;
+            case 'detached':
+              console.log(`[ambient-ui] first-run dashboard spawn still running on ${sidecar.id}; counting it as shown`);
+              break;
+            case 'failed':
+              console.warn(
+                `[ambient-ui] first-run dashboard open failed on ${sidecar.id}; will retry on a later connect:`,
+                settled.ok ? settled.result : settled.error,
+              );
+              break;
+          }
+        } catch (err) {
+          console.warn(`[ambient-ui] first-run dashboard bookkeeping failed on ${sidecar.id}:`, err);
+        } finally {
+          if (started) {
+            try {
+              finishDashboardIntro(shown);
+            } catch (err) {
+              console.warn('[ambient-ui] could not record the first-run dashboard attempt:', err);
+            }
+          }
+        }
+      };
+
+      // The hotkeys this daemon last ASKED each sidecar for, keyed by sidecar
+      // id. Deliberately NOT cleared on disconnect, unlike spawnedOn: it is the
+      // memory that lets a reconnect skip the close below (see there), and it
+      // has to outlive the sidecar going away and coming back. Bounded by the
+      // number of sidecars that enrol during one daemon lifetime, not by
+      // reconnects, since the ids are the stable enrolled ones.
+      const pebbleHotkeysRequested = new Map<string, string>();
+
       sidecarManager.onSidecarConnected(async (sidecar) => {
         if (!sidecar.capabilities.includes('pebble')) {
           console.log(`[ambient-ui] Sidecar ${sidecar.id} lacks 'pebble' capability — skipping native pebble spawn`);
@@ -722,18 +1478,107 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         if (spawnedOn.has(sidecar.id)) return;
         spawnedOn.add(sidecar.id);
         try {
+          // Resolved against the SIDECAR's OS, not process.platform: a hosted
+          // brain runs on a Linux VPS while the machine with the keyboard is
+          // someone's Mac. The defaults are uniform today, so this only matters
+          // the day a platform override is added -- but by then the call site
+          // would have been wrong and nobody would have noticed.
+          const hotkeys = resolvePebbleHotkeys(jarvisConfig.pebble, sidecar.os);
+          const requested = pebbleHotkeyRequestKey(hotkeys);
+          const closeFirst = shouldCloseBeforeSpawn(pebbleHotkeysRequested.get(sidecar.id), requested);
+
+          // Only alongside a change, so one config typo does not become a
+          // repeating error stream: this handler runs on every connect and once
+          // per connected sidecar, so three machines and a flapping link would
+          // otherwise reprint the same complaint indefinitely.
+          //
+          // An error rather than a warning: the user edited config.yaml on
+          // purpose and the value is being ignored. (Unlike daemon.port, a bad
+          // hotkey must not stop the daemon booting -- see
+          // src/config/pebble-hotkeys.ts for why the policies differ.)
+          if (closeFirst) {
+            for (const problem of hotkeys.problems) {
+              console.error(`[ambient-ui] ${problem}`);
+            }
+          }
+
+          // Close before the first spawn we send this sidecar, because
+          // PebbleService.Spawn is idempotent: it returns early on its
+          // `spawned` latch and DISCARDS the spec. A sidecar that outlived a
+          // daemon restart would otherwise keep its old hotkeys while
+          // answering {"spawned": true}, so someone who edited
+          // pebble.summon_hotkey and ran `jarvis restart` would be told it
+          // worked and see nothing change -- which is the whole escape hatch
+          // #563 adds, failing silently on first use.
+          //
+          // Only when what we are about to ask for differs from what we last
+          // asked this sidecar for, so an ordinary reconnect (a network blip)
+          // does not make the pebble blink. See shouldCloseBeforeSpawn for what
+          // an empty map costs after our own restart: the overlay is closed and
+          // respawned even when nothing changed, because pebble.spawn does not
+          // report back which keyspec it is actually running.
+          //
+          // The `await` here is LOAD-BEARING, not stylistic. The sidecar runs
+          // every RPC handler on its own goroutine, and its pebble service
+          // guards Spawn/Close with an atomic latch that covers the entry and
+          // not the body -- so a close overlapping a spawn can skip the hotkey
+          // teardown and leave a system-wide key monitor installed that nothing
+          // can ever remove. Awaiting the close response, which the sidecar
+          // sends after Close() returns, keeps the two strictly ordered. Do not
+          // turn this into a fire-and-forget.
+          //
+          // One caveat on that ordering: dispatchRPC RESOLVES with 'detached'
+          // rather than throwing when its initial timeout expires, so a close
+          // that takes longer than that is not actually awaited. It is treated
+          // as a failed close below, and the keyspec is then reported as
+          // requested rather than applied.
+          let closed = true;
+          if (closeFirst) {
+            try {
+              const closeResult = await sidecarManager.dispatchRPC(sidecar.id, 'pebble.close', {});
+              closed = closeResult !== 'detached';
+              if (!closed) {
+                console.warn(`[ambient-ui] pebble.close on ${sidecar.id} detached; its old hotkeys may still be registered`);
+              }
+            } catch (err) {
+              // Not swallowed. If the close did not land, Spawn's latch will
+              // discard the new keyspec and still answer {"spawned": true}, so
+              // this is the only warning anyone gets that the hotkeys they
+              // edited are not the ones running.
+              closed = false;
+              console.warn(`[ambient-ui] pebble.close on ${sidecar.id} failed; its old hotkeys may still be registered:`, err);
+            }
+          }
+
           const result = await sidecarManager.dispatchRPC(sidecar.id, 'pebble.spawn', {
-            cursor_offset_x: 22,
-            cursor_offset_y: 26,
-            summon_hotkey: 'ctrl+space',
-            palette_hotkey: 'ctrl+k',
+            cursor_offset_x: 34,
+            cursor_offset_y: 40,
+            summon_hotkey: hotkeys.summon,
+            palette_hotkey: hotkeys.palette,
           });
-          console.log(`[ambient-ui] Native pebble spawned on ${sidecar.id}:`, result);
+          // Only remember it as asked-for when the close that makes the ask
+          // effective actually landed; otherwise the next connect retries.
+          if (closed) pebbleHotkeysRequested.set(sidecar.id, requested);
+          // "requested", not "running": pebble.spawn answers {"spawned": true}
+          // whether it applied the spec or discarded it on the latch, so the
+          // daemon cannot honestly claim more than what it asked for.
+          console.log(
+            `[ambient-ui] Native pebble spawned on ${sidecar.id}`
+            + ` (requested summon=${hotkeys.summon || 'off'}, palette=${hotkeys.palette || 'off'}):`,
+            result,
+          );
           // W6 — push initial blinded state so the eye-strike glyph
           // matches awareness.enabled across daemon restarts.
           const awarenessEnabled = (jarvisConfig.awareness as { enabled?: boolean })?.enabled ?? true;
           sidecarManager.dispatchRPC(sidecar.id, 'pebble.set_blinded', { blinded: !awarenessEnabled })
             .catch(() => { /* sidecar might not have the cap yet */ });
+          // Deliberately last: the pebble comes up first, then the dashboard
+          // lands behind it. Note this ties the intro to the 'pebble'
+          // capability — unreachable today (both 'pebble' and 'windows' are
+          // defaults, and LoadConfig re-adds any default a config file drops),
+          // but if pebble ever becomes disableable, hoist this call out of the
+          // pebble gate or a windows-only sidecar will see nothing at all.
+          await openFirstRunDashboard(sidecar);
         } catch (err) {
           spawnedOn.delete(sidecar.id);
           console.warn(`[ambient-ui] Failed to spawn native pebble on ${sidecar.id}:`, err);
@@ -810,7 +1655,10 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // the task via taskManager.setSummary so the dashboard panel route
       // can read it too. Re-dispatches set_expanded if the bubble is
       // still open by the time the summary lands.
-      const summarizeTaskAsync = async (taskId: string, sidecarId: string): Promise<void> => {
+      // Background: a digest of a finished task's output, not a new turn.
+      const summarizeTaskAsync = (taskId: string, sidecarId: string): Promise<void> =>
+        runWithOrigin('background', () => summarizeTaskOutput(taskId, sidecarId));
+      const summarizeTaskOutput = async (taskId: string, sidecarId: string): Promise<void> => {
         try {
           const tm = agentService.getTaskManager();
           const llm = agentService.getLLMManager();
@@ -833,12 +1681,11 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
                 content: `Task: ${task.task}\n\nAgent response:\n${raw.slice(0, 4000)}\n\nSummary:`,
               },
             ];
-            // Route through Groq (or whatever cheap provider is configured)
-            // when available — summaries don't need top-tier reasoning and
-            // sub-cent-per-task makes the always-on summary affordable.
-            // chatWithOverride silently falls back to the default provider
-            // if the requested one isn't registered.
-            const resp = await llm.chatWithOverride(messages, 'groq', { max_tokens: 180, temperature: 0.3 });
+            // Summaries don't need top-tier reasoning, so they run on the low
+            // tier (falling up to medium/high). Routing by tier keeps the
+            // user's model choice: a provider override carries no model and
+            // would run the provider's built-in default (Ollama: llama3).
+            const resp = await llm.chatTier('low', 'sub_pebble_summary', messages, { max_tokens: 180, temperature: 0.3 });
             const summary = (resp.content || '').trim();
             if (summary) {
               tm.setSummary(taskId, summary);
@@ -1059,10 +1906,11 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
                 });
                 console.log(`[sub-pebble] spawn task=${task.id} agent=${task.agentName} slot=${slot}`);
               } else if (event === 'complete' || event === 'fail') {
-                // Flip to idle so the pulse stops; failures additionally
-                // recolor to vermilion so the user sees red on the rail.
+                // Success turns the drop green (the brand "done" state) so the
+                // rail shows finished work at a glance; failures stop the pulse
+                // (idle) and recolor to vermilion so the user sees red.
                 await sidecarManager.dispatchRPC(sidecarId, 'sub_pebble.set_state', {
-                  id: task.id, state: 'idle',
+                  id: task.id, state: event === 'complete' ? 'done' : 'idle',
                 });
                 if (event === 'fail') {
                   await sidecarManager.dispatchRPC(sidecarId, 'sub_pebble.set_color', {
@@ -1128,11 +1976,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       sidecarManager.onEvent(async (sidecarId, event) => {
         if (event.event_type !== 'pebble.blind_toggle') return;
         try {
-          const { saveUserSection } = await import('./user-settings.ts');
+          const { persistPlainUserPatch } = await import('./user-settings.ts');
           const wasEnabled = jarvisConfig.awareness?.enabled ?? true;
           const nextEnabled = !wasEnabled;
           (jarvisConfig.awareness as { enabled?: boolean }).enabled = nextEnabled;
-          saveUserSection('awareness', jarvisConfig.awareness);
+          // Persist only the key that changed. Writing the whole in-memory
+          // section would stamp every DEFAULT_CONFIG fill into the row, pinning
+          // this install to today's capture interval and cooldowns forever.
+          persistPlainUserPatch('awareness', { enabled: nextEnabled });
           // Toggle live awareness service if it exists.
           if (awarenessService) awarenessService.toggle(nextEnabled);
           // Push visual: blinded = !enabled.
@@ -1146,6 +1997,30 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         } catch (err) {
           console.warn('[ambient-ui] blind_toggle failed:', err);
         }
+      });
+
+      // Skill recorder: while a record_skill session is live, the sidecar
+      // emits ui_interaction events (each click/commit + the acted element's
+      // SemanticRef). Buffer them for the compiler. Redaction happens inside
+      // the recorder at push time, and this is the ONLY consumer: the
+      // generic listener below skips these types, so the raw value never
+      // reaches a dashboard socket or the coalescer. A malformed event is
+      // dropped, never coerced into a click.
+      sidecarManager.onEvent(async (_sidecarId, event) => {
+        if (event.event_type === 'ui_recording') {
+          const p = (event.payload ?? {}) as { state?: string; reason?: string };
+          if (p.state === 'stopped') onRecordingStopped(typeof p.reason === 'string' ? p.reason : 'sidecar');
+          return;
+        }
+        if (event.event_type !== 'ui_interaction') return;
+        const rec = getRecorder();
+        if (!rec.isRecording()) return;
+        const interaction = parseInteractionEvent(event.payload);
+        if (!interaction) {
+          console.warn('[Daemon] Dropped malformed ui_interaction event from the sidecar');
+          return;
+        }
+        rec.push(interaction);
       });
 
       // W6-T1 — pebble eye glyph fires when sidecar emits a screen_capture
@@ -1187,7 +2062,19 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           console.log(`[ambient-ui] pebble.summon (dismiss) on ${sidecarId}`);
           return;
         }
-        pendingSummons.set(sidecarId, { cancelled: false });
+        const payload = (event.payload as { session_id?: string; muted?: boolean } | undefined) ?? {};
+        if (payload.muted === true) {
+          // The sidecar sends the press even when the mic is muted, because
+          // this hotkey doubles as the dismiss gesture (handled above). With
+          // nothing to dismiss there's no cycle to open: claiming a summon slot
+          // here would strand the pebble in `listening` waiting on audio the
+          // sidecar has already refused to capture. No text argument — the
+          // sidecar's bubble already says why.
+          setState(sidecarId, 'muted');
+          console.log(`[ambient-ui] pebble.summon on ${sidecarId} — ignored, microphone muted`);
+          return;
+        }
+        pendingSummons.set(sidecarId, { cancelled: false, sessionId: payload.session_id });
         setState(sidecarId, 'listening', '');
         console.log(`[ambient-ui] pebble.summon on ${sidecarId} — listening for audio…`);
       });
@@ -1197,66 +2084,65 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // pipeline (capture done → transcribe → think → speak), not timers.
       const audioSessions = new (await import('./audio-sessions.ts')).AudioSessionRegistry();
       audioSessions.attach((cb) => sidecarManager.onEvent(cb));
-      // T20 — voice-driven settings mutation. Patches `jarvisConfig`,
-      // persists via the DB settings store, and rebuilds the live providers so
-      // the next response uses the new setting without a daemon
-      // restart. The user explicitly hit this with "turn off TTS in
-      // the settings" — the panel opened but the toggle didn't flip
-      // because no handler was wired to the request. This closes that
-      // gap. New providers added to `jarvisConfig` (e.g. Groq STT)
-      // become voice-switchable too.
-      const applyTTSEnabled = async (enabled: boolean): Promise<void> => {
-        const { saveUserSection } = await import('./user-settings.ts');
-        if (!jarvisConfig.tts) jarvisConfig.tts = { enabled, provider: 'edge' };
+      // T20 — voice-driven settings mutation. Patches `jarvisConfig` and
+      // persists via the DB settings store; the saveUserSection choke-point
+      // hook then runs the stt/tts appliers (pebble + dashboard providers),
+      // so the next response uses the new setting without a daemon restart.
+      // Both appliers persist BEFORE mutating jarvisConfig and report failure
+      // instead of throwing: persistUserPatch throws when the keychain refuses
+      // a credential, and an exception here would abort the whole response
+      // cycle — the user would get silence instead of an answer.
+      const applyTTSEnabled = async (enabled: boolean): Promise<boolean> => {
+        const { persistUserPatch } = await import('./user-settings.ts');
+        // Patch-over-STORED-row (see persistUserPatch): persisting the merged
+        // in-memory section here would record the DEFAULT provider 'edge' as
+        // a choice the user never made, pinning hosted installs to Edge
+        // instead of the included Usejarvis AI voice.
+        try {
+          persistUserPatch('tts', { enabled });
+        } catch (err) {
+          console.error('[ambient-ui] Could not save the TTS setting:', err);
+          return false;
+        }
+        if (!jarvisConfig.tts) jarvisConfig.tts = { enabled };
         else jarvisConfig.tts.enabled = enabled;
-        saveUserSection('tts', jarvisConfig.tts);
-        const fresh = { tts: jarvisConfig.tts };
-        // Rebuild the pebble's TTS provider so the next response cycle
-        // either uses the new provider or skips TTS entirely.
-        if (enabled) {
-          try {
-            const { createTTSProvider } = await import('../comms/voice.ts');
-            pebbleTTS = createTTSProvider(fresh.tts);
-            if (pebbleTTS) console.log('[ambient-ui] TTS re-enabled via voice command');
-          } catch (err) {
-            console.warn('[ambient-ui] failed to re-init TTS provider:', err);
-            pebbleTTS = null;
-          }
-        } else {
-          pebbleTTS = null;
-          console.log('[ambient-ui] TTS disabled via voice command');
-        }
-        // Hot-reload dashboard TTS too so the WSService stays in sync.
-        if (wsService && fresh.tts) {
-          try {
-            const { createTTSProvider } = await import('../comms/voice.ts');
-            const provider = createTTSProvider(fresh.tts);
-            if (provider && enabled) wsService.setTTSProvider(provider);
-          } catch { /* dashboard fallback */ }
-        }
+        // Await the applier (vs the save hook's scheduled run) so pebbleTTS
+        // is already rebuilt when the confirmation reply is spoken — "turn
+        // on text to speech" must be audible in the SAME response cycle.
+        await settingsReload?.applyNow('tts');
+        console.log(`[ambient-ui] TTS ${enabled ? 'enabled' : 'disabled'} via voice command`);
+        return true;
       };
 
-      const applySTTProvider = async (provider: 'openai' | 'groq' | 'sarvam' | 'local'): Promise<boolean> => {
-        const { saveUserSection } = await import('./user-settings.ts');
+      const applySTTProvider = async (provider: 'openai' | 'groq' | 'sarvam' | 'local' | 'usejarvis'): Promise<boolean> => {
+        const { persistUserPatch } = await import('./user-settings.ts');
+        const { hasUsejarvisAi } = await import('./usejarvis-ai.ts');
         if (!jarvisConfig.stt) jarvisConfig.stt = { provider };
-        // Refuse the switch if the target provider has no API key
-        // configured — we don't want to silently break STT.
+        // Refuse the switch if the target provider has no credentials
+        // configured — we don't want to silently break STT. The hosted
+        // 'usejarvis' choice is gated on the system usejarvis_ai block
+        // (its key never lives in cfg.stt).
         const hasKey = (() => {
+          if (provider === 'usejarvis') return hasUsejarvisAi(jarvisConfig);
           if (provider === 'local') return !!jarvisConfig.stt!.local?.endpoint;
           const sub = (jarvisConfig.stt as unknown as Record<string, { api_key?: string } | undefined>)[provider];
           return !!sub?.api_key;
         })();
         if (!hasKey) return false;
-        jarvisConfig.stt.provider = provider;
-        saveUserSection('stt', jarvisConfig.stt);
-        const fresh = { stt: jarvisConfig.stt };
+        // Patch-over-STORED-row: the provider IS explicit intent here, but
+        // the rest of the merged in-memory section must not ride along.
         try {
-          const { createSTTProvider } = await import('../comms/voice.ts');
-          pebbleSTT = createSTTProvider(fresh.stt);
-          console.log(`[ambient-ui] STT provider switched to ${provider} via voice command`);
+          persistUserPatch('stt', { provider });
         } catch (err) {
-          console.warn('[ambient-ui] failed to re-init STT provider:', err);
+          console.error('[ambient-ui] Could not save the STT provider:', err);
+          return false;
         }
+        if (!jarvisConfig.stt) jarvisConfig.stt = { provider };
+        else jarvisConfig.stt.provider = provider;
+        // Deterministic swap: the next transcription must already use the
+        // new provider when we confirm the switch to the user.
+        await settingsReload?.applyNow('stt');
+        console.log(`[ambient-ui] STT provider switched to ${provider} via voice command`);
         return true;
       };
 
@@ -1301,7 +2187,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         if (!re.test(t)) return false;
 
         // The runResponseCycle caller already claimed the pendingSummons
-        // slot for this turn (Ctrl+Space → listening → audio.session_end
+        // slot for this turn (summon hotkey → listening → audio.session_end
         // → onComplete → here, OR wake-with-command → here). We just
         // hand control off to the region overlay and re-use the same
         // ctrl so a hotkey press still cancels cleanly.
@@ -1434,35 +2320,48 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         const ttsOff = /\b(turn off|disable|switch off|deactivate)\s+(?:the\s+)?(text[- ]to[- ]speech|tts|voice (?:output|response)?|speech|tts response)\b/.test(t);
         const ttsOn  = /\b(turn on|enable|switch on|activate|reactivate)\s+(?:the\s+)?(text[- ]to[- ]speech|tts|voice (?:output|response)?|speech|tts response)\b/.test(t);
         if (ttsOff) {
-          await applyTTSEnabled(false);
+          const ok = await applyTTSEnabled(false);
           // Speak the confirmation BEFORE shutting TTS down — temp
           // restore a one-shot provider so the user hears acknowledgment.
-          await speakConfirmation(sidecarId, "Text-to-speech turned off.", ctrl);
+          await speakConfirmation(
+            sidecarId,
+            ok ? "Text-to-speech turned off." : "I couldn't save that setting.",
+            ctrl,
+          );
           return true;
         }
         if (ttsOn) {
-          await applyTTSEnabled(true);
-          await speakConfirmation(sidecarId, "Text-to-speech turned on.", ctrl);
+          const ok = await applyTTSEnabled(true);
+          await speakConfirmation(
+            sidecarId,
+            ok ? "Text-to-speech turned on." : "I couldn't save that setting.",
+            ctrl,
+          );
           return true;
         }
 
         // STT provider switch.
         const sttMatch =
-          /\b(switch|change)\s+(?:the\s+)?(stt|speech[- ]to[- ]text|transcription|speech recognition|listening)\s+(?:to|provider to)\s+(openai|whisper|groq|sarvam|local)\b/.exec(t) ||
-          /\buse\s+(openai|whisper|groq|sarvam|local)\s+(?:for\s+(?:stt|speech[- ]to[- ]text|transcription|speech recognition|listening|hearing))\b/.exec(t);
+          /\b(switch|change)\s+(?:the\s+)?(stt|speech[- ]to[- ]text|transcription|speech recognition|listening)\s+(?:to|provider to)\s+(openai|whisper|groq|sarvam|local|usejarvis|use jarvis|jarvis)\b/.exec(t) ||
+          /\buse\s+(openai|whisper|groq|sarvam|local|usejarvis|use jarvis|jarvis)\s+(?:for\s+(?:stt|speech[- ]to[- ]text|transcription|speech recognition|listening|hearing))\b/.exec(t);
         if (sttMatch) {
-          let target = (sttMatch[2] === 'whisper' ? 'openai' : sttMatch[2]) as 'openai' | 'groq' | 'sarvam' | 'local';
+          // 'whisper' → openai; 'jarvis' / 'use jarvis' (how STT typically
+          // transcribes the brand name) → the hosted usejarvis provider.
+          type SttTarget = 'openai' | 'groq' | 'sarvam' | 'local' | 'usejarvis';
+          const canonical = (name: string): SttTarget =>
+            (name === 'whisper' ? 'openai' : name === 'use jarvis' || name === 'jarvis' ? 'usejarvis' : name) as SttTarget;
+          let target = canonical(sttMatch[2]!);
           // The first capture group depends on which alternative matched.
           const candidate = (sttMatch[3] || sttMatch[1]) as string;
-          if (candidate && /^(openai|whisper|groq|sarvam|local)$/.test(candidate)) {
-            target = (candidate === 'whisper' ? 'openai' : candidate) as typeof target;
+          if (candidate && /^(openai|whisper|groq|sarvam|local|usejarvis|use jarvis|jarvis)$/.test(candidate)) {
+            target = canonical(candidate);
           }
           const ok = await applySTTProvider(target);
           await speakConfirmation(
             sidecarId,
             ok
               ? `Switched transcription to ${target}.`
-              : `I can't switch to ${target} — it doesn't have an API key configured.`,
+              : `I couldn't switch to ${target} — it may not have an API key configured.`,
             ctrl,
           );
           return true;
@@ -1499,6 +2398,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         tasks:       { aliases: ['tasks', 'todos', 'task list', 'task'],    title: 'Tasks',       w: 500, h: 600 },
         content:     { aliases: ['content', 'content pipeline', 'notes'],   title: 'Content',     w: 800, h: 600 },
         workspaces:  { aliases: ['workspaces', 'workspace', 'sites'],       title: 'Workspaces',  w: 800, h: 600 },
+        usage:       { aliases: ['token usage', 'usage room'],              title: 'Usage',       w: 800, h: 600 },
       };
 
       // Match aliases longest-first so "tool catalog" wins over "tools" when
@@ -1576,7 +2476,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       });
 
       // W4 — Cmd+K palette: cursor-anchored fuzzy room picker. The
-      // sidecar's Ctrl+K hotkey emits a `pebble.palette` event with the
+      // sidecar's palette hotkey emits a `pebble.palette` event with the
       // current cursor position; the daemon spawns a small `_palette`
       // panel near the cursor (or focuses the existing one). Picks
       // (room nav / object) come back via HTTP `/api/palette/pick`,
@@ -1727,7 +2627,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         },
       });
 
-      // W4 — Ctrl+K opens or refocuses the palette. Closing flows
+      // W4 — the palette hotkey opens or refocuses the palette. Closing flows
       // through user-driven paths (Esc / click / pick → /api/palette/close),
       // not the hotkey, because rapid hotkey-toggle close→spawn reliably
       // crashes webview_go's Bind path after the 3rd–4th cycle.
@@ -1775,11 +2675,17 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       type ScreenshotInfo = {
         base64: string;
         mediaType: string;
-        // Scale factors: pixels-on-actual-screen ÷ pixels-in-sent-image.
-        // The LLM picks coordinates in the (downscaled) image; we
-        // multiply its (x, y) by these before dispatching pebble.point_at
-        // so the pebble lands at the real-screen position. =1 when the
-        // image wasn't resized.
+        // Scale factors: capture-native pixels per sent-image pixel. The
+        // model picks coordinates in the (downscaled) image; we multiply by
+        // these before dispatching pebble.point_at. =1 when the image was not
+        // resized.
+        //
+        // CAPTURE-NATIVE, not "real-screen" (#604): orig_* is the pixel size
+        // of whatever `platformCaptureScreen` wrote, read off that image's own
+        // header, so it is backing pixels on a Retina Mac and primary-monitor
+        // pixels on Windows. That is not the space the pebble eases in. The
+        // multiply site has the per-platform detail and the reason no
+        // conversion is applied.
         scaleX: number;
         scaleY: number;
         origWidth: number;
@@ -1886,7 +2792,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           '',
           'When the user asks for something that genuinely requires a click on a non-UIA surface (desktop icon, system tray, popup), prefer asking them to do it themselves rather than wrestling with coordinate clicks — coordinate clicks move the OS cursor and steal control from the user.',
           '',
-          '**Sidecar is primary.** The Go sidecar is connected and exposes desktop / browser / filesystem / clipboard / system_info / screenshot capabilities. Tools auto-route to it — you never need to specify a `target` parameter unless you want to override. If a tool returns "Sidecar not running" / "Desktop bridge not found", that\'s the legacy local-only path leaking through; mention it in your reply but try the same call again — the auto-route should pick up the connected sidecar on the second attempt.',
+          '**Sidecar is primary.** The Go sidecar is connected and exposes desktop / browser / filesystem / clipboard / system_info / screenshot capabilities. Tools auto-route to it — you never need to specify a `target` parameter unless you want to override. If a tool returns "Local desktop control is not available", that\'s the local-only path leaking through; mention it in your reply but try the same call again — the auto-route should pick up the connected sidecar on the second attempt.',
           '',
           'When you finish a multi-step task, give a short verbal confirmation ("Done — Chrome is up.") rather than re-narrating each step. The pebble already showed each step visually.',
           '',
@@ -1914,33 +2820,20 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             '',
           );
         }
-        sections.push(
-          '# Pointing at things on the user\'s screen — REQUIRED for "where" / "show me" requests',
-          'Emit a tag of the form `[POINT:<x>,<y>:<short label>]` anywhere in your reply to fly the pebble to that screen coordinate. The daemon strips these tags before display + TTS, dispatches a pebble.point_at RPC, and the pebble eases to the position with the label shown in its bubble for ~3.5 seconds. Coordinates are virtual-screen pixels.',
-          '',
-          '**When the user asks a spatial question, the daemon attaches a screenshot of their current screen as the FIRST content block of the user message.** Use the actual pixels in that image to pick coordinates — read button labels, identify positions, find the exact target the user is asking about. Do NOT fall back to remembered coordinates from prior turns; ground every estimate in the current screenshot.',
-          '',
-          '**Coordinate space — read it off the grid.** The attached screenshot has a labelled coordinate grid overlay — light vermilion hairlines every 100 px and labelled major lines every 200 px ("x=200", "y=400" …). Pick coordinates in the *image* coordinate space using the grid as your reference frame. Do NOT eyeball pixel positions — find the gridlines that bracket the target element, then interpolate. For a button sitting just left of the "x=1500" gridline at roughly half the distance to "x=1400", you write `x=1450`. Use the same approach for y. The daemon scales your image-space coords back to real-screen pixels before dispatching the pebble, so if you see the close button just left of the "x=1580, y=10" intersection, emit `[POINT:1578,12:close]`.',
-          '',
-          '**Common coordinate mistakes to avoid:**',
-          '- Outputting "real screen" coordinates (e.g. (3792, 29) for a 4K screen) — the LLM sees the SHRUNK image, so coordinates must be in shrunk-image space. The daemon does the upscale.',
-          '- Putting coordinates near the centre of the image when the user asked about a corner element. Read the grid: top-right means high x AND low y.',
-          '- Reusing example coordinates from these instructions verbatim instead of measuring from the actual screenshot.',
-          '',
-          '**Required for any request matching:** "where is X", "where do I click for X", "show me X", "point to X", "guide me to X". A reply without the tag for these is wrong — describing the location verbally is not enough; the pebble must actually move.',
-          '',
-          '**Emit ONE point per request, not a multi-step walkthrough** — unless the user explicitly asks for steps ("walk me through", "show me each step"). If the user asks "how to open a terminal" you point at ONE primary control (the Terminal menu), not three sequential ones.',
-          '',
-          '**Each request is independent.** Do NOT carry over coordinates or labels from earlier turns; pick fresh ones based on what the user is asking about RIGHT NOW.',
-          '',
-          'Estimating coordinates: use the foreground-app context above and your knowledge of typical UIs. The user\'s desktop coordinate space starts at (0, 0) top-left. A maximized window on a 1920×1080 screen has its close button near (1895, 8). Browser tab close ≈ right edge of the active tab. Editors typically have their main menu bar around y=10–30. When in doubt, your best guess is fine — the user can re-ask.',
-          '',
-          'Examples (do not reuse these coordinates verbatim — they\'re illustrative):',
-          '  user: "where do I click to publish?" → "Top-right of the workflows panel. [POINT:<x>,<y>:publish]"',
-          '  user: "show me where to close this window" → "Top-right of the title bar. [POINT:<x>,<y>:close]"',
-          '',
-          'Replace `<x>,<y>` with your actual estimate. The text is spoken; the [POINT:..] tag is consumed by the daemon and never shown.',
+        // The [POINT:..] contract, and the one name for the space it lands
+        // in, live in pebble-point-prompt.ts (#604). Extracted because the
+        // space claim is a model-facing contract and nothing here could test
+        // a string literal inside this closure.
+        //
+        // The pebble's OS decides which unit the no-image branch names, and
+        // that branch is the one dispatched UNSCALED, so a wrong unit there is
+        // a pointer off by the display's scale factor. `null` for an
+        // unrecognised or absent `os` is a real case (offline or older
+        // sidecar) and names all three rather than guessing one.
+        const pebbleOs = osFamily(
+          sidecarManager.listSidecars().find((s) => s.id === sidecarId)?.os,
         );
+        sections.push(...pointingGuidance(pebbleOs));
         return sections.join('\n');
       };
 
@@ -2230,6 +3123,16 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           await speakConfirmation(sidecarId, "I can't start a background agent right now.", ctrl);
           return true;
         }
+        // Asked BEFORE spawning: a cap hit inside assign would leave an idle
+        // specialist behind for a task that never started.
+        if (!taskManagerLocal.canLaunch()) {
+          await speakConfirmation(
+            sidecarId,
+            "Too many background tasks are already running. Try again when one finishes.",
+            ctrl,
+          );
+          return true;
+        }
 
         const deps = {
           orchestrator,
@@ -2416,97 +3319,147 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         return true;
       };
 
-      // T26b — resolve coordinates for action-class tools and fly the
-      // pebble to the target before the click fires. The orchestrator
-      // executes tools AFTER the LLM finishes streaming the message,
-      // so dispatching point_at right when we see the tool_call event
-      // gives the pebble ~50-300 ms head-start on the actual action —
-      // enough for the user to see it land at the button.
-      const flyPebbleToToolTarget = async (
+      /** The narrated tools that name an element, i.e. that owe the user a pointer. */
+      const ELEMENT_ADDRESSED_TOOLS = new Set([
+        'desktop_click', 'desktop_type', 'browser_click', 'browser_type',
+      ]);
+
+      /**
+       * The routing facts the narration predicates decide on, gathered once per
+       * call. They live in pebble-narration.ts as pure functions over this --
+       * `localBrowserWillServe` is the one security-relevant predicate here and
+       * it has to be testable without a daemon.
+       */
+      const narrationRouting = (sidecarId: string, args: Record<string, unknown>): NarrationRouting => ({
+        pebbleSidecarId: sidecarId,
+        // `listSidecars` is a synchronous DB query and CAN throw -- a closed or
+        // locked registry during a shutdown overlap, which
+        // `collectExecutionTargets` already guards for the same reason. An
+        // EMPTY inventory rather than a throw, because empty fails closed
+        // through both predicates that read this: `pebbleIsOnThisHost` finds no
+        // pebble sidecar and `remoteBrowserPebbleTarget` finds no browser one,
+        // so the narration goes quiet instead of taking the turn down.
+        sidecars: (() => {
+          try {
+            return sidecarManager.listSidecars();
+          } catch (err) {
+            console.warn('[ambient-ui] sidecar inventory unavailable for narration:', err);
+            return [];
+          }
+        })(),
+        selfHostname: os.hostname(),
+        machineScoped: !!getMachineScope(),
+        // A host that refuses local browser calls cannot be the machine that
+        // serves one, whatever the inventory says. Read here rather than in
+        // pebble-narration.ts, which imports only a zero-import leaf, on
+        // purpose (#611) -- so every decision there stays a pure function of
+        // what this object hands it.
+        localBrowserEnabled: !isLocalBrowserDisabled() && !isNoLocalTools(),
+        args,
+      });
+
+      // T26b -- resolve WHERE the pebble should point for an action-class tool,
+      // so the caller can fly it to the target before the click fires. The
+      // orchestrator executes tools AFTER the LLM finishes streaming the
+      // message, so resolving right when we see the tool_call event gives the
+      // pebble a head-start on the actual action -- enough for the user to see
+      // it land at the button. The caller bounds the wait, because a pointer
+      // that arrives after the click has fired previews nothing.
+      //
+      // Resolves only; it dispatches nothing. Null means the tool addresses no
+      // element. An `unplaced` result means it does and we cannot honestly say
+      // where, and the caller has to show that rather than leave a confident
+      // label standing over a pebble that never moved. Nothing in here may
+      // query the page or send an action/evaluate RPC -- pebble-narration.ts
+      // carries the reasons.
+      const resolveToolNarration = async (
         sidecarId: string,
         toolName: string,
         args: Record<string, unknown>,
-        label: string,
-      ): Promise<void> => {
+      ): Promise<PebbleNarration | null> => {
         try {
-          if (toolName === 'desktop_click') {
-            const id = Number(args.element_id);
-            if (!Number.isFinite(id)) return;
+          if (toolName === 'desktop_click' || toolName === 'desktop_type') {
+            // desktop_type's element_id is optional: without one it types into
+            // whatever already has focus, so it addresses nothing and there is
+            // neither a pointer to show nor an absence to admit to.
+            if (toolName === 'desktop_type' && args.element_id === undefined) return null;
+            const id = snapshotElementId(args.element_id);
+            if (id === null) return { kind: 'unplaced', reason: 'element_id is not a snapshot id' };
+            // That cache holds positions on THIS host's screen, so it is only
+            // a pointer when the pebble is drawn here.
+            if (!pebbleIsOnThisHost(narrationRouting(sidecarId, args))) {
+              return { kind: 'unplaced', reason: 'the pebble is not on this machine' };
+            }
             const { getCachedElementBounds } = await import('../actions/tools/desktop.ts');
             const bounds = getCachedElementBounds(id);
-            if (!bounds) return; // not in cache → label-only narration
-            const cx = Math.round(bounds.x + bounds.width / 2);
-            const cy = Math.round(bounds.y + bounds.height / 2);
-            console.log(`[ambient-ui] fly pebble to desktop element [${id}] @ (${cx},${cy})`);
-            await sidecarManager.dispatchRPC(sidecarId, 'pebble.point_at', {
-              x: cx, y: cy, label, duration_ms: 2500,
-            });
-          } else if (toolName === 'browser_click' || toolName === 'browser_type') {
-            // T26c — fly the pebble to the rendered element in the
-            // browser viewport. We bounce a Runtime.evaluate through the
-            // sidecar's browser capability to read the element's
-            // getBoundingClientRect + window.screenX/Y; the result is
-            // already in screen-pixel space so no extra scale step.
-            const id = Number(args.element_id);
-            if (!Number.isFinite(id)) return;
-            const script = `
-(function(){
-  try {
-    var els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick], [tabindex]');
-    var el = els[${Math.floor(id)}];
-    if (!el) return JSON.stringify({error: 'not found'});
-    var r = el.getBoundingClientRect();
-    return JSON.stringify({
-      x: Math.round(r.x + (window.screenX || 0)),
-      y: Math.round(r.y + (window.screenY || 0)),
-      w: Math.round(r.width),
-      h: Math.round(r.height)
-    });
-  } catch (e) { return JSON.stringify({error: String(e)}); }
-})()`;
-            try {
-              const evalResult = await Promise.race<unknown>([
-                sidecarManager.dispatchRPC(sidecarId, 'browser_evaluate', { expression: script }),
-                new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1500)),
-              ]);
-              // Result shape varies by sidecar — try to dig the JSON
-              // string out of common locations.
-              let raw: string | null = null;
-              if (typeof evalResult === 'string') raw = evalResult;
-              else if (evalResult && typeof evalResult === 'object') {
-                const r = evalResult as Record<string, unknown>;
-                if (typeof r.value === 'string') raw = r.value;
-                else if (typeof r.result === 'string') raw = r.result;
-                else if (r.result && typeof r.result === 'object') {
-                  const rr = r.result as Record<string, unknown>;
-                  if (typeof rr.value === 'string') raw = rr.value;
-                }
-              }
-              if (!raw) return;
-              let rawStr: string = raw;
-              // Sometimes the inner JSON is wrapped in a CDP shape
-              // {"type":"string","value":"..."} — try one more peel.
-              try {
-                const parsed = JSON.parse(rawStr);
-                if (parsed && typeof parsed === 'object' && typeof parsed.value === 'string') rawStr = parsed.value;
-              } catch { /* not nested */ }
-              const bounds = JSON.parse(rawStr) as { x?: number; y?: number; w?: number; h?: number; error?: string };
-              if (bounds.error || typeof bounds.x !== 'number' || typeof bounds.y !== 'number') return;
-              const cx = Math.round(bounds.x + (bounds.w ?? 0) / 2);
-              const cy = Math.round(bounds.y + (bounds.h ?? 0) / 2);
-              console.log(`[ambient-ui] fly pebble to browser element [${id}] @ (${cx},${cy})`);
-              await sidecarManager.dispatchRPC(sidecarId, 'pebble.point_at', {
-                x: cx, y: cy, label, duration_ms: 2500,
-              });
-            } catch (err) {
-              console.warn('[ambient-ui] browser bounds fetch failed:', err);
-            }
+            // Only a LOCAL desktop_snapshot fills that cache, so a
+            // sidecar-routed click lands here and narrates without a pointer.
+            if (!bounds) return { kind: 'unplaced', reason: `no local snapshot cached desktop element [${id}]` };
+            // PEBBLE_SCREEN_SPACE, by the platform controllers that fill the
+            // cache (#604): Win32 UIA rects are physical virtual-screen px
+            // under the same PerMonitorV2 awareness GetCursorPos reports in,
+            // macOS AX position/size are Cocoa points, and xdotool geometry is
+            // X11 px. Equal to the pebble's space on Windows, and on Linux
+            // wherever GDK's scale factor is 1. On macOS equal in UNIT but not
+            // guaranteed in ORIGIN: the pebble flips y against
+            // `NSScreen.screens[0]`, so on a multi-display Mac with unequal
+            // heights the two can disagree about where y=0 is. Named rather
+            // than converted for the same reason as the capture path: there is
+            // no scale-factor helper in the tree to convert with, and no
+            // display geometry reported to compute an origin from.
+            //
+            // This is the PRE-ACTION approval path -- the pebble that says
+            // "this is what you are approving" before a desktop_click -- so
+            // the caveat is recorded rather than rounded off.
+            return {
+              kind: 'point',
+              x: Math.round(bounds.x + bounds.width / 2),
+              y: Math.round(bounds.y + bounds.height / 2),
+            };
           }
-          // browser_click / browser_type / launch_app etc.: no cached
-          // bounds → fall through to v1 label-only narration. Browser
-          // selector → coords resolution lands in T26c (CDP DOM.getBoxModel).
+          if (toolName === 'browser_click' || toolName === 'browser_type') {
+            // The element the snapshot named, from the coordinates the click
+            // will dispatch at -- never from a fresh look at the page. See
+            // pebble-narration.ts for why, and BrowserController's
+            // snapshotElementPoint / viewportScreenOrigin for what they hold.
+            const { browser } = await import('../actions/tools/builtin.ts');
+            // ONE routing object for the whole narration. Both deps below read
+            // it, and building it twice would be two inventory reads: identical
+            // today, since `localBrowserWillServe` is synchronous and the remote
+            // dep is invoked in the same turn, but any `await` inserted between
+            // them would open a gap between "the coordinates are not local" and
+            // "which sidecar to ask" -- a pointer aimed with one machine's
+            // geometry for a click the router sends to another.
+            const routing = narrationRouting(sidecarId, args);
+            // `return await`, not `return`: a bare `return <promise>` completes
+            // the try block BEFORE the promise is adopted, so the catch below
+            // would never see a rejection from here. It would instead reach
+            // `unhandledRejection` -- which shuts the daemon down -- and leave
+            // the confident label standing over a pebble that never moved,
+            // which is the one outcome this whole path exists to prevent.
+            return await browserElementNarration(args.element_id, {
+              localBrowserWillServe: () => localBrowserWillServe(routing),
+              snapshotElementPoint: (id) => browser.snapshotElementPoint(id),
+              viewportScreenOrigin: (id) => browser.viewportScreenOrigin(id),
+              // The sidecar-served case, which is the DEFAULT install: the
+              // click runs in the sidecar's browser and the coordinates live in
+              // that process, so they are read from it over #591's read-only
+              // RPC instead of re-derived here. The same `routing` object feeds
+              // both predicates, so "which machine" is answered once per call.
+              remoteElementPoint: (id) => remoteBrowserNarration(routing, id),
+            });
+          }
+          // Every other narrated tool (run_command, write_file, launch_app...)
+          // acts on nothing the pebble can point at, so there is nothing to
+          // place and nothing to admit to: label-only narration is complete.
+          return null;
         } catch (err) {
-          console.warn('[ambient-ui] flyPebbleToToolTarget error:', err);
+          console.warn('[ambient-ui] resolveToolNarration error:', err);
+          // A tool that addresses an element still owes the user an answer, so
+          // a failure here is `unplaced`, not silence.
+          return ELEMENT_ADDRESSED_TOOLS.has(toolName)
+            ? { kind: 'unplaced', reason: 'resolving the element failed' }
+            : null;
         }
       };
 
@@ -2526,11 +3479,22 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         switch (name) {
           // Browser
           case 'browser_navigate':    return `Opening ${trim(args.url, 60)}`;
-          case 'browser_click':       return `Clicking ${trim(args.text || args.selector || 'element', 50)}`;
-          case 'browser_type':        return `Typing into ${trim(args.selector || 'field', 30)}`;
+          // The id is what cross-references the snapshot the user read.
+          // `browser_click` has no `text` or `selector` parameter at all, which
+          // is why the old label was the bare constant "Clicking element".
+          // `browser_type` DOES take a required `text`, and it is deliberately
+          // not echoed: the bubble is a persistent on-screen label, so naming
+          // the typed value would put a password or a secret on screen,
+          // so the id is the only thing that can tie the bubble to the list the
+          // user read. It also has to be there for the "(location unknown)"
+          // amendment to say anything: "Clicking element (location unknown)"
+          // names nothing at all.
+          case 'browser_click':       return `Clicking element [${trim(args.element_id ?? '?', 12)}]`;
+          case 'browser_type':        return `Typing into element [${trim(args.element_id ?? '?', 12)}]`;
           case 'browser_scroll':      return 'Scrolling';
           case 'browser_evaluate':    return 'Running JS';
-          case 'browser_upload_file': return `Uploading ${trim(args.path, 40)}`;
+          // The parameter is `file_path`; `args.path` read as "Uploading undefined".
+          case 'browser_upload_file': return `Uploading ${trim(args.file_path ?? args.path, 40)}`;
           // Desktop (Win32 UIA)
           case 'desktop_click':        return `Clicking ${trim(args.element_id || args.label || 'element', 50)}`;
           case 'desktop_type':         return `Typing "${trim(args.text, 50)}"`;
@@ -2558,7 +3522,10 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // the screen position with a label callout. Tags arriving across
       // chunk boundaries are handled because we only match closed tags
       // (the `]` terminator must be present).
-      const POINT_TAG_RE = /\[POINT:(-?\d+),(-?\d+):([^\]]+)\]/g;
+      // Built from the pattern that ships beside the text teaching it, so a
+      // reword of the contract and the matcher that enforces it cannot drift
+      // (#604). Its own instance: a /g regex carries lastIndex.
+      const POINT_TAG_RE = pointTagRegex();
       const stripPointTags = (
         text: string,
         seen: Set<string>,
@@ -2599,6 +3566,28 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         return { sentences, remainder: buffer.slice(lastEnd) };
       };
 
+      // stripMarkdownForSpeech flattens markdown to plain prose so TTS doesn't
+      // read syntax aloud ("asterisk asterisk", "hash hash"). The bubble still
+      // receives the raw markdown (the sidecar renders it styled); only the
+      // synthesized audio gets the cleaned text.
+      const stripMarkdownForSpeech = (s: string): string =>
+        s
+          .replace(/```[\s\S]*?```/g, ' ')          // fenced code blocks
+          .replace(/`([^`]*)`/g, '$1')              // inline code
+          .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')    // images
+          .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')  // links -> text
+          .replace(/^\s{0,3}#{1,6}\s+/gm, '')       // ATX headings
+          .replace(/^\s{0,3}>\s?/gm, '')            // blockquote markers
+          .replace(/^\s*[-*+]\s+/gm, '')            // bullet markers
+          .replace(/^\s*\d+[.)]\s+/gm, '')          // numbered markers
+          .replace(/(\*\*|__)(.*?)\1/g, '$2')       // bold
+          .replace(/(\*|_)(.*?)\1/g, '$2')          // italic
+          .replace(/~~(.*?)~~/g, '$1')              // strikethrough
+          .replace(/^\s*([-*_]\s*){3,}$/gm, ' ')    // horizontal rules
+          .replace(/\|/g, ' ')                      // table pipes
+          .replace(/\s+/g, ' ')
+          .trim();
+
       // runResponseCycle — streams the LLM response token-by-token.
       // Each completed sentence is synthesized and queued on the sidecar
       // immediately so playback starts within ~1 s of the LLM's first
@@ -2607,7 +3596,15 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // LLM's natural cadence. Sidecar's playback queue plays clips
       // back-to-back; we track estimated end-of-playback so we know
       // when to flip to idle.
-      const runResponseCycle = async (
+      // A Pebble reply is the person's own turn, including the streamed answer
+      // and the speech synthesized from it (src/llm/origin.ts).
+      const runResponseCycle = (
+        sidecarId: string,
+        userText: string,
+        ctrl: { cancelled: boolean },
+        opts?: { image?: { base64: string; mediaType: string } },
+      ): Promise<void> => runWithOrigin('user', () => runResponseCycleTurn(sidecarId, userText, ctrl, opts));
+      const runResponseCycleTurn = async (
         sidecarId: string,
         userText: string,
         ctrl: { cancelled: boolean },
@@ -2659,11 +3656,24 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         let firstAudioDispatchAt = 0;
         let visibleText = '';
         let unsynth = '';
+        /**
+         * Who owns the pebble's bubble text right now. Every writer bumps it;
+         * an action narration captures it and stays quiet if it has moved on by
+         * the time its coordinates come back, so a late "(location unknown)"
+         * cannot land on top of live speech or of the next tool's label (#585).
+         */
+        let pebbleBubbleGen = 0;
         let speakingStarted = false;
         let speakingFlipPending: Promise<void> | null = null;
         let lastPlaybackEnd = Date.now();
         let totalAudioMs = 0;
         const pendingTTS: Promise<unknown>[] = [];
+        // Synthesis started for every sentence at once, so a long reply fired a
+        // burst of parallel hosted TTS requests large enough to trip a per-key
+        // limit. Bounded per SIDECAR, shared with any cycle a barge-in starts;
+        // only the synthesize call holds a slot, so waiting on the previous
+        // clip below can never deadlock the queue.
+        const synthLimit = pebbleSynthLimiter(sidecarId);
         // Serializes clip DISPATCH (not synthesis) so sentences play in order
         // even when a later, shorter sentence synthesizes faster than an earlier
         // one. Each job awaits the previous before queueing its clip + bumping
@@ -2677,16 +3687,23 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         };
 
         const enqueueSentence = (sentence: string): void => {
-          if (!pebbleTTS || !sentence.trim()) return;
+          if (!pebbleTTS) return;
+          const speakText = stripMarkdownForSpeech(sentence);
+          if (!speakText) return; // sentence was pure markdown (e.g. a code fence)
           const prev = ttsTail;
           const job = (async () => {
             const ttsStart = Date.now();
             try {
-              const audio = await pebbleTTS!.synthesize(sentence);
+              const audio = await synthLimit(async () => {
+                // Checked once the slot is ours: a turn cancelled while this
+                // sentence queued must not pay for speech it will never play.
+                if (ctrl.cancelled) return null;
+                return pebbleTTS!.synthesize(speakText);
+              });
               // Synthesis may have finished out of order; wait for the previous
               // sentence's clip to be queued before queueing ours.
               await prev;
-              if (ctrl.cancelled) return;
+              if (ctrl.cancelled || !audio) return;
               const clipMs = estimateAudioDurationMs(audio) ?? sentence.length * 60;
               totalAudioMs += clipMs;
               const now = Date.now();
@@ -2739,12 +3756,49 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
               `scale ${autoShot.scaleX.toFixed(2)}x — ${autoShot.base64.length} base64 chars`,
             );
           }
-          // POINT coordinates emitted by the LLM are in the SENT-image
-          // coordinate space (the downscaled JPEG). Scale them up to
-          // the actual virtual-screen pixels before dispatching to the
-          // sidecar so the pebble lands at the real button.
+          // POINT coordinates emitted by the model are in the SENT-image
+          // coordinate space (the downscaled, grid-overlaid JPEG). Scaling
+          // them by orig/sent puts them in CAPTURE-NATIVE pixels -- the space
+          // of whatever `platformCaptureScreen` wrote, since `capture_screen`
+          // reports orig_width by decoding that image's header and asks the OS
+          // nothing (sidecar/handlers.go).
+          //
+          // THAT IS NOT `PEBBLE_SCREEN_SPACE`, which is what pebble.point_at
+          // consumes, and the gap is #604's first two bullets (see
+          // pebble-point-prompt.ts for the full per-platform table):
+          //
+          //   Linux    equal at GDK scale 1; off by the scale factor above it.
+          //   Windows  equal at 100% DPI. The capture is PRIMARY-MONITOR-ONLY
+          //            and its origin is the primary's top-left, which IS
+          //            virtual (0,0), so the two share an origin and no offset
+          //            belongs here -- adding one would move every pointer by
+          //            the width of a display placed to the left. Above 100%
+          //            DPI they differ by the monitor's scale.
+          //   macOS    OFF BY THE BACKING FACTOR. `screencapture -x` writes
+          //            backing pixels and the pebble eases in Cocoa points, so
+          //            this lands ~2x out on a Retina display.
+          //
+          // NAMED, NOT CONVERTED, deliberately. No factor is derivable from
+          // anything the sidecar reports: `capture_screen` carries no `space`
+          // or scale field, `platformGetScreenSize` is a hardcoded 1920x1080
+          // stub on darwin and linux, there is no display-geometry RPC, and the
+          // only backing-scale read in the tree is a C file-static in
+          // region_select_darwin.go. #590 removed a devicePixelRatio multiply
+          // for being wrong on two of three platforms; a guessed factor here
+          // would repeat that. Closing it needs a `space` (or scale) field on
+          // the capture reply, the way #591 put one on browser_element_point.
           const pointScaleX = autoShot?.scaleX ?? 1;
           const pointScaleY = autoShot?.scaleY ?? 1;
+          // NOTE the asymmetry, which is not a typo: the scale follows
+          // `autoShot`, the image follows `opts.image ?? autoShot`. A T19
+          // region capture therefore ships an image with NO scale and NO crop
+          // origin -- `opts.image` is `{base64, mediaType}` only, and the
+          // region path never reports where the crop sat (its callback is
+          // `onCapture([]byte, int, int)` and `region.captured` sends just an
+          // id and a size). So that image is unplaceable, which is why
+          // `pointingGuidance` case 3 tells the model to answer in words
+          // rather than emit a tag it cannot ground. Plumbing a crop origin
+          // through is its own change.
           const imageInput = opts?.image ?? autoShot;
           // Multi-modal path — image either explicitly supplied (T19
           // region capture) or auto-captured (T9). Else regular text.
@@ -2782,10 +3836,53 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           // cancel the pending hops instead of flying the pebble around after
           // it's already returned to idle.
           const pointTimers: ReturnType<typeof setTimeout>[] = [];
+          // Whether any coordinate the model emits can be placed on screen at
+          // all. True only for an auto-capture, which is the one image whose
+          // scale we know -- and, because `grid := compact` in the sidecar's
+          // handler, also the only one carrying the grid the model is told to
+          // measure against.
+          //
+          // THE DAEMON DECIDES THIS, not the prompt. `pointingGuidance` case 3
+          // asks the model not to emit a tag it cannot ground, but a prompt is
+          // a courtesy and this is the control: a region crop reaches the model
+          // as an ordinary first-content-block image, and if it points anyway
+          // -- through plain non-compliance, or because text inside the crop
+          // encouraged it -- the coordinates would be crop-relative and fly the
+          // pebble to a confident, wrong place with the label asserting it is
+          // the answer. The user asked precisely because they did not know.
+          const placeableFrame = !!autoShot;
           const onPoint = (rawX: number, rawY: number, label: string) => {
-            // Scale image-space coords back to virtual-screen pixels.
+            if (!placeableFrame && opts?.image) {
+              console.log(
+                '[ambient-ui] dropped POINT in an unplaceable frame '
+                + `(region crop has no reported origin or scale) label="${logSafeLabel(label)}"`,
+              );
+              // No bubble amendment, and that is the difference from the
+              // tool-narration path. There, `unplacedLabel` exists because a
+              // confident label would otherwise stand over a pebble that never
+              // moved. Here the reply itself is the answer: the tag is stripped
+              // and the surrounding text is still spoken, so the user gets the
+              // location in words, which is exactly what case 3 asks for.
+              // Touching the pebble state mid-stream would fight the speaking
+              // state machine for no gain.
+              return;
+            }
+            // Image space -> capture-native pixels. See the pointScaleX
+            // comment for why that is not PEBBLE_SCREEN_SPACE everywhere and
+            // why no conversion is applied here (#604).
             const x = Math.round(rawX * pointScaleX);
             const y = Math.round(rawY * pointScaleY);
+            // Bounded before dispatch, matching the bound the SIDECAR-measured
+            // coordinate has carried since #591. The pebble stores the point in
+            // an atomic.Int32, so an oversized value truncates and WRAPS into
+            // range -- a confident pointer at an arbitrary spot, which is worse
+            // than one parked harmlessly off-screen. The model-authored
+            // coordinate was the only one of the two left unbounded.
+            if (!Number.isFinite(x) || !Number.isFinite(y)
+              || Math.abs(x) > MAX_POINT_COORD || Math.abs(y) > MAX_POINT_COORD) {
+              console.warn(`[ambient-ui] dropped out-of-range POINT (${x},${y})`);
+              return;
+            }
             const delay = pointDelayMs;
             pointDelayMs += 4000; // 3.5 s hold + small overlap
             pointTimers.push(setTimeout(() => {
@@ -2799,9 +3896,15 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
               });
             }, delay));
             const scaledNote = (pointScaleX !== 1 || pointScaleY !== 1)
-              ? ` (raw ${rawX},${rawY} × scale ${pointScaleX.toFixed(2)},${pointScaleY.toFixed(2)})`
+              ? ` (raw ${rawX},${rawY} x scale ${pointScaleX.toFixed(2)},${pointScaleY.toFixed(2)})`
               : '';
-            console.log(`[ambient-ui] point @ (${x},${y}) label="${label}" delay=${delay}ms${scaledNote}`);
+            // The space is in the line because a misplaced pebble is otherwise
+            // indistinguishable from a model that guessed badly, and these two
+            // numbers are the only record of which frame they were meant in.
+            // The label is model-authored, so it is neutralised first -- this
+            // line is the audit record for exactly the misplacement above, and
+            // a label that can inject a newline can forge a second line of it.
+            console.log(`[ambient-ui] point @ (${x},${y}) -> ${PEBBLE_SCREEN_SPACE} label="${logSafeLabel(label)}" delay=${delay}ms${scaledNote}`);
           };
           for await (const event of stream) {
             if (ctrl.cancelled) {
@@ -2839,6 +3942,9 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
               if (!speakingStarted) {
                 speakingFlipPending = flipToSpeaking();
               }
+              // Streamed text owns the bubble from here, so a narration still
+              // waiting on coordinates must not write over it.
+              pebbleBubbleGen++;
               void setState(sidecarId, 'speaking', visibleText);
 
               // Emit any complete sentences for synthesis.
@@ -2857,13 +3963,100 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
               if (NARRATE_TOOLS.test(tcName)) {
                 const label = describeToolCall(tcName, tcArgs);
                 console.log(`[ambient-ui] narrating tool: ${tcName} → "${label}"`);
-                void setState(sidecarId, 'working', label);
 
-                // T26b — fly the pebble to the actual click target so
-                // the user SEES JARVIS reach for the button before it
-                // clicks. Only for tools where we can resolve coords
-                // before execution; everything else stays label-only.
-                void flyPebbleToToolTarget(sidecarId, tcName, tcArgs, label);
+                // T26b -- fly the pebble to the actual click target so the user
+                // SEES JARVIS reach for the button before it clicks, and say so
+                // when we cannot: a pebble that silently stays put looks just
+                // like one the user blinked past, and the label would then be
+                // the only thing they read (#585).
+                //
+                // The label goes up first and is AWAITED, so the amendment
+                // below is sent after it -- provided it completed. setState
+                // swallows its own failures and an RPC that detaches resolves
+                // without the sidecar having run it, and handlers there run one
+                // per goroutine, so send order is not apply order; the await
+                // only removes the common race.
+                //
+                // The label write itself is NOT generation-gated, and does not
+                // need to be: the IIFE runs synchronously to its first await,
+                // so the label is issued at the `tool_call` event exactly as
+                // the unconditional `void setState(...)` it replaces was, and
+                // its ordering against a later writer's is unchanged by this
+                // PR. Only the amendment is gated, because only the amendment
+                // can arrive after a resolution that took up to 1200ms.
+                //
+                // `gen` claims the bubble's TEXT for this narration. Streamed
+                // tokens and the next tool's label bump the counter, and a late
+                // amendment then stays quiet rather than writing a sentence
+                // about an element from two actions ago over what the user is
+                // now reading. The flight itself is not gated on it: pointing
+                // at the button is the narration, it is what this path exists
+                // for, and taking the bubble while it points is the behaviour
+                // the pebble already restores from afterwards.
+                const gen = ++pebbleBubbleGen;
+                void (async () => {
+                  await setState(sidecarId, 'working', label);
+                  // The RESOLUTION step is bounded on purpose: this exists to
+                  // land before the action, and a pointer that arrives after
+                  // the click is worse than none.
+                  //
+                  // The 30s CDP timeout this used to cite is the LOCAL browser
+                  // path's, and it was never this path's whole story. Of the two
+                  // local readers, `snapshotElementPoint` is a synchronous map
+                  // read (`actions/browser/session.ts`) that issues no command
+                  // and bounds nothing, while `viewportScreenOrigin` sends up to
+                  // three -- a frame tree, an isolated world, an evaluate in it
+                  // -- each inheriting the hardcoded 30s per-send timeout in
+                  // `actions/browser/cdp.ts`. So the local worst case is nearer
+                  // 90s than 30s, and this race is the only thing bounding it.
+                  //
+                  // On the SIDECAR route -- the default install -- the reads
+                  // behind `remoteElementPoint` are bounded on the far side
+                  // instead, by the element-point handler's own
+                  // `elementPointBudget` of 900ms (#610), which cuts each read to
+                  // what the budget has left and refuses one outright with less
+                  // than `elementPointMinRead` (20ms) to go. There this race is a
+                  // backstop rather than the bound.
+                  //
+                  // It does not bound the label write above it, which is its own
+                  // RPC; a write that late is suppressed by the generation guard
+                  // instead.
+                  let budget: ReturnType<typeof setTimeout> | undefined;
+                  const narration = await Promise.race([
+                    resolveToolNarration(sidecarId, tcName, tcArgs),
+                    new Promise<PebbleNarration>((r) => { budget = setTimeout(
+                      () => r({ kind: 'unplaced', reason: 'resolving the element took too long' }), 1200); }),
+                  ]).finally(() => clearTimeout(budget));
+                  if (!narration || ctrl.cancelled) return; // the turn was dismissed
+                  if (narration.kind === 'point') {
+                    console.log(`[ambient-ui] fly pebble for ${tcName} @ (${narration.x},${narration.y})`);
+                    try {
+                      const sent = await sidecarManager.dispatchRPC(sidecarId, 'pebble.point_at', {
+                        x: narration.x, y: narration.y, label, duration_ms: 2500,
+                      });
+                      // 'detached' means the call timed out without the sidecar
+                      // running it, so the pebble may never have moved and the
+                      // confident label must not be left standing over it.
+                      if (sent !== 'detached') return;
+                      console.warn('[ambient-ui] pebble.point_at detached before the sidecar ran it');
+                    } catch (err) {
+                      // The pointer did not happen, so the confident label must
+                      // not be left standing over a pebble that never moved.
+                      console.warn('[ambient-ui] pebble.point_at failed:', err);
+                    }
+                  } else {
+                    console.log(`[ambient-ui] no pebble pointer for ${tcName}: ${narration.reason}`);
+                  }
+                  if (ctrl.cancelled || gen !== pebbleBubbleGen) return;
+                  await setState(sidecarId, 'working', unplacedLabel(label));
+                })().catch((err) => {
+                  // Defence in depth behind `resolveToolNarration`'s own catch:
+                  // a detached task with no handler reaches
+                  // `unhandledRejection`, which shuts the daemon down. A
+                  // narration is cosmetic and runs before the action it previews
+                  // has been approved, so nothing in here may end the process.
+                  console.warn('[ambient-ui] narration task failed:', err);
+                });
               }
             } else if (event.type === 'done') {
               llmDone = true;
@@ -2901,6 +4094,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         if (speakingFlipPending) await speakingFlipPending;
         // Make sure the bubble shows the final text (in case the last
         // setState lost a race).
+        pebbleBubbleGen++;
         await setState(sidecarId, 'speaking', fullText);
         try { wsService.broadcastHeartbeat(fullText); } catch { /* dashboard may not be open */ }
 
@@ -2944,7 +4138,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         // close immediately — too fast to read the answer. Hold it open for
         // a text-length-derived reading window so no-TTS users get time
         // to actually read what JARVIS said. User can dismiss anytime by
-        // pressing the summon hotkey (Ctrl+Space).
+        // pressing the summon hotkey.
         let readingHoldMs = 0;
         if (totalAudioMs === 0 && fullText.length > 0) {
           // ~60 ms/char gives skim time; clamp 6–30 s so short answers
@@ -2967,6 +4161,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         }
         if (ctrl.cancelled) return;
 
+        pebbleBubbleGen++;
         await setState(sidecarId, 'idle', '');
         // Suppress unused-var warning if linting cared.
         void llmDone;
@@ -3002,8 +4197,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           }
           if (ctrl.cancelled) return;
 
-          if (!transcript) {
-            console.log('[ambient-ui] empty transcript — returning to idle');
+          // `hasSpokenContent`, not a bare truthiness check: STT renders a
+          // captured silence as "." or "?!" often enough, and those used to
+          // run as the user's whole turn.
+          if (!hasSpokenContent(transcript)) {
+            console.log(
+              `[ambient-ui] no speech in transcript${transcript ? ` (${JSON.stringify(transcript)})` : ''}` +
+              ` — returning to idle`,
+            );
             await setState(session.sidecarId, 'idle', '');
             clearSummon(session.sidecarId, ctrl);
             return;
@@ -3024,29 +4225,15 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // transcribe and word-search for "jarvis"; on a hit, we either
       //   - run the LLM directly with the trailing command (single-shot,
       //     "Jarvis play music" works without saying it twice), or
-      //   - if only "jarvis" alone, fire a normal listening summon so the
-      //     user can speak the command after the bubble pops up.
+      //   - if only "jarvis" alone (bare, or trailed by nothing but
+      //     punctuation), fire a normal listening summon so the user can
+      //     speak the command after the bubble pops up.
       // Suppressed when a summon cycle is already running so the
       // continuous wake stream doesn't fight with the active turn.
-      const wakePhrase = /\bjarvis\b/i;
-      const stripWakePrefix = (text: string): string => {
-        // Pull out the segment after the LAST occurrence of "jarvis" so
-        // "I'm at home, Jarvis play music" → "play music". Trailing
-        // punctuation/whitespace removed; if nothing follows, returns "".
-        const re = /\bjarvis\b[\s,.\-—:]*/gi;
-        let last: RegExpExecArray | null = null;
-        let m: RegExpExecArray | null;
-        while ((m = re.exec(text)) !== null) {
-          last = m;
-        }
-        if (!last) return '';
-        return text.slice(last.index + last[0].length).trim();
-      };
-
       sidecarManager.onEvent(async (sidecarId, event) => {
         if (event.event_type !== 'audio.wake_segment') return;
         // Suppress while an active summon is in flight — the user already
-        // got JARVIS's attention via Ctrl+Space (or a prior wake).
+        // got JARVIS's attention via the summon hotkey (or a prior wake).
         if (pendingSummons.has(sidecarId)) return;
         if (!pebbleSTT) return;
         // Claim a synchronous in-flight flag before the first await so a
@@ -3079,14 +4266,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         }
         const sttMs = Date.now() - sttStart;
         if (!transcript) return;
-        if (!wakePhrase.test(transcript)) {
+        if (!containsWakePhrase(transcript)) {
           // Most segments — user talking about other things. Quietly drop.
           return;
         }
         console.log(`[ambient-ui] wake-segment matched (${sttMs}ms STT, ${transcript.length} chars)`);
 
-        const command = stripWakePrefix(transcript);
-        // Re-check: a manual summon (Ctrl+Space) may have claimed the slot while
+        const command = wakeCommandFrom(transcript);
+        // Re-check: a manual summon may have claimed the slot while
         // we were transcribing (the entry guard at the top ran before the STT
         // await). The deliberate press wins, so bail rather than clobber its ctrl
         // and resolve its session_end against ours.
@@ -3096,7 +4283,8 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         pendingSummons.set(sidecarId, ctrl);
 
         if (!command) {
-          // Just "Jarvis" alone — flip to listening and trigger a fresh
+          // Just "Jarvis" alone, "Hey Jarvis!" included (`wakeCommandFrom`
+          // won't hand back bare punctuation): flip to listening and trigger a fresh
           // session capture on the sidecar so the user's next utterance
           // gets transcribed + run through the LLM. The session_end
           // event will land in `audioSessions.onComplete` above, which
@@ -3107,7 +4295,24 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           // instant a session is actually consumed, so it never cuts a response).
           await setState(sidecarId, 'listening', '');
           try {
-            await sidecarManager.dispatchRPC(sidecarId, 'pebble.start_listening', {});
+            const res = (await sidecarManager.dispatchRPC(sidecarId, 'pebble.start_listening', {})) as
+              | { started?: boolean; reason?: string }
+              | undefined;
+            if (res?.started === false) {
+              // The sidecar refused to open the mic — the user muted it between
+              // the wake segment being captured and this call landing. Give the
+              // slot back now instead of holding `listening` until the fallback
+              // timer fires, and leave the pebble showing why.
+              console.log(`[ambient-ui] wake → start_listening refused (${res.reason ?? 'unknown'})`);
+              ctrl.cancelled = true;
+              clearSummon(sidecarId, ctrl);
+              // No text argument for the muted case: the sidecar has already
+              // put the reason in the bubble, and passing text here would
+              // overwrite it with the default per-state copy.
+              if (res.reason === 'muted') await setState(sidecarId, 'muted');
+              else await setState(sidecarId, 'idle', '');
+              return;
+            }
             console.log(`[ambient-ui] wake → listening (capture started)`);
             clearListenTimer(sidecarId);
             pendingListenTimers.set(sidecarId, setTimeout(() => {
@@ -3140,6 +4345,32 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         } finally {
           wakeInFlight.delete(sidecarId);
         }
+      });
+
+      // The sidecar turned a mic request away because the user has the mic muted
+      // from the tray. Mute is sidecar-owned local state, so mostly this is
+      // informational — the two paths that could open a cycle already handle
+      // their own refusal (`pebble.summon` carries a `muted` flag, and
+      // `pebble.start_listening` answers `started: false`).
+      //
+      // What's left is the narrow race: mute landing AFTER a press was reported
+      // unmuted, or mid-capture, which leaves a summon slot with no audio ever
+      // coming. Unwind it — but only when the session id matches the slot's, so
+      // an unrelated in-flight turn can't be interrupted by a stray event (the
+      // hazard the stray-region.captured comment below spells out).
+      sidecarManager.onEvent((sidecarId, event) => {
+        if (event.event_type !== 'pebble.mic_blocked') return;
+        const payload = (event.payload as { reason?: string; source?: string; session_id?: string } | undefined) ?? {};
+        console.log(
+          `[ambient-ui] mic blocked on ${sidecarId} ` +
+          `(source=${payload.source ?? '?'}, reason=${payload.reason ?? '?'})`,
+        );
+        const ctrl = pendingSummons.get(sidecarId);
+        if (!ctrl || !payload.session_id || ctrl.sessionId !== payload.session_id) return;
+        ctrl.cancelled = true;
+        clearListenTimer(sidecarId);
+        clearSummon(sidecarId, ctrl);
+        void setState(sidecarId, 'muted'); // no text — the sidecar's bubble already says why
       });
 
       // T19 — region.captured / region.cancelled. The user said "help
@@ -3196,7 +4427,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
 
         // Frame the question for the LLM: include the original voice
         // text plus a hint that the image is the user's pointer.
-        const promptText = `${userText}\n\n(I've attached a screenshot of the area I selected on screen. Look at the image and answer based on what's shown there.)`;
+        // The "cannot point at it" clause matters as much as the rest (#604):
+        // this crop carries no record of where it sat on screen, so there is
+        // no frame to convert a coordinate from. It is `pointingGuidance` case
+        // 3, restated next to the question it applies to, because instruction
+        // following degrades with distance from the directive. The daemon
+        // drops a tag here regardless -- see `placeableFrame` -- so this spares
+        // the user a refusal rather than being the thing that prevents one.
+        const promptText = `${userText}\n\n(I've attached a screenshot of only the area I selected on screen. Look at the image and answer based on what's shown there. I selected just part of the screen, so you cannot point at it - tell me in words instead of emitting a [POINT:..] tag.)`;
         // Mark the cycle active and keep the pendingRegion entry until the
         // finally — together these make a concurrent duplicate capture a no-op
         // and guarantee state is torn down on every exit (success, error, or
@@ -3237,20 +4475,30 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     // 8c. Wire TTS provider if configured
     if (jarvisConfig.tts?.enabled) {
       const { createTTSProvider } = await import('../comms/voice.ts');
-      const ttsProvider = createTTSProvider(jarvisConfig.tts);
+      const { effectiveTtsForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+      const ttsBinding = effectiveTtsForBinding(jarvisConfig);
+      const ttsProvider = ttsBinding
+        ? createTTSProvider(ttsBinding, usejarvisVoiceCredentials(jarvisConfig))
+        : null;
       if (ttsProvider) {
         wsService.setTTSProvider(ttsProvider);
-        console.log(`[Daemon] TTS enabled: ${jarvisConfig.tts.voice ?? 'en-US-AriaNeural'}`);
+        console.log(`[Daemon] TTS enabled: ${ttsBinding?.provider ?? 'edge'} (${jarvisConfig.tts.voice ?? 'en-US-AriaNeural'})`);
       }
     }
 
-    // 8d. Wire STT provider for voice input via dashboard
-    if (jarvisConfig.stt) {
+    // 8d. Wire STT provider for voice input via dashboard. Guard on the
+    // BINDING result, not on config.stt existing (like channel-service):
+    // the hosted default applies even when the section is absent.
+    {
       const { createSTTProvider } = await import('../comms/voice.ts');
-      const sttProvider = createSTTProvider(jarvisConfig.stt);
+      const { effectiveSttForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+      const sttBinding = effectiveSttForBinding(jarvisConfig);
+      const sttProvider = sttBinding
+        ? createSTTProvider(sttBinding, usejarvisVoiceCredentials(jarvisConfig))
+        : null;
       if (sttProvider) {
         wsService.setSTTProvider(sttProvider);
-        console.log(`[Daemon] STT for voice input: ${jarvisConfig.stt.provider}`);
+        console.log(`[Daemon] STT for voice input: ${sttBinding!.provider}`);
       }
     }
 
@@ -3273,12 +4521,17 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     deferredExecutor.setLearner(learner);
     // Approved actions must respect the kill switch too, not just the gate.
     deferredExecutor.setEmergencyController(emergencyController);
-    // Inline requests are owned by an authority gate blocked in-process;
-    // any that survived a restart have no gate anymore, so hand them to
-    // the deferred path or approving them would execute nothing.
-    const orphanedInline = approvalManager.demoteAllPendingInline();
-    if (orphanedInline > 0) {
-      console.log(`[Daemon] Demoted ${orphanedInline} orphaned inline approval(s) to deferred`);
+    // Startup reconciliation. Inline requests are owned by an authority gate
+    // blocked in-process; any that survived a restart have no gate anymore,
+    // so they go to the deferred path. An approved request that never got a
+    // receipt either never started (nothing happened) or was interrupted
+    // (it may have). Neither is run here; both wait for the user in Authority.
+    const reconciled = approvalManager.reconcileAfterRestart();
+    if (reconciled.demotedInline > 0) {
+      console.log(`[Daemon] Demoted ${reconciled.demotedInline} orphaned inline approval(s) to deferred`);
+    }
+    if (reconciled.notStarted > 0 || reconciled.interrupted > 0) {
+      console.log(`[Daemon] Approved actions left unresolved by the last shutdown: ${reconciled.notStarted} never started, ${reconciled.interrupted} interrupted. Awaiting a decision in Authority.`);
     }
     // Phase 6.3.5b — let WS service resolve approvals from voice intents.
     wsService.setApprovalManager(approvalManager);
@@ -3304,6 +4557,346 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       }
     });
 
+    // 8f. Settings hot reload: per-section appliers. Everything they need
+    // (wsService, channelService, registry, observers, authority) is in
+    // scope here. Appliers are idempotent — routes that already apply a
+    // change by hand (LLM, TTS) can keep doing so; a second run is harmless.
+    settingsReload.setBroadcast((p) => wsService.broadcastSettingsApplied(p));
+
+    // channels — Telegram/Discord adapters bake tokens (and the STT
+    // provider) into their constructors, so restart-in-place is the apply.
+    // Debounced so back-to-back saves reconnect the bots once.
+    settingsReload.registerApplier('channels', async () => {
+      await registry!.stopService('channels');
+      await registry!.startService('channels');
+    }, { debounceMs: 400 });
+
+    // stt — swap the dashboard voice-input provider; live channel adapters
+    // captured the old provider at construction, so chain a channels
+    // restart when any channel is connected.
+    settingsReload.registerApplier('stt', async (cfg) => {
+      const { createSTTProvider } = await import('../comms/voice.ts');
+      const { effectiveSttForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+      const sttBinding = effectiveSttForBinding(cfg);
+      wsService.setSTTProvider(sttBinding ? createSTTProvider(sttBinding, usejarvisVoiceCredentials(cfg)) : null);
+      if (Object.values(channelService.getChannelStatus()).some(Boolean)) {
+        settingsReload!.sectionChanged('channels');
+      }
+    });
+
+    // tts — same swap the /api/config/tts route already does by hand; this
+    // also covers voice-command toggles and reloadAll, and clears the
+    // provider on disable.
+    settingsReload.registerApplier('tts', async (cfg) => {
+      const { createTTSProvider } = await import('../comms/voice.ts');
+      const { effectiveTtsForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+      const ttsBinding = cfg.tts?.enabled ? effectiveTtsForBinding(cfg) : undefined;
+      wsService.setTTSProvider(ttsBinding ? createTTSProvider(ttsBinding, usejarvisVoiceCredentials(cfg)) : null);
+    });
+
+    // google — refresh the auth (disconnect unlinks the tokens file; the
+    // null-first reload drops the stale in-memory tokens), hand it to the
+    // observers and restart them so EmailSync/CalendarSync re-capture it.
+    let lastGoogleCreds = googleIdentity(jarvisConfig);
+    settingsReload.registerApplier('google', async (cfg) => {
+      const creds = googleIdentity(cfg);
+      if (!creds) {
+        googleAuth = null;
+      } else if (googleAuth && creds === lastGoogleCreds) {
+        googleAuth.reloadTokensFromDisk();
+      } else {
+        googleAuth = makeGoogleAuth(cfg);
+      }
+      lastGoogleCreds = creds;
+      if (observerService) {
+        observerService.setGoogleAuth(googleAuth);
+        // Re-read alongside the auth so the watches are armed from the live
+        // config rather than whatever booted. (The notify secret and channel
+        // token are keyed by the INSTANCE id, which a migration preserves, so
+        // those two do not actually change on a move — the topic and callback
+        // can, if the deployment's config did.)
+        observerService.setPushTargets({
+          pubsubTopic: cfg.google?.pubsub_topic,
+          pushCallback: cfg.google?.push_callback,
+          channelToken: cfg.google?.channel_token,
+        });
+        await registry!.stopService('observers');
+        await registry!.startService('observers');
+      }
+    });
+
+    // llm — routes keep their synchronous hotReloadLLMProviders call for an
+    // accurate response; this covers reloadAll/SIGHUP (external DB edits).
+    settingsReload.registerApplier('llm', async (cfg) => {
+      const { hotReloadLLMProviders } = await import('./llm-settings.ts');
+      hotReloadLLMProviders(cfg, agentService.getLLMManager());
+      // `mergeLLMSettingsIntoConfig` REPLACES `config.llm.providers` rather
+      // than mutating it, so the orchestrator's boot-time reference is
+      // detached on every reload. Re-hand it, or the tool filter keeps
+      // classifying provider kinds from a snapshot that no longer matches
+      // the tier map it is being asked about -- and a provider re-pointed
+      // from a local endpoint to a remote one would still read as local.
+      agentService.getOrchestrator().setToolFilterProviders(cfg.llm?.providers);
+      bgAgent?.getOrchestrator().setToolFilterProviders(cfg.llm?.providers);
+    });
+
+    // authority — keep the engine's construction-time snapshot in sync on a
+    // full reload (mirror of the POST /api/authority/config mapping).
+    // emergency_state is excluded: EmergencyController owns it.
+    settingsReload.registerApplier('authority', async (cfg) => {
+      const a = cfg.authority;
+      if (!a) return;
+      const current = authorityEngine.getConfig();
+      authorityEngine.updateConfig({
+        ...current,
+        default_level: a.default_level ?? current.default_level,
+        governed_categories: (a.governed_categories ?? current.governed_categories) as any,
+        overrides: (a.overrides ?? current.overrides) as any,
+        context_rules: (a.context_rules ?? current.context_rules) as any,
+        learning: a.learning ?? current.learning,
+      });
+      // The background agent's extra restrictions live beside the shared
+      // config; rebuild its profile so a dashboard/file edit applies live.
+      bgAgent?.setAuthorityProfile(buildBackgroundProfile(a.background));
+      agentService.getOrchestrator().setTaintGating(buildTaintGating(a.taint_gating));
+    });
+
+    // awareness — the service snapshots its sub-config at construction; the
+    // enabled flag is the one knob with a live setter today.
+    settingsReload.registerApplier('awareness', async (cfg) => {
+      awarenessService?.toggle(cfg.awareness?.enabled !== false);
+    });
+    // voice: resolveRealtimeVoice reads live config per call, so the dashboard
+    // needs no applier, but a connected pebble keeps the realtime verdict it
+    // was sent; its re-push applier is wired beside the pebble voice loop
+    // (wireRealtimeReadvertisement).
+
+    // ── Tray menu live data (design: usejarvis-tray §00) ──
+    // Push a status snapshot to each connected sidecar every few seconds so the
+    // tray menu (read on open) shows pending approvals, pause state, health, and
+    // the recent-activity block. The pebble state is pushed separately by the
+    // ambient-ui loop, deduped.
+    const trayRelTime = (ts: number): string => {
+      const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+      if (s < 60) return 'just now';
+      const m = Math.floor(s / 60);
+      if (m < 60) return `${m}m`;
+      const h = Math.floor(m / 60);
+      if (h < 24) return `${h}h`;
+      return `${Math.floor(h / 24)}d`;
+    };
+    // Humanize a tool_name ("send_email") into a short activity label ("Send email").
+    const trayHumanizeTool = (tool: string): string => {
+      const words = tool.replace(/[_-]+/g, ' ').trim();
+      return words ? words.charAt(0).toUpperCase() + words.slice(1) : 'Action';
+    };
+    // Recent activity = the last few actions Jarvis actually carried out, newest
+    // first. Sourced from approvals that were approved/executed (the actions the
+    // user cares about); auto-approved low-risk actions aren't gated so don't
+    // appear here. Best-effort — never let it break the heartbeat.
+    const buildTrayRecent = (): string[] => {
+      try {
+        return approvalManager
+          .getHistory({ limit: 8 })
+          .filter((r) => r.status === 'executed' || r.status === 'approved')
+          .slice(0, 3)
+          .map((r) => `${trayHumanizeTool(r.tool_name)} · ${trayRelTime(r.executed_at ?? r.decided_at ?? r.created_at)}`);
+      } catch {
+        return [];
+      }
+    };
+    const trayStatusTimer = setInterval(() => {
+      try {
+        const connected = sidecarManager.getConnectedSidecars();
+        if (connected.length === 0) return;
+        const enrolled = sidecarManager.listSidecars().length || connected.length;
+        const payload = {
+          waiting: approvalManager.getPending().length + approvalManager.getUnresolved().length,
+          paused: emergencyController.getState() === 'paused',
+          brain_online: true,
+          port: config.port,
+          sidecars: `${connected.length}/${enrolled}`,
+          recent: buildTrayRecent(),
+        };
+        for (const sc of connected) {
+          void sidecarManager.dispatchRPC(sc.id, 'tray.status', payload).catch(() => {});
+        }
+      } catch {
+        /* best-effort heartbeat */
+      }
+    }, 4000);
+    trayStatusTimer.unref?.(); // the heartbeat must not keep the process alive
+
+    // Tray → brain: the "Pause Jarvis" toggle drives the emergency controller.
+    // ("Mute microphone" is mic control the sidecar owns locally, not here.)
+    sidecarManager.onEvent((_sidecarId, event) => {
+      if (event.event_type !== 'tray.set_pause') return;
+      const paused = (event.payload as { paused?: boolean } | undefined)?.paused === true;
+      if (paused) emergencyController.pause();
+      else emergencyController.resume();
+    });
+
+    // ── Outbound OS notifications (design: usejarvis-tray §01) ──
+    // The four reasons Jarvis interrupts: it needs your OK (approval), it
+    // finished (done), a machine dropped (sidecar), or an update is ready
+    // (update). Each is raised natively by the sidecar via notify.show; the
+    // user's choice returns as a notify.action event. Book 08 originally held
+    // Approve/Deny to ordinary actions and gave irreversible ones "Review in
+    // Jarvis" only; the founder opted to allow Approve/Deny on every approval
+    // notification (the impact still shows in the body's meta as a risk cue).
+    // Since #791 a toast too long to read whole is review-only whatever its
+    // impact (approvalToast, TOAST_APPROVABLE_MAX_COLUMNS).
+    // All four reasons are wired: approval, done (an approved action finished),
+    // sidecar-offline, and update (a connecting sidecar that is behind and
+    // cannot update itself; see the onSidecarConnected handler below).
+    const notifyAll = (payload: Record<string, unknown>): void => {
+      for (const sc of sidecarManager.getConnectedSidecars()) {
+        void sidecarManager.dispatchRPC(sc.id, 'notify.show', payload).catch(() => {});
+      }
+    };
+
+    // New pending approvals → one notification each, deduped and recent-only so a
+    // sidecar reconnect doesn't blast the whole backlog. The same poll also
+    // catches approvals that just finished executing → the "done" notification.
+    const notifiedApprovalIds = new Set<string>();
+    const notifiedDoneIds = new Set<string>();
+    const approvalNotifyTimer = setInterval(() => {
+      try {
+        if (sidecarManager.getConnectedSidecars().length === 0) return;
+        for (const req of approvalManager.getPending()) {
+          if (notifiedApprovalIds.has(req.id)) continue;
+          notifiedApprovalIds.add(req.id);
+          if (Date.now() - req.created_at > 60_000) continue; // skip the backlog
+          // Product call (founder): Approve/Deny on approval notifications,
+          // including irreversible ones; the impact rides along in `meta`
+          // ("destructive · delete_data") so the toast reads the risk. Since
+          // #791 only when the toast can show what is being approved: above
+          // TOAST_APPROVABLE_MAX_COLUMNS it is review-only (approvalToast).
+          const { approvable: _approvable, ...toast } = approvalToast(req);
+          notifyAll(toast);
+        }
+        if (notifiedApprovalIds.size > 200) {
+          const pending = new Set(approvalManager.getPending().map((r) => r.id));
+          for (const id of notifiedApprovalIds) if (!pending.has(id)) notifiedApprovalIds.delete(id);
+        }
+
+        // Approved actions that finished → the "Task complete" (done) notification
+        // — the design's own example (the send_email you approved, sent). Scoped
+        // to executed approvals for now: a bounded, non-naggy source (you approved
+        // them); broader task-done hooks can feed the same path later. Ordered by
+        // creation, but approvals execute shortly after creation, so the recent
+        // window catches them.
+        const executed = approvalManager.getHistory({ status: 'executed', limit: 12 });
+        for (const req of executed) {
+          if (notifiedDoneIds.has(req.id)) continue;
+          notifiedDoneIds.add(req.id);
+          const doneAt = req.executed_at ?? req.decided_at ?? req.created_at;
+          if (Date.now() - doneAt > 60_000) continue; // skip the backlog
+          notifyAll({
+            id: `done:${req.id}`,
+            kind: 'done',
+            title: 'Task complete',
+            // What it did, not why it needed approval (#813).
+            body: taskCompleteBody(req) || `${trayHumanizeTool(req.tool_name)} finished.`,
+            actions: [
+              { id: 'view', label: 'View', primary: true },
+              { id: 'dismiss', label: 'Dismiss' },
+            ],
+          });
+        }
+        if (notifiedDoneIds.size > 200) {
+          const recent = new Set(executed.map((r) => r.id));
+          for (const id of notifiedDoneIds) if (!recent.has(id)) notifiedDoneIds.delete(id);
+        }
+      } catch {
+        /* best-effort */
+      }
+    }, 3000);
+    approvalNotifyTimer.unref?.();
+
+    // A machine dropped → tell the other connected sidecars. Keep a name map so
+    // the body can say which machine (the sidecar object is gone by disconnect).
+    // On connect we also fire the "update" notification when the sidecar is
+    // behind: below SIDECAR_RECOMMENDED_VERSION ('suggested'), or behind the
+    // sidecar this brain ships with. Only for sidecars that predate
+    // self-update (no update_* feature): newer ones prompt natively at
+    // startup or get the dashboard hint, and a second nudge would be noise.
+    // Sent only to that machine, deduped per (id, version) for this brain
+    // process so a reconnect flap can't nag.
+    const sidecarNameById = new Map<string, string>();
+    const notifiedUpdateKeys = new Set<string>();
+    sidecarManager.onSidecarConnected((sc) => {
+      sidecarNameById.set(sc.id, sc.name);
+      const behind = sc.updateStatus === 'suggested' || isUpdateAvailable(sc.version);
+      const selfUpdating = sc.features?.some((f) => f === 'update_prompt' || f === 'update_apply') ?? false;
+      if (behind && !selfUpdating) {
+        const key = `${sc.id}:${sc.version}`;
+        if (!notifiedUpdateKeys.has(key)) {
+          notifiedUpdateKeys.add(key);
+          const target = sc.updateStatus === 'suggested' && !isUpdateAvailable(sc.version)
+            ? `${SIDECAR_RECOMMENDED_VERSION} is recommended`
+            : `${SIDECAR_LATEST_VERSION} is available`;
+          void sidecarManager.dispatchRPC(sc.id, 'notify.show', {
+            id: `update:${sc.id}`,
+            kind: 'update',
+            title: 'Update Jarvis',
+            body: `This machine is on ${sc.version}; ${target}.`,
+            destructive: false,
+            actions: [
+              { id: 'review', label: 'Open Jarvis', primary: true },
+              { id: 'later', label: 'Later' },
+            ],
+          }).catch(() => {});
+        }
+      }
+    });
+    // Offline toasts ride a grace timer (a quick reconnect cancels it) plus a
+    // per-machine cooldown, so a flapping connection can't nag every flap.
+    const offlineNotifyTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    const offlineNotifiedAt = new Map<string, number>();
+    const OFFLINE_NOTIFY_GRACE_MS = 15_000;
+    const OFFLINE_NOTIFY_COOLDOWN_MS = 5 * 60_000;
+    sidecarManager.onSidecarConnected((sc) => {
+      const t = offlineNotifyTimers.get(sc.id);
+      if (t) {
+        clearTimeout(t);
+        offlineNotifyTimers.delete(sc.id);
+      }
+    });
+    sidecarManager.onSidecarDisconnected((id) => {
+      const name = sidecarNameById.get(id) ?? 'A machine';
+      sidecarNameById.delete(id);
+      if (offlineNotifyTimers.has(id)) return;
+      const last = offlineNotifiedAt.get(id) ?? 0;
+      if (Date.now() - last < OFFLINE_NOTIFY_COOLDOWN_MS) return;
+      const timer = setTimeout(() => {
+        offlineNotifyTimers.delete(id);
+        offlineNotifiedAt.set(id, Date.now());
+        notifyAll({
+          id: `sidecar:${id}`,
+          kind: 'sidecar',
+          title: 'Sidecar disconnected',
+          body: `${name} went offline. The agent can’t act on that machine until it’s back.`,
+          destructive: false,
+          actions: [
+            { id: 'review', label: 'Open Jarvis', primary: true },
+            { id: 'dismiss', label: 'Dismiss' },
+          ],
+        });
+      }, OFFLINE_NOTIFY_GRACE_MS);
+      timer.unref?.();
+      offlineNotifyTimers.set(id, timer);
+    });
+
+    // The user's choice from a notification. Only the approval buttons act on the
+    // brain (Approve/Deny, mirroring the dashboard endpoint); 'review'/'dismiss'
+    // are handled sidecar-side (it opened the app) so there's nothing to do here.
+    sidecarManager.onEvent((_sidecarId, event) => {
+      if (event.event_type !== 'notify.action') return;
+      void notificationApprovalDecision(event.payload, { approvalManager, deferredExecutor, wsService })
+        .catch((err) => console.error('[Daemon] notification approval decision failed:', err));
+    });
+
     // Wire authority engine into orchestrator
     const orchestrator = agentService.getOrchestrator();
     orchestrator.setAuthorityEngine(authorityEngine);
@@ -3314,6 +4907,9 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     orchestrator.setDeferredExecutor(deferredExecutor);
     orchestrator.setAuditTrail(auditTrail);
     orchestrator.setEmergencyController(emergencyController);
+    // Within a turn that read outside content, machine-changing actions
+    // stop for approval. The level itself is untouched.
+    orchestrator.setTaintGating(buildTaintGating(jarvisConfig.authority?.taint_gating));
 
     // Wire approval callback: when orchestrator needs approval, deliver to user
     orchestrator.setApprovalCallback((request) => {
@@ -3329,55 +4925,15 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     // Note: toolRegistry set after startAll() below
 
     // Wire channel approval handler
-    channelService.setApprovalHandler(async (action, shortId, channel) => {
-      const request = approvalManager.findByShortId(shortId);
-      if (!request) return `No pending approval found for ID ${shortId}`;
-
-      if (action === 'approve') {
-        const approved = approvalManager.approve(request.id, channel);
-        if (!approved) return 'Request already decided';
-        let reply: string;
-        if (approved.tool_name === 'request_approval' || approved.execution_mode === 'inline') {
-          // Intent-only and inline requests are executed by the blocked
-          // caller (request_approval tool / authority gate) once it sees
-          // the status flip — executing here would run the tool twice.
-          reply = 'Approved. The agent will continue and report back in chat.';
-        } else {
-          const result = await deferredExecutor.executeApproved(request.id);
-          reply = `Approved and executed. Result: ${result.slice(0, 200)}`;
-        }
-        const updated = approvalManager.getRequest(request.id);
-        if (updated) wsService.broadcastApprovalUpdate(updated);
-        return reply;
-      } else {
-        const denied = approvalManager.deny(request.id, channel);
-        if (!denied) return 'Request already decided';
-        deferredExecutor.recordDenial(denied);
-        wsService.broadcastApprovalUpdate(denied);
-        return `Denied: ${request.tool_name}`;
-      }
-    });
+    channelService.setApprovalHandler((action, shortId, channel) =>
+      channelApprovalReply(action, shortId, channel, { approvalManager, deferredExecutor, wsService }));
 
     console.log(`[Daemon] Authority engine initialized (governed: ${authorityEngine.getConfig().governed_categories.join(', ')})`);
 
     // 9. Ensure UI is built (auto-build if ui/dist is missing or empty)
-    const uiDistDir = path.join(import.meta.dir, '../../ui/dist');
-    const uiIndexPath = path.join(uiDistDir, 'index.html');
-    if (!existsSync(uiIndexPath)) {
-      logWithTimestamp('Dashboard UI not built — building automatically...');
-      const buildResult = Bun.spawnSync(['bun', 'run', 'build:ui'], {
-        cwd: path.join(import.meta.dir, '../..'),
-        stdout: 'pipe',
-        stderr: 'pipe',
-        env: { ...process.env },
-      });
-      if (buildResult.exitCode === 0) {
-        logWithTimestamp('Dashboard UI built successfully');
-      } else {
-        const stderr = buildResult.stderr.toString().trim();
-        console.warn(`[Daemon] UI build failed (dashboard may not load): ${stderr.slice(0, 200)}`);
-      }
-    }
+    const repoRoot = path.join(import.meta.dir, '../..');
+    const uiDistDir = path.join(repoRoot, 'ui', 'dist');
+    ensureUiBuilt(repoRoot, logWithTimestamp);
 
     // 9b. Set up API routes + dashboard static files
     const apiContext: import('./api-routes.ts').ApiContext & Record<string, unknown> = {
@@ -3396,8 +4952,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       awarenessService: null as any,
       goalService: undefined,
       sidecarManager,
+      settingsReload,
+      // Lets the hosted push bridge's doorbell poll on demand. `?? undefined`
+      // rather than a cast: when observers are not running there is genuinely
+      // nothing to sync, and the webhook says so.
+      observerService: observerService ?? undefined,
     };
-    setCorsOrigin(jarvisConfig.daemon.port);
+    setCorsOrigin(externalOrigin.httpOrigin);
+    wsService.getServer().setCorsOrigin(externalOrigin.httpOrigin);
 
     // Construct the workflow runtime's shared collaborators early so the
     // route table can carry a TriggerManager reference (used for cron /
@@ -3421,6 +4983,47 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     systemCron = new SystemCronService(sharedEventBus, jarvisConfig.cron);
     systemCron.start();
 
+    // Hosted usage warnings: three-quarters used, and used up, for each of the
+    // two windows the proxy enforces. Registered even on a self-hosted install
+    // — the reader answers null there, so the pass is a no-op and costs one
+    // config read every 15 minutes, which is cheaper than deciding whether to
+    // register it from a config that can change under SIGHUP.
+    const { UsageAlertsService } = await import('./usage-alerts-service.ts');
+    usageAlerts = new UsageAlertsService({
+      getConfig: () => jarvisConfig,
+      notify: notifyAll,
+      canNotify: () => sidecarManager.getConnectedSidecars().length > 0,
+    });
+    usageAlerts.start();
+    // A pass with no sidecar connected leaves its flags unset on purpose, so
+    // the warning survives — but it would then wait up to fifteen minutes for
+    // the next tick. Re-check as soon as a machine appears, which is exactly
+    // when someone is there to read it. The 60s reader cache makes a reconnect
+    // storm cost one upstream request, and the flags make a duplicate pass a
+    // no-op.
+    sidecarManager.onSidecarConnected(() => {
+      void usageAlerts?.check().catch(() => {});
+    });
+
+    // Prime the realtime plan verdict before anyone speaks. Realtime is now on
+    // by default for hosted tenants, so the gate decides for every hosted
+    // install — and with a cold cache GET /api/config/voice reports
+    // "available", which puts the browser into raw-PCM capture. On a plan
+    // WITHOUT realtime that first utterance is refused and its frames dropped,
+    // so the user speaks and nothing happens. One catalog request at boot
+    // removes it, and it is issued here — well before registry.startAll()
+    // binds any listener — so the dashboard's first poll already has a verdict.
+    const warmRealtime = () => warmRealtimeGateFor(() => {
+      const rtCfg = agentService.getConfig();
+      return resolveRealtimeVoice(rtCfg, realtimeEnablement(rtCfg));
+    });
+    warmRealtime();
+    // And again after every SIGHUP reload, which clears the verdict cache. A
+    // reload arriving BEFORE this line is registered simply has no warm; the
+    // miss-triggered fetch in cachedRealtimeVerdict covers that gap, which is
+    // why that fetch exists rather than warming being the only defence.
+    settingsReload.setWarmRealtime(warmRealtime);
+
     // Bootstrap the workflow engine: build/locate the bundle, compile pieces,
     // start the loopback SandboxApi, construct the EngineRuntime, extract the
     // canonical PieceCatalog. /v1/jarvis/* service backends are wired below
@@ -3442,11 +5045,15 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     // matching source; non-prefixed ids fall through to the `app_connection`
     // repo (encrypted at rest).
     const credentialResolver = new CredentialResolver();
-    if (googleAuth) {
+    {
+      // Registered unconditionally with a getter reading the live
+      // `googleAuth` binding: the settings hot-reload google applier
+      // reassigns it (connect mid-run, cred rotation, disconnect), and the
+      // source resolves to null while it's absent/unauthenticated.
       const { JarvisGoogleConnectionSource } = await import(
         "../workflows/credentials/google-source.ts"
       );
-      credentialResolver.register(new JarvisGoogleConnectionSource(googleAuth));
+      credentialResolver.register(new JarvisGoogleConnectionSource(() => googleAuth));
       logWithTimestamp(
         "Workflow credential resolver: registered jarvis:google source",
       );
@@ -3469,6 +5076,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         "Workflow credential resolver: registered jarvis:telegram source",
       );
     }
+    // Ready-made workflow-runtime artifact paths (workflows.engine_dir /
+    // pieces_dir / piece_metadata_cache, with ${version} expansion; env vars
+    // as fallback). Resolved ONCE and passed everywhere (bootstrap, Library
+    // routes, uninstall revert) so the whole daemon agrees on the paths.
+    const sharedRuntime = resolveSharedRuntimePaths(jarvisConfig);
+    for (const w of sharedRuntime.warnings) {
+      logWithTimestamp(`[shared-runtime] WARNING: ${w}`);
+    }
     try {
       engineBoot = await bootstrapWorkflowEngine({
         services: {
@@ -3490,6 +5105,18 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           },
         },
         log: (line) => console.log(`[Daemon] ${line}`),
+        engineIdleTtlMs: resolveEngineIdleTtlMs(jarvisConfig.workflows?.engineIdleTtlMs),
+        engineCacheRetention: resolveEngineCacheRetention({
+          ...(jarvisConfig.workflows?.engineCacheMaxBundles !== undefined
+            ? { maxBundles: jarvisConfig.workflows.engineCacheMaxBundles }
+            : {}),
+          ...(jarvisConfig.workflows?.engineCacheMaxAgeDays !== undefined
+            ? { maxAgeDays: jarvisConfig.workflows.engineCacheMaxAgeDays }
+            : {}),
+        }),
+        sharedPiecesDir: sharedRuntime.piecesDir,
+        sharedCacheFile: sharedRuntime.metadataCacheFile,
+        engineCacheRoot: sharedRuntime.engineCacheRoot,
       });
       workflowEngineShutdown = engineBoot.shutdown;
       logWithTimestamp(
@@ -3521,6 +5148,15 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     // so the `onPieceLibraryChanged` callback can call `upsert()` / `remove()`
     // after runtime installs.
     const workflowPieceCatalog = engineBoot?.catalog ?? null;
+    configureWorkflowReadiness({
+      pieces: workflowPieceCatalog ?? undefined,
+      credentials: credentialResolver,
+      tool: name => {
+        const tool = agentService.getOrchestrator().getToolRegistry()?.list().find(t => t.name === name);
+        return tool ? { params: Object.entries(tool.parameters).map(([name, param]) => ({ name, ...param })) } : null;
+      },
+      roles: () => new Set(agentService.getSpecialists().keys()),
+    });
     const workflowEngineRuntime = engineBoot?.runtime ?? null;
     const workflowSandboxApi = engineBoot?.api ?? null;
 
@@ -3530,6 +5166,12 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     // to direct event-bus subscription.
     triggerManager = new TriggerManager({
       eventBus: sharedEventBus,
+      onRegistrationBlocked: ({ runId, message }) => notifyAll({
+        id: `workflow-readiness:${runId}`, kind: 'workflow',
+        title: 'Workflow needs attention',
+        body: `A workflow could not start: ${message}. See its failed run for details.`,
+        actions: [{ id: 'review', label: 'Open Jarvis', primary: true }, { id: 'dismiss', label: 'Dismiss' }],
+      }),
       ...(workflowEngineRuntime ? { engineRuntime: workflowEngineRuntime } : {}),
     });
 
@@ -3547,6 +5189,11 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             kind: "installed" | "uninstalled";
             piece: { npmPackage: string; resolvedVersion: string };
           }) => {
+            // Only ever reached on a SELF-MANAGED install: the Library
+            // mutations that fire this are refused when a host owns the
+            // catalog, and a host owning the catalog is exactly what having a
+            // shared tree means. So an uninstall here has no shared copy to
+            // fall back to — the piece is simply gone.
             if (event.kind === "uninstalled") {
               workflowPieceCatalog.remove(event.piece.npmPackage);
               return;
@@ -3576,8 +5223,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         triggerManager,
         credentialResolver,
         ...(workflowPieceCatalog ? { pieceRegistry: workflowPieceCatalog } : {}),
+        sharedPiecesDir: sharedRuntime.piecesDir,
         ...(onPieceLibraryChanged ? { onPieceLibraryChanged } : {}),
         getEventBufferDropped: () => workflowEventBuffer.dropped(),
+        // Lets the editor's publish (version lock) report a step whose
+        // command can't run on any machine it could land on -- the one OS
+        // check a hand-drawn flow gets, since it never meets the composer.
+        // A thunk: sidecars enroll and report their OS long after boot.
+        executionTargets: () => collectExecutionTargets(),
       }),
     };
     wsService.setApiRoutes(apiRoutes);
@@ -3620,6 +5273,40 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       setNoLocalTools(true);
     }
 
+    // 9b-bis. What the generic file tools must know about this install
+    // (#522): the site projects dir, whose git internals they refuse --
+    // registered whether or not the site builder is on or starts, since old
+    // projects keep their .git and pre-#511 reflogs either way (same `~`
+    // expansion ProjectManager applies) -- and the dirs whose contents the
+    // daemon loads or runs, where a write is rated execute_command.
+    {
+      const { setSiteProjectsDir, setDaemonDataRoots } = await import('../actions/tools/file-path-policy.ts');
+      setSiteProjectsDir((jarvisConfig.sites?.projects_dir ?? '~/.jarvis/projects').replace(/^~/, os.homedir()));
+      // Where the keychain and the workflow key really are, which
+      // JARVIS_SECRETS_DIR can put outside every data dir. Resolved through the
+      // owning modules rather than recomputed, and tolerated failing: a read of
+      // a secret is refused by the policy's own env fallback either way, and a
+      // boot must not fail because a key file is unreadable (#528).
+      const secretsDirs: Array<string | null> = [];
+      try {
+        const { keychainDir } = await import('../vault/keychain.ts');
+        secretsDirs.push(keychainDir());
+      } catch { /* the policy falls back to JARVIS_SECRETS_DIR / JARVIS_HOME / ~/.jarvis */ }
+      // The workflow key is deliberately NOT resolved here. It lives in the same
+      // directory keychainDir() returns (both are JARVIS_SECRETS_DIR ||
+      // JARVIS_HOME || ~/.jarvis), and an explicit
+      // JARVIS_WORKFLOW_ENCRYPTION_KEY_FILE is read by the policy itself. Boot
+      // takes exactly one thing from encryption.ts -- the relocation -- so that
+      // a fresh install cannot plant a key a later restore could not replace,
+      // and encryption-key-path.test.ts pins that list.
+      setDaemonDataRoots({
+        // The engine bundle cache is under ~/.jarvis whatever the data dir.
+        dataDirs: [config.dataDir, path.join(os.homedir(), '.jarvis')],
+        codeRoots: [sharedRuntime.engineCacheRoot, sharedRuntime.piecesDir, sharedRuntime.metadataCacheFile],
+        secretsDirs,
+      });
+    }
+
     // 9b'. browser.local: false (system config) - never launch a local
     // Chrome on this machine. Hosted instances set this so no CDP port can
     // open on a shared VPS; browser actions route to a sidecar browser
@@ -3633,6 +5320,22 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     await registry.startAll();
 
     // 10a-post. Wire authority components that need running services
+    // Tool relevance filtering (docs/tool-relevance-filtering.md). Resolved
+    // once here from the SYSTEM-owned `tools:` config section plus
+    // JARVIS_TOOL_FILTER; absent config means OFF, and `=off` beats
+    // everything. Only the POLICY is frozen -- which model a tier resolves
+    // to is classified per call, because `llm` is hot-reloadable.
+    {
+      const { toolFilterPolicyFromConfig, setToolFilterPolicy } = await import('../actions/tools/tool-relevance/policy.ts');
+      const policy = toolFilterPolicyFromConfig(jarvisConfig);
+      setToolFilterPolicy(policy);
+      orchestrator.setToolFilterProviders(jarvisConfig.llm?.providers);
+      if (policy.enabled) {
+        console.warn('[Daemon] Tool relevance filtering is ON. It is default-off and '
+          + 'unbenchmarked; set JARVIS_TOOL_FILTER=off to disable.');
+      }
+    }
+
     const toolRegistry = orchestrator.getToolRegistry();
     if (toolRegistry) {
       deferredExecutor.setToolRegistry(toolRegistry);
@@ -3661,68 +5364,34 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // earlier in step 10.1) is in scope and refreshes happen on enable /
       // disable / publish / delete.
       const { createManageWorkflowTool } = await import('../actions/tools/manage-workflow.ts');
-      // Build a minimal piece-side LLM client + tool-registry shim for the
-      // composer. Both are tiny structural wrappers; we no longer need the
-      // legacy `JarvisLlmClient`/`JarvisToolRegistryAdapter` classes since
-      // the engine path is the production runtime.
+      // Build the composer's LLM client + a tool-registry shim. The client
+      // lives in its own module (composer-llm.ts) so the tier it runs on is a
+      // reviewable, testable decision rather than a line buried in boot.
       const llmManager = agentService.getLLMManager();
-      const composeLlm = {
-        async chat(input: { prompt: string; system?: string }): Promise<{ text: string }> {
-          const messages: Array<{ role: "system" | "user"; content: string }> = [];
-          if (input.system !== undefined) messages.push({ role: "system", content: input.system });
-          messages.push({ role: "user", content: input.prompt });
-          // Composer expects a complete JSON tree describing the flow.
-          // A realistic flow is 500-2000 output tokens; we ask for 8192
-          // to leave room for verbose pieces (long input schemas, many
-          // steps) without surprise truncation -- kept consistent with the
-          // chatTools cap below. Ollama's default `num_predict` is 128 --
-          // truncates every compose reply mid-JSON and crashes parsing with
-          // "Unexpected EOF". Other providers either have higher defaults or
-          // ignore the cap.
-          const reply = await llmManager.chat(messages, { max_tokens: 8192 });
-          // `LLMResponse.content` is the assistant-text field; an earlier
-          // version of this adapter read `reply.text` which doesn't
-          // exist on the provider response shape, so every compose
-          // returned "" and JSON.parse crashed with EOF. Stay strict
-          // here -- if the provider ever returns ContentBlock[] for
-          // text-only completions we want to know.
-          const content = typeof reply.content === "string" ? reply.content : "";
-          return { text: content };
-        },
-        // Tool-loop entrypoint: the composer discovers pieces via tools
-        // (list_pieces / get_piece_details / ...) instead of a full catalog
-        // dump. ComposerChatMessage / ComposerToolDef alias LLMMessage /
-        // LLMTool, so this is a passthrough. If the provider rejects the tools
-        // parameter, the composer catches the error and falls back to the
-        // one-shot `chat` path above. `finish_reason` is surfaced so the loop
-        // can detect a reply truncated at the token cap (a dropped submit_flow)
-        // rather than misreading it as prose.
-        async chatTools(
-          messages: ComposerChatMessage[],
-          tools: ComposerToolDef[],
-        ): Promise<ComposerChatReply> {
-          const reply = await llmManager.chat(messages, {
-            max_tokens: 8192,
-            tools,
-            tool_choice: 'auto',
-          });
-          return {
-            content: typeof reply.content === 'string' ? reply.content : '',
-            tool_calls: reply.tool_calls ?? [],
-            finish_reason: reply.finish_reason,
-          };
-        },
-      };
+      const composeLlm = createComposerLlmClient(llmManager);
       // Compact community-library index for the composer's search_library
       // tool: lets it suggest "install piece X first" when the user asks for
       // a service that isn't installed, instead of forcing a wrong fit.
+      //
+      // Withheld on a HOST-MANAGED install, where that suggestion is a
+      // dead end. The host installed the whole catalog, so every piece the
+      // engine could actually run is already in the registry list_pieces
+      // reads; the only ids this index could still flag "not installed" are
+      // ones whose metadata extraction failed on the host — which the tenant
+      // can neither install (the API answers 403) nor repair. Passing no
+      // library also strips search_library from the composer's tool loop and
+      // the suggest-install wording from both prompts, so the agent stops
+      // telling hosted users to visit a Library page that has no button.
       const { CATALOG: piecesLibraryCatalog } = await import('../workflows/pieces-library/catalog.ts');
-      const composerLibrary = piecesLibraryCatalog.map((e) => ({
-        id: e.id,
-        npmPackage: e.npmPackage,
-        displayName: e.displayName,
-        description: e.description,
-      }));
+      const { piecesManagedByHost } = await import('../workflows/pieces-library/shared.ts');
+      const composerLibrary = piecesManagedByHost(sharedRuntime.piecesDir)
+        ? []
+        : piecesLibraryCatalog.map((e) => ({
+            id: e.id,
+            npmPackage: e.npmPackage,
+            displayName: e.displayName,
+            description: e.description,
+          }));
       const composerToolRegistry = toolRegistry
         ? {
             listNames: (cat?: string) => toolRegistry.list(cat).map((t) => t.name),
@@ -3738,6 +5407,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
                   type: p.type,
                   required: p.required,
                   description: p.description,
+                  enum: p.enum,
                 })),
               })),
           }
@@ -3761,14 +5431,43 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             description: r.description,
           })),
         library: composerLibrary,
+        // Give the composer the machine inventory (sidecars + this host, each
+        // with its OS and arch) so it writes commands for the machine the step
+        // actually lands on. Without it the model guesses -- "open notepad"
+        // composed as `notepad.exe` for a fleet whose only machine is a Mac,
+        // failing on the first run. A thunk: sidecars enroll and report their
+        // OS long after this tool is built.
+        executionTargets: () => collectExecutionTargets(),
       });
       if (!toolRegistry.has('manage_workflow')) {
         toolRegistry.register(manageWorkflowTool);
         console.log('[Daemon] Registered manage_workflow tool');
       }
+      if (workflowPieceCatalog) {
+        const pieceRegistry = workflowPieceCatalog;
+        suggestionComposer = new SuggestionComposer(request => composePersistedFlow({
+          llm: composeLlm, pieceRegistry,
+          tools: composerToolRegistry?.listDetailed(),
+          specialistRoles: Array.from(agentService.getSpecialists().values()).map(r => ({
+            id: r.id, name: r.name, description: r.description,
+          })),
+          library: composerLibrary, executionTargets: collectExecutionTargets(),
+        }, request));
+        apiContext.suggestionComposer = suggestionComposer;
+        suggestionComposer.start();
+      }
     }
     approvalDelivery.setBroadcaster(wsService);
     approvalDelivery.setChannelSender(channelService);
+    channelService.setDeliveryFailureHandler(({ channel, attempts, error }) => {
+      // 'normal', not 'urgent': urgent notifications are echoed back to
+      // external channels, which would loop the failure into the channel
+      // that just failed. The dashboard is the fallback the user still has.
+      wsService.broadcastNotification(
+        `Could not deliver message to ${channel} after ${attempts} attempt(s): ${error}`,
+        'normal',
+      );
+    });
     deferredExecutor.setResultCallback((requestId, request, result) => {
       // Notify via WS and channels that an approved action was executed.
       // Skip for intent-only approvals — they have no deferred execution.
@@ -3806,6 +5505,8 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         authorityEngine,
         auditTrail,
         emergencyController,
+        approvalManager,
+        onWorkflowApproval: request => approvalDelivery.deliver(request),
         // Give the jarvis-ask piece the same Jarvis-flavoured system
         // prompt the chat agent uses, so workflow LLM calls answer as
         // Jarvis rather than as the bare base model. `"workflow"` is the
@@ -3815,13 +5516,22 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           agentService.buildFullSystemPromptParts("workflow", userMessage),
       });
       workflowSandboxApi.setServices(backends);
-      logWithTimestamp("Workflow engine service backends wired (llm/tools/notify/context/agent/events/workflows)");
+      logWithTimestamp("Workflow engine service backends wired (llm/tools/pieces/notify/context/agent/events/workflows)");
+
+      // Boot recovery retires interrupted workflows for reconciliation.
+      // Only other retryable job types can be re-queued automatically.
+      const recovered = recoverOrphanedJobs();
+      if (recovered > 0) logWithTimestamp(`Re-queued ${recovered} interrupted retryable job(s)`);
 
       const flowExecutor = new EngineFlowExecutor(workflowEngineRuntime);
       workflowWorker = new WorkflowWorker({
         handlers: { [RUN_FLOW]: createRunFlowHandler({ executor: flowExecutor }) },
       });
       workflowWorker.start();
+
+      // Resume TIMER waitpoints whose delay has elapsed (incl. during downtime).
+      timerScheduler = new TimerWaitpointScheduler();
+      timerScheduler.start();
     } else {
       console.warn("[Daemon] Workflow worker not started -- engine unavailable; queued RUN_FLOW jobs will pile up");
     }
@@ -3878,6 +5588,23 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // 10b. Background agent (needs LLM providers from agentService.start())
       const bgAgentService = new BackgroundAgentService(jarvisConfig, agentService.getLLMManager());
       bgAgentService.setResearchQueue(researchQueue);
+      // Same engine, approvals, audit and kill switch as the main agent, plus
+      // the background profile: this agent acts on ambient input (screen
+      // text, email snippets, clipboard) with no user turn, so anything that
+      // changes the machine stops for approval. Wired BEFORE start() so no
+      // reaction can ever run against an ungated orchestrator.
+      bgAgentService.setAuthority({
+        engine: authorityEngine,
+        profile: buildBackgroundProfile(jarvisConfig.authority?.background),
+        approvalManager,
+        auditTrail,
+        emergencyController,
+        onApprovalNeeded: (request) => {
+          approvalDelivery.deliver(request).catch(err =>
+            console.error('[Daemon] Background approval delivery error:', err)
+          );
+        },
+      });
       await bgAgentService.start();
       bgAgent = bgAgentService;
       console.log('[Daemon] Background agent started (separate browser for heartbeat/reactions)');
@@ -3885,6 +5612,8 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // 10c. Wire reactor + executor to background agent
       reactor.setAgentService(bgAgentService);
       executor.setAgentService(bgAgentService);
+      // Commitments parked on a background approval close from its outcome.
+      executor.setApprovalLookup((id) => approvalManager.getRequest(id));
 
       // 10d. Wire executor broadcast (needs wsServer running) and start
       executor.setBroadcast((msg) => wsService.getServer().broadcast(msg));
@@ -3925,8 +5654,8 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             } else {
               coalescer.addEvent(classified);
             }
-            // Broadcast to WebSocket clients
-            wsService.broadcastAwarenessEvent(event);
+            // Opportunity notifications use their durable outbox below.
+            if (!event.data.opportunityId) wsService.broadcastAwarenessEvent(event);
 
             // Republish onto the workflow event bus so flows with `on_event`
             // triggers (awareness.context_changed, awareness.suggestion_ready, etc.)
@@ -3943,7 +5672,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             sharedEventBus.publish(canonical, { ...event.data, _timestamp: event.timestamp });
 
             // Push suggestions as chat notifications + voice + desktop
-            if (event.type === 'suggestion_ready') {
+            if (event.type === 'suggestion_ready' && !event.data.opportunityId) {
               const title = String(event.data.title ?? '');
               const body = String(event.data.body ?? '');
               const text = `**${title}**\n${body}`;
@@ -3975,15 +5704,25 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
               if (errorText.length > 5) {
                 console.log(`[Daemon] Auto-researching error: "${errorText.slice(0, 80)}"`);
                 bgAgent.handleMessage(
-                  `The user is seeing this error in ${appName}: "${errorText}". ` +
+                  // `appName` is the active window's app name, which a web page
+                  // controls through document.title -- the same actor that
+                  // supplies the framed errorText below. Framing the error text
+                  // and interpolating the app name raw would leave an unframed
+                  // channel in the sentence that introduces the block, complete
+                  // with newlines to open headings of its own.
+                  `The user is seeing an error in ${inlineUntrusted(appName, 60)}. The error text, read from their screen:\n` +
+                  wrapUntrusted(errorText, 'screen text (OCR)') + '\n\n' +
                   `Search the web and vault for a solution. Be concise and actionable. ` +
                   `Start your response with the fix, not a question.`,
                   'awareness'
                 ).then(solution => {
                   if (solution && solution.length > 10) {
-                    const solutionText = `**Fix for error in ${appName}:**\n${solution.slice(0, 500)}`;
+                    // A turn that stopped on an approval request is not a fix yet.
+                    const awaiting = bgAgent?.lastTurnRequestedApproval() ?? false;
+                    const heading = awaiting ? `Needs your approval (error in ${appName})` : `Fix for error in ${appName}`;
+                    const solutionText = `**${heading}:**\n${solution.slice(0, 500)}`;
                     wsService.broadcastNotification(solutionText, 'urgent');
-                    sendDesktopNotification(`JARVIS: Fix for ${appName}`, solution.slice(0, 200), { urgency: 'critical', expireMs: 15000 });
+                    sendDesktopNotification(`JARVIS: ${heading}`, solution.slice(0, 200), { urgency: 'critical', expireMs: 15000 });
                     // Strip markdown for TTS — voice should sound natural
                     const voiceText = solution
                       .replace(/#{1,6}\s*/g, '')
@@ -3997,7 +5736,9 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
                       .slice(0, 300);
                     console.log(`[Daemon] Speaking error solution (${voiceText.length} chars): "${voiceText.slice(0, 80)}..."`);
                     wsService.broadcastProactiveVoice(
-                      `I found a fix for the error in ${appName}. ${voiceText}`
+                      awaiting
+                        ? `I need your approval to fix the error in ${appName}. ${voiceText}`
+                        : `I found a fix for the error in ${appName}. ${voiceText}`
                     ).then(() =>
                       console.log('[Daemon] Error solution TTS delivered')
                     ).catch(err =>
@@ -4020,16 +5761,22 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
               if (compositeScore >= 0.7 && (appCategory === 'code_editor' || appCategory === 'terminal')) {
                 console.log(`[Daemon] Deep-researching struggle in ${sAppName} (score: ${compositeScore.toFixed(2)})`);
                 bgAgent.handleMessage(
-                  `The user has been struggling in ${sAppName} (${appCategory}) for several minutes. ` +
-                  `Here's what's on their screen:\n"${ocrPreview.slice(0, 800)}"\n\n` +
+                  // Same reasoning as the error path above: both of these come
+                  // from observer event data, so both are labels inside trusted
+                  // prose rather than trusted text.
+                  `The user has been struggling in ${inlineUntrusted(sAppName, 60)} (${inlineUntrusted(appCategory, 40)}) for several minutes. ` +
+                  `Here's what's on their screen:\n` +
+                  wrapUntrusted(ocrPreview.slice(0, 800), 'screen text (OCR)') + '\n\n' +
                   `Search for solutions to any errors visible. Check documentation for the relevant language/framework. ` +
                   `Provide a specific, actionable fix. Start with the solution, not a question.`,
                   'awareness'
                 ).then(solution => {
                   if (solution && solution.length > 10) {
-                    const solutionText = `**Help for ${sAppName}:**\n${solution.slice(0, 500)}`;
+                    const awaiting = bgAgent?.lastTurnRequestedApproval() ?? false;
+                    const heading = awaiting ? `Needs your approval (${sAppName})` : `Help for ${sAppName}`;
+                    const solutionText = `**${heading}:**\n${solution.slice(0, 500)}`;
                     wsService.broadcastNotification(solutionText, 'urgent');
-                    sendDesktopNotification(`JARVIS: Help for ${sAppName}`, solution.slice(0, 200), { urgency: 'critical', expireMs: 15000 });
+                    sendDesktopNotification(`JARVIS: ${heading}`, solution.slice(0, 200), { urgency: 'critical', expireMs: 15000 });
                     const voiceText = solution
                       .replace(/#{1,6}\s*/g, '')
                       .replace(/\*{1,2}([^*]+)\*{1,2}/g, '$1')
@@ -4041,7 +5788,9 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
                       .trim()
                       .slice(0, 300);
                     wsService.broadcastProactiveVoice(
-                      `I found something that might help with what you're working on in ${sAppName}. ${voiceText}`
+                      awaiting
+                        ? `I need your approval to help with what you're working on in ${sAppName}. ${voiceText}`
+                        : `I found something that might help with what you're working on in ${sAppName}. ${voiceText}`
                     ).catch(err =>
                       console.error('[Daemon] Struggle solution TTS failed:', err instanceof Error ? err.message : err)
                     );
@@ -4055,17 +5804,23 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             // M16: Route awareness events to goal auto-detection
             if (goalService && (event.type === 'context_changed' || event.type === 'session_ended')) {
               try {
-                const { matchAwarenessToGoals, logAutoDetectedProgress } = require('../goals/awareness-bridge.ts');
-                const matches = matchAwarenessToGoals(event.data);
-                if (matches.length > 0) {
-                  logAutoDetectedProgress(matches, event.type);
-                }
+                const { recordGoalAwarenessActivity } = require('../goals/awareness-bridge.ts');
+                recordGoalAwarenessActivity(event);
               } catch (err) {
                 // Silently ignore — goal matching is best-effort
               }
             }
           },
-          googleAuth,
+          // Delegating wrapper (not the instance): the settings hot-reload
+          // google applier reassigns `googleAuth`, and the suggestion engine
+          // holds this reference for the service's whole lifetime.
+          {
+            isAuthenticated: () => googleAuth?.isAuthenticated() ?? false,
+            getAccessToken: () => {
+              if (!googleAuth) return Promise.reject(new Error('Google not configured'));
+              return googleAuth.getAccessToken();
+            },
+          },
           async (sidecarId: string, imagePath: string) => {
             try {
               const result = await sidecarManager.dispatchRPC(sidecarId, 'fetch_capture', { path: imagePath }) as
@@ -4109,7 +5864,17 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             if (offline > 0) {
               console.log(`[Daemon] Sidecar capture cleanup: skipped ${offline} offline sidecar(s); their files will be pruned on reconnect`);
             }
-          }
+          },
+          async suggestion => {
+            const channel = await deliverOpportunityNotification(suggestion, wsService.getServer(), channelService);
+            if (channel === 'websocket') {
+              sendDesktopNotification(`JARVIS: ${suggestion.title}`, suggestion.body, { urgency: 'normal' });
+              wsService.broadcastProactiveVoice(suggestion.body).catch(err =>
+                console.error('[Daemon] Awareness TTS error:', err)
+              );
+            }
+            return channel;
+          },
         );
         await svc.start();
         awarenessService = svc;
@@ -4146,30 +5911,11 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             });
         });
 
-        // Auto-launch overlay widget (non-blocking, best-effort)
-        if (jarvisConfig.awareness?.overlay_autolaunch !== false && jarvisConfig.browser?.local !== false) {
-          try {
-            const overlayUrl = `http://localhost:${config.port}/overlay`;
-            const browsers = ['chromium-browser', 'chromium', 'google-chrome', 'google-chrome-stable'];
-            for (const browser of browsers) {
-              const which = Bun.spawnSync(['which', browser]);
-              if (which.exitCode === 0) {
-                Bun.spawn([
-                  browser,
-                  `--app=${overlayUrl}`,
-                  '--window-size=300,320',
-                  '--window-position=20,20',
-                  '--no-sandbox',
-                  '--disable-extensions',
-                  '--disable-gpu',
-                  `--user-data-dir=${path.join(config.dataDir, 'browser', 'overlay-profile')}`,
-                ], { stdout: 'ignore', stderr: 'ignore' });
-                console.log(`[Daemon] Awareness overlay launched (${browser})`);
-                break;
-              }
-            }
-          } catch (err) { console.warn('[Daemon] Awareness overlay failed (non-fatal):', err instanceof Error ? err.message : err); }
-        }
+        // (Removed) The old-dashboard awareness overlay widget used to
+        // auto-launch a Chromium window pointed at /overlay. It connected as a
+        // WebSocket client, which made the daemon's proactive TTS play THROUGH
+        // it — talking over the native pebble's realtime voice. The native
+        // pebble is the awareness surface now, so the overlay is gone.
       } catch (err) {
         console.error('[Daemon] Awareness service failed to start:', err instanceof Error ? err.message : err);
         // Non-fatal — daemon continues without awareness
@@ -4201,7 +5947,19 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           max_concurrent_servers: 3,
         };
         const siteBuilderService = new SiteBuilderService(sitesConfig);
+        // Site projects stay uploadable even inside the data dir (#521).
+        (await import('../actions/browser/upload-policy.ts')).registerSiteProjectsDir(sitesConfig.projects_dir);
         await siteBuilderService.start();
+        // --no-local-tools keeps the general tools off this host; the site
+        // builder is deliberately outside it (projects live here, and
+        // site_run_command, scaffolding and `make dev` run their code here).
+        // Say so, since the flag reads as if nothing runs locally.
+        // Documented in docs/SELF_HOSTING.md.
+        if (config.noLocalTools) {
+          console.warn('[Daemon] --no-local-tools is set, but the site builder is enabled: site projects are built and run '
+            + 'on THIS host (site_run_command, scaffolding, make dev). Set sites.enabled: false if this host must not run '
+            + 'model-written code.');
+        }
         apiContext.siteBuilderService = siteBuilderService;
         registry.register(siteBuilderService);
 
@@ -4229,9 +5987,9 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     // 10b. (legacy workflow engine deleted; the new runtime initialized above
     //       in step 10.1 owns all workflow execution.)
 
-    // 10f. Goal Service (M16)
+    // 10f. Goal service and durable event recovery, even when autonomous rhythms are disabled.
     const goalsConfig = jarvisConfig.goals;
-    if (goalsConfig?.enabled !== false) {
+    {
       try {
         const { GoalService } = await import('../goals/service.ts');
         const goalSvc = new GoalService(goalsConfig ?? {
@@ -4257,7 +6015,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         // Register manage_goals tool for chat agent
         try {
           const goalToolRegistry = orchestrator.getToolRegistry();
-          if (goalToolRegistry) {
+          if (goalToolRegistry && goalsConfig?.enabled !== false) {
             const { createManageGoalsTool } = await import('../actions/tools/goals.ts');
             const { NLGoalBuilder } = await import('../goals/nl-builder.ts');
             const { GoalEstimator } = await import('../goals/estimator.ts');
@@ -4266,7 +6024,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             const llm = agentService.getLLMManager();
             const style = goalsConfig?.accountability_style ?? 'drill_sergeant';
             const escWeeks = goalsConfig?.escalation_weeks ?? { pressure: 1, root_cause: 3, suggest_kill: 4 };
-            const goalNlBuilder = new NLGoalBuilder(llm);
+            const goalNlBuilder = new NLGoalBuilder(llm, { timezone: jarvisConfig.timezone });
             const goalEstimator = new GoalEstimator(llm);
             const goalRhythm = new DailyRhythm(llm, style);
             const goalAccountability = new AccountabilityEngine(llm, style, escWeeks);
@@ -4281,7 +6039,6 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             console.log('[Daemon] manage_goals tool registered for chat agent');
 
             // Wire DailyRhythm + chat delivery into GoalService for proactive reminders
-            goalRhythm.setEventCallback((event) => wsService.broadcastGoalEvent(event));
             goalSvc.setRhythm(goalRhythm);
             goalSvc.setChatCallback((text) => wsService.broadcastHeartbeat(text));
           }
@@ -4289,7 +6046,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           console.error('[Daemon] Failed to register manage_goals tool:', err instanceof Error ? err.message : err);
         }
 
-        console.log('[Daemon] Goal service started (autonomous goal pursuit)');
+        console.log('[Daemon] Goal application ready; autonomous rhythms', goalsConfig?.enabled === false ? 'disabled' : 'enabled');
       } catch (err) {
         console.error('[Daemon] Goal service failed to start:', err instanceof Error ? err.message : err);
         // Non-fatal — daemon continues without goals
@@ -4322,9 +6079,19 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     };
     const observerWarnedTypes = new Set<string>();
 
+    // Recorder events carry the committed value of the field the person just
+    // typed into. They are consumed by the recorder listener alone; a
+    // dashboard broadcast or a coalescer slot would bypass its redaction.
+    const recorderEventTypes = ['ui_interaction', 'ui_recording'];
+    // Self-update progress is bookkeeping the sidecar manager records on the
+    // connection (surfaced through /api/sidecars); it is not an observation.
+    const internalSidecarEventTypes = ['update_progress'];
+
     sidecarManager.onEvent((sidecarId, event) => {
       // Skip events already routed to awareness service to avoid double processing
       if (awarenessService && awarenessEventTypes.includes(event.event_type)) return;
+      if (recorderEventTypes.includes(event.event_type)) return;
+      if (internalSidecarEventTypes.includes(event.event_type)) return;
 
       const payloadObj: Record<string, unknown> =
         typeof event.payload === 'object' && event.payload !== null
@@ -4446,6 +6213,28 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
 process.on('SIGINT', () => handleShutdown('SIGINT'));
 process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
+// SIGHUP = reload settings from the DB (daemon convention). Covers settings
+// edited outside the daemon process (sqlite3 CLI, hosted control plane);
+// same path as POST /api/config/reload. Registering the handler also stops
+// the default terminate-on-HUP, which is what we want for a daemon.
+if (process.platform !== 'win32') {
+  process.on('SIGHUP', () => {
+    if (!settingsReload) {
+      console.log('[Daemon] SIGHUP received before boot finished — ignoring');
+      return;
+    }
+    console.log('[Daemon] SIGHUP — reloading settings from DB');
+    settingsReload.reloadAll()
+      .then((r) => {
+        const changed = r.changed.length > 0 ? r.changed.join(', ') : 'nothing';
+        console.log(`[Daemon] SIGHUP reload done — changed: ${changed}${r.errors.length ? `, errors: ${r.errors.length}` : ''}`);
+        // The pebble realtime re-advertisement runs inside reloadAll's
+        // post-reload hook, shared with POST /api/config/reload.
+      })
+      .catch((err) => console.error('[Daemon] SIGHUP reload failed:', err));
+  });
+}
+
 // Handle uncaught errors
 process.on('uncaughtException', (error) => {
   console.error('[Daemon] Uncaught exception:', error);
@@ -4453,7 +6242,16 @@ process.on('uncaughtException', (error) => {
 });
 
 process.on('unhandledRejection', (reason) => {
-  const msg = reason instanceof Error ? reason.message : String(reason);
+  // Guarded: a rejection value whose `message` getter or `toString` throws would
+  // otherwise throw HERE, before the fatal exit is armed. (It would come back as
+  // an uncaughtException, so the status would still be non-zero, but this path
+  // is the one the daemon is supposed to leave through.)
+  let msg: string;
+  try {
+    msg = reason instanceof Error ? reason.message : String(reason);
+  } catch {
+    msg = '<rejection value could not be described>';
+  }
 
   // Browser timeouts and CDP errors should NOT crash the daemon
   if (msg.includes('Timeout waiting for') || msg.includes('CDP')) {

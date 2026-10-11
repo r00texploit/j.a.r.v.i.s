@@ -13,17 +13,24 @@ import (
 )
 
 // panelSharedLoop is true on platforms where one process-wide native run loop,
-// owned elsewhere (the macOS tray's [NSApp run]), services every panel window.
+// owned elsewhere, services every panel window: the macOS tray's [NSApp run],
+// and on Linux the GTK main loop the pebble overlays run (gtk_main_linux.go).
 // There, panels must NOT start their own loop and every window/webview mutation
-// must be marshalled onto that loop's thread (the main thread). On Windows/Linux
-// each panel goroutine owns its window and runs its own loop, so this is false.
-const panelSharedLoop = runtime.GOOS == "darwin"
+// must be marshalled onto that loop's thread. On Linux that is not optional: a
+// panel running its own gtk_main beside the overlays' put two threads inside
+// GTK and crashed the sidecar as the window opened. On Windows each panel
+// goroutine owns its window and runs its own loop, so this is false.
+const panelSharedLoop = runtime.GOOS == "darwin" || runtime.GOOS == "linux"
 
 // uiSync runs fn on the thread that owns the panel windows and blocks until it
-// finishes. On shared-loop platforms (macOS) that's the main thread, reached via
-// the webview's main-queue dispatch; elsewhere the caller already owns the
-// window so fn runs inline.
+// finishes. On shared-loop platforms that's the loop's thread: Linux reaches it
+// through gtkInvokeSync (runOnSharedUIThread, inline when already there), macOS
+// through the webview's main-queue dispatch. On Windows the caller already owns
+// the window so fn runs inline.
 func uiSync(wv webview.WebView, fn func()) {
+	if panelSharedLoop && runOnSharedUIThread(fn) {
+		return
+	}
 	if !panelSharedLoop || wv == nil {
 		fn()
 		return
@@ -39,15 +46,19 @@ func uiSync(wv webview.WebView, fn func()) {
 // panelImpl wraps a single webview window and the channel used to control it.
 type panelImpl struct {
 	spec       PanelSpec
-	wvVal      atomic.Value    // webview.WebView; set once by the runner goroutine, read by close-watcher / hotkey / service methods
-	ready      chan struct{}   // closed once wv is set + flags applied
-	done       chan struct{}   // closed when Run() returns
-	following  atomic.Bool     // when true, cursor-tracker actively moves window
-	followStop chan struct{}   // closed by Close()/Stop() to halt the tracker
-	hotkeyStop func()          // unregister + stop the hotkey listener
-	// macOS shared-loop teardown: uiClosed is closed (once) when the window is
-	// gone so the spawn goroutine, which does not run its own loop there, can
-	// return. Unused on Windows/Linux (those block in wv.Run()).
+	wvVal      atomic.Value  // webview.WebView; set once by the runner goroutine, read by close-watcher / hotkey / service methods
+	ready      chan struct{} // closed once wv is set + flags applied
+	done       chan struct{} // closed when Run() returns
+	following  atomic.Bool   // when true, cursor-tracker actively moves window
+	followStop chan struct{} // closed by Close()/Stop() to halt the tracker
+	hotkeyStop func()        // unregister + stop the hotkey listener
+	// createFailed is set, before ready is closed, when the webview could not
+	// be created, so Spawn can report the failure instead of an id for a window
+	// that will never exist. Read only after <-ready.
+	createFailed bool
+	// Shared-loop teardown (macOS, Linux): uiClosed is closed (once) when the
+	// window is gone so the spawn goroutine, which does not run its own loop
+	// there, can return. Unused on Windows (it blocks in wv.Run()).
 	uiClosed    chan struct{}
 	uiCloseOnce sync.Once
 }
@@ -80,17 +91,68 @@ func NewPanelService() PanelService {
 	return &panelService{reg: newPanelRegistry()}
 }
 
+// spawnReadyWait bounds how long Spawn waits for a new window to be created (or
+// fail) before answering. WebView2's first environment in a login session can
+// take several seconds, and the answer matters: it is how the brain learns
+// whether its first-run dashboard really opened.
+const spawnReadyWait = 10 * time.Second
+
+// deleteIf removes id's entry only while it still belongs to handle, so a panel
+// tearing down late cannot remove a newer panel that has since taken its id.
+func (r *panelRegistry) deleteIf(id PanelID, handle any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.entries[id]; ok && e.handle == handle {
+		delete(r.entries, id)
+	}
+}
+
 func (s *panelService) Spawn(spec PanelSpec) (PanelID, error) {
 	if err := validateSpec(spec); err != nil {
 		return "", err
 	}
 	spec = resolveSpec(spec)
+	// Waiting out a same-id panel below gets half the budget, and this panel's
+	// own creation still gets all of spawnReadyWait afterwards: a creation that
+	// started late must not be reported as opened just because the wait before it
+	// used up the time. Both together (plus the panel token mint in the RPC
+	// handler) stay well inside the brain's RPC timeout.
+	deadline := time.Now().Add(spawnReadyWait / 2)
 
 	s.mu.Lock()
 	if !spec.MultiInstance {
-		if _, exists := s.reg.get(spec.ID); exists {
+		// A same-id panel that is still being created is waited out, bounded,
+		// before answering. Two opens of the dashboard can race (the brain's
+		// first-run intro and the sidecar's own open-at-startup), and answering
+		// "panel already exists" while the other creation is still running would
+		// tell the loser the dashboard is up even when that creation then fails.
+		// A failed creation removes its entry before it signals ready, so the
+		// re-check sees the truth; with several waiters, the first to wake
+		// creates and the rest wait on that creation in turn.
+		for {
+			e, exists := s.reg.get(spec.ID)
+			if !exists {
+				break
+			}
+			pending, creating := e.handle.(*panelImpl)
+			if creating {
+				select {
+				case <-pending.ready:
+					creating = false
+				default:
+				}
+			}
+			remaining := time.Until(deadline)
+			if !creating || remaining <= 0 {
+				s.mu.Unlock()
+				return spec.ID, formatPanelError("spawn", spec.ID, ErrPanelExists)
+			}
 			s.mu.Unlock()
-			return spec.ID, formatPanelError("spawn", spec.ID, ErrPanelExists)
+			select {
+			case <-pending.ready:
+			case <-time.After(remaining):
+			}
+			s.mu.Lock()
 		}
 	}
 	impl := &panelImpl{
@@ -114,7 +176,38 @@ func (s *panelService) Spawn(spec PanelSpec) (PanelID, error) {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
-		defer s.reg.delete(spec.ID)
+		// Windows owns the loop and Destroys the webview after Run()
+		// returns. Declared FIRST so defer LIFO runs it LAST: hotkey teardown,
+		// follower shutdown, close(impl.done), and registry removal all happen
+		// before the engine is freed — with Destroy first (the old order), the
+		// still-registered summon hotkey could Dispatch into freed memory, and
+		// a Close()/reopen could reach the dead entry. The delayShow reveal
+		// timer and the close watcher are joined here too, for the same reason
+		// (same fix as webview_reveal.go's stop). On the shared-loop platforms
+		// the window closes under a loop this goroutine does not run. On macOS
+		// webview's own on_window_will_close dispatch still references the
+		// engine, so destroying it here frees the engine out from under it ->
+		// use-after-free crash. On Linux ~gtk_webkit_engine pumps the GTK loop
+		// from the calling thread, which is the two-threads-in-GTK crash again.
+		// Leak the engine there instead (the timer and watcher are joined
+		// either way). That is not always rare: the Linux palette opens and
+		// closes on every Ctrl+K and leaks one small engine each time. TODO:
+		// reclaim it, e.g. Destroy on the loop's thread after the destroy
+		// signal, where the engine's own loop pump is a legal nested iteration.
+		// wv/stopReveal/stopCloseWatch are populated later; they stay nil/no-op
+		// on the webview.New failure path.
+		var wv webview.WebView
+		stopReveal := func() {}
+		stopCloseWatch := func() {}
+		defer func() {
+			stopCloseWatch()
+			stopReveal()
+			if wv != nil && !panelSharedLoop {
+				wv.Destroy()
+			}
+		}()
+
+		defer s.reg.deleteIf(spec.ID, impl)
 		defer close(impl.done)
 		defer func() {
 			// idempotent close — guard against double-close panic if
@@ -130,24 +223,16 @@ func (s *panelService) Spawn(spec PanelSpec) (PanelID, error) {
 
 		log.Printf("[panels] spawn(%s): creating webview", spec.ID)
 		debug := false
-		wv := webview.New(debug)
+		wv = newPanelWebview(debug)
 		if wv == nil {
-			log.Printf("[panels] spawn(%s): webview.New returned nil — WebView2 runtime missing?", spec.ID)
+			log.Printf("[panels] spawn(%s): could not create the webview — no display, webview runtime missing, or its init failed", spec.ID)
+			impl.createFailed = true
+			// Free the id before signalling, so whoever reads the failure (this
+			// Spawn, or a same-id Spawn waiting on it) can create it again at once.
+			s.reg.deleteIf(spec.ID, impl)
 			close(impl.ready)
 			return
 		}
-		// Windows/Linux own the loop and Destroy the webview safely after Run()
-		// returns. On macOS (shared loop) the window closes under the tray's
-		// [NSApp run], but pending webview callbacks still reference the engine
-		// (the delayShow reveal-timeout goroutine, webview's own
-		// on_window_will_close dispatch); destroying it here frees the engine out
-		// from under them -> use-after-free crash. Leak the engine on macOS
-		// instead (panels open rarely). TODO: cancellable teardown to reclaim.
-		defer func() {
-			if !panelSharedLoop {
-				wv.Destroy()
-			}
-		}()
 		impl.setWV(wv)
 		log.Printf("[panels] spawn(%s): webview created", spec.ID)
 
@@ -156,16 +241,26 @@ func (s *panelService) Spawn(spec PanelSpec) (PanelID, error) {
 		// so it appears fully-formed instead of showing the empty webview that
 		// fills + resizes as it loads). Fullscreen / cursor-follow panels (the
 		// transparent overlays) must be visible from the start, so they opt out.
-		// All window/webview setup below touches AppKit/WebKit objects, which on
-		// the shared-loop platform (macOS) must run on the main thread. uiSync
-		// marshals the whole sequence there and blocks until done; on
-		// Windows/Linux it runs inline on this goroutine. earlyHandle/handle/
+		// All window/webview setup below touches AppKit/GTK/WebKit objects,
+		// which on the shared-loop platforms must run on that loop's thread (the
+		// main thread on macOS, the GTK main loop's on Linux). uiSync marshals
+		// the whole sequence there and blocks until done; on Windows it runs
+		// inline on this goroutine. earlyHandle/handle/
 		// delayShow are hoisted because later goroutines (follow, bounds, close
 		// watcher) read them.
 		var earlyHandle, handle unsafe.Pointer
 		var delayShow bool
 		uiSync(wv, func() {
 			earlyHandle = wv.Window()
+			if earlyHandle == nil && panelSharedLoop {
+				// Shared loop: the window was destroyed between its creation and
+				// this setup (a Close() or the user's close button got there
+				// first), and the engine's calls below would each hit a null
+				// window. Nothing to set up; end the panel.
+				log.Printf("[panels] spawn(%s): window closed before setup", spec.ID)
+				impl.uiCloseOnce.Do(func() { close(impl.uiClosed) })
+				return
+			}
 			delayShow = !spec.Fullscreen && !spec.FollowCursor && earlyHandle != nil
 			if delayShow {
 				_ = platformSetWindowVisible(earlyHandle, false)
@@ -256,7 +351,25 @@ func (s *panelService) Spawn(spec PanelSpec) (PanelID, error) {
 				// window (its SetWindowPos uses SWP_SHOWWINDOW for always-on-top).
 				_ = platformSetWindowVisible(earlyHandle, false)
 				var panelShown atomic.Bool
+				var revealStopped atomic.Bool
 				showPanel := func() {
+					if revealStopped.Load() {
+						return // teardown won the race; the handle may be dead
+					}
+					select {
+					case <-impl.uiClosed:
+						// Shared loop: the window already closed under it.
+						// uiClosed is closed ON THE LOOP'S THREAD (inside the
+						// will-close notification on macOS, the destroy signal
+						// on Linux), so a reveal closure queued behind it
+						// reliably sees this and bails —
+						// otherwise it would re-show and focus the closed
+						// (frameless, registry-deleted) panel as an
+						// unreachable zombie. revealStopped can't cover this:
+						// the spawn goroutine sets it only after it wakes.
+						return
+					default:
+					}
 					if panelShown.CompareAndSwap(false, true) {
 						_ = platformSetWindowVisible(earlyHandle, true)
 						_ = platformFocusWindow(earlyHandle)
@@ -268,25 +381,89 @@ func (s *panelService) Spawn(spec PanelSpec) (PanelID, error) {
 					`if(document.readyState==='complete'){setTimeout(r,120);}` +
 					`else{window.addEventListener('load',function(){setTimeout(r,120);});}}catch(e){}})();`)
 				_ = wv.Bind("__sidecar_panel_ready", func() { showPanel() })
+				// Timeout fallback, cancellable: stopReveal (joined by the defer
+				// above before Destroy) keeps the Dispatch CALL off a freed
+				// engine, and revealStopped keeps an already-queued closure off
+				// a dead window handle (GTK idle sources survive gtk_main_quit).
+				revealDone := make(chan struct{})
+				revealFinished := make(chan struct{})
 				go func() {
-					time.Sleep(6 * time.Second)
-					if wv := impl.loadWV(); wv != nil {
+					defer close(revealFinished)
+					select {
+					case <-time.After(6 * time.Second):
 						wv.Dispatch(func() { showPanel() })
+					case <-revealDone:
 					}
 				}()
+				var stopOnce sync.Once
+				stopReveal = func() {
+					stopOnce.Do(func() {
+						revealStopped.Store(true)
+						close(revealDone)
+					})
+					<-revealFinished
+				}
+			}
+
+			// Log why a page failed to load, so a refused or unreachable load
+			// leaves a reason in sidecar.log instead of only a blank window.
+			// macOS only (panels_loadfail_darwin.go); a no-op elsewhere.
+			installPanelLoadFailureLog(wv, spec.ID)
+
+			// Send the dashboard's window.open / target=_blank OAuth "connect"
+			// flows to the system browser instead of a nested embedded window
+			// (Google/Clerk refuse OAuth inside an embedded webview). Installed
+			// on the UI thread before the first navigation. No-op where
+			// unsupported; failures leave the old behaviour, never break the panel.
+			if installPanelExternalNav(wv) {
+				// Tell the page, because it cannot tell on its own and the
+				// difference matters to what it says next.
+				//
+				// The handler opens the URL in the system browser and returns
+				// no view, which is what window.open evaluating to null means
+				// here -- indistinguishable from a blocked popup. The dashboard
+				// reads null as failure and prints "open this link yourself",
+				// which is wrong the moment we DID open it, and is the more
+				// confusing half of the bug: the browser comes up and the page
+				// still tells you it didn't.
+				//
+				// Set before the first Navigate and re-injected on every
+				// navigation (Init), so a page that reads it during module init
+				// sees it.
+				wv.Init("window.__jarvisOpensExternally = true;")
 			}
 
 			if spec.URL != "" {
 				wv.Navigate(spec.URL)
 				log.Printf("[panels] spawn(%s): navigated to %s", spec.ID, redactPanelURL(spec.URL))
 			}
+
+			// Shared-loop platforms (macOS, Linux): panels don't run their own
+			// loop, so we can't rely on wv.Run() returning when the window
+			// closes. Observe the window's close to signal teardown (clears the
+			// registry so a reopen makes a fresh window instead of focusing the
+			// destroyed one). Registered here, on the loop's thread, so a close
+			// handled by the loop cannot slip in before the watch exists. No-op
+			// on Windows.
+			registerPanelCloseWatch(handle, impl)
 		})
 
-		// macOS: panels don't run their own loop, so we can't rely on wv.Run()
-		// returning when the window closes. Observe the window's close to signal
-		// teardown (clears the registry so a reopen makes a fresh window instead
-		// of focusing the destroyed one). No-op on Windows/Linux.
-		registerPanelCloseWatch(handle, impl)
+		if panelSharedLoop && earlyHandle == nil {
+			// Setup found the window already gone and ended the panel. Skip the
+			// hotkey grab and the follow/bounds/close watchers it would only tear
+			// straight back down, and report the close like any other. The id is
+			// freed before ready is signalled, so a same-id Spawn waiting on this
+			// one creates a new window instead of hearing "panel already exists".
+			s.reg.deleteIf(spec.ID, impl)
+			close(impl.ready)
+			s.mu.Lock()
+			closedCb := s.closedCb
+			s.mu.Unlock()
+			if closedCb != nil {
+				closedCb(spec.ID)
+			}
+			return
+		}
 
 		// Global summon hotkey: toggles cursor-follow and dispatches a JS
 		// callback in the page so the user can summon/dismiss from any app.
@@ -317,10 +494,10 @@ func (s *panelService) Spawn(spec PanelSpec) (PanelID, error) {
 			}
 			stop, err := startHotkeyListener(spec.SummonHotkey, onFire)
 			if err != nil {
-				log.Printf("[panels] spawn(%s): hotkey '%s' not registered: %v", spec.ID, spec.SummonHotkey, err)
+				log.Printf("[panels] spawn(%s): hotkey %q not registered: %v", spec.ID, spec.SummonHotkey, err)
 			} else {
 				impl.hotkeyStop = stop
-				log.Printf("[panels] spawn(%s): summon hotkey '%s' registered", spec.ID, spec.SummonHotkey)
+				log.Printf("[panels] spawn(%s): summon hotkey %q registered", spec.ID, spec.SummonHotkey)
 			}
 		}
 
@@ -367,7 +544,9 @@ func (s *panelService) Spawn(spec PanelSpec) (PanelID, error) {
 						// apps activating don't bury us. In non-fullscreen
 						// mode platformMoveWindow already does this per frame.
 						if fullscreen {
-							_ = platformReassertTopmost(panelHandle)
+							_ = withFollowedWindow(wv, panelHandle, func(h unsafe.Pointer) error {
+								return platformReassertTopmost(h)
+							})
 						}
 					case <-ticker.C:
 						if fullscreen {
@@ -388,7 +567,10 @@ func (s *panelService) Spawn(spec PanelSpec) (PanelID, error) {
 						targetY := float64(y + oy)
 						curX += (targetX - curX) * followFactor
 						curY += (targetY - curY) * followFactor
-						_ = platformMoveWindow(panelHandle, int(curX), int(curY))
+						moveX, moveY := int(curX), int(curY)
+						_ = withFollowedWindow(wv, panelHandle, func(h unsafe.Pointer) error {
+							return platformMoveWindow(h, moveX, moveY)
+						})
 					}
 				}
 			}()
@@ -456,11 +638,21 @@ func (s *panelService) Spawn(spec PanelSpec) (PanelID, error) {
 		// panel can't be reopened. Watch the HWND; when it's destroyed, force the
 		// loop to return so cleanup runs. No-op on platforms where
 		// platformWindowAlive can't probe the handle.
+		//
+		// Joined (stopCloseWatch, in the Destroy defer) before the engine is
+		// freed: teardown closes impl.done only AFTER Destroy (defer LIFO), so
+		// the done check alone leaves a gap where a tick could see the window
+		// dead, pass the check, and Dispatch into freed memory.
+		watchStop := make(chan struct{})
+		watchFinished := make(chan struct{})
 		go func() {
+			defer close(watchFinished)
 			t := time.NewTicker(250 * time.Millisecond)
 			defer t.Stop()
 			for {
 				select {
+				case <-watchStop:
+					return // teardown is joining us
 				case <-impl.done:
 					return
 				case <-t.C:
@@ -468,12 +660,14 @@ func (s *panelService) Spawn(spec PanelSpec) (PanelID, error) {
 						continue
 					}
 					select {
+					case <-watchStop:
+						return // teardown is joining us
 					case <-impl.done:
 						return // already tearing down (webview terminated it)
 					default:
 						if panelSharedLoop {
-							// macOS: the window is gone, but the shared [NSApp run]
-							// loop must keep running for the tray + other panels.
+							// Shared loop: the window is gone, but the loop must
+							// keep running for the tray/overlays + other panels.
 							// Signal the spawn goroutine instead of terminating.
 							impl.uiCloseOnce.Do(func() { close(impl.uiClosed) })
 						} else if wv := impl.loadWV(); wv != nil {
@@ -486,13 +680,19 @@ func (s *panelService) Spawn(spec PanelSpec) (PanelID, error) {
 				}
 			}
 		}()
+		var watchOnce sync.Once
+		stopCloseWatch = func() {
+			watchOnce.Do(func() { close(watchStop) })
+			<-watchFinished
+		}
 
 		close(impl.ready)
 		if panelSharedLoop {
-			// macOS: the tray owns the single process-wide [NSApp run] loop and
-			// services this window. Starting our own loop here would nest
-			// [NSApp run] on a background goroutine (illegal). Just block until
-			// the window closes — the close watcher / Close() signals uiClosed.
+			// Shared loop: the macOS tray's [NSApp run], or the Linux GTK main
+			// loop, services this window. Starting our own loop here would nest
+			// [NSApp run] on a background goroutine (illegal) or run a second
+			// gtk_main on another thread (a crash inside GTK). Just block until
+			// the window closes — the close watch / Close() signals uiClosed.
 			log.Printf("[panels] spawn(%s): attached to shared run loop", spec.ID)
 			<-impl.uiClosed
 			log.Printf("[panels] spawn(%s): window closed", spec.ID)
@@ -509,12 +709,21 @@ func (s *panelService) Spawn(spec PanelSpec) (PanelID, error) {
 		}
 	}()
 
-	// Wait briefly for the window to become ready so the caller knows it
-	// either started or failed without holding the RPC connection too long.
+	// Wait for the window to become ready so the caller knows it either started
+	// or failed. RPC handlers run on their own goroutines, so this holds up only
+	// the caller, never the connection.
 	select {
 	case <-impl.ready:
-	case <-time.After(2 * time.Second):
-		// Continue anyway — webview may take longer on slow systems.
+		if impl.createFailed {
+			// Say so. Reporting the id of a window that will never exist told
+			// the brain its first-run dashboard had opened, and it never tried
+			// again.
+			return spec.ID, formatPanelError("spawn", spec.ID, fmt.Errorf("could not create the window"))
+		}
+	case <-time.After(spawnReadyWait):
+		// Still being created after spawnReadyWait: answer with the id. A
+		// failure after this point is logged by the spawn goroutine but not
+		// reported to this caller.
 	}
 
 	return spec.ID, nil
@@ -531,30 +740,70 @@ func (s *panelService) Close(id PanelID) error {
 	}
 	if wv := impl.loadWV(); wv != nil {
 		if panelSharedLoop {
-			// macOS: close the window on the main thread (it owns the NSWindow)
-			// and signal the spawn goroutine. Never Terminate() here — that stops
-			// the tray's shared [NSApp run] loop, killing the menu bar + every
-			// other panel. The close watcher's deferred cleanup runs once the
-			// spawn goroutine returns from <-uiClosed.
+			// Shared loop: close the window on the loop's thread (it owns the
+			// NSWindow / GtkWindow) and signal the spawn goroutine. Never
+			// Terminate() here — that stops the shared loop, killing the menu
+			// bar or the pebble overlays + every other panel. The close
+			// watcher's deferred cleanup runs once the spawn goroutine returns
+			// from <-uiClosed.
 			uiSync(wv, func() {
-				if err := platformDestroyWindow(wv.Window()); err != nil {
+				// Nil when the window is already gone (the user closed it);
+				// there is nothing left to destroy.
+				h := wv.Window()
+				if h == nil {
+					return
+				}
+				if err := platformDestroyWindow(h); err != nil {
 					log.Printf("[panels] platformDestroyWindow(%s): %v", id, err)
 				}
 			})
 			impl.uiCloseOnce.Do(func() { close(impl.uiClosed) })
 			return nil
 		}
-		// On Windows, wv.Terminate() asks the webview's message loop to
+		// Windows: wv.Terminate() asks the webview's message loop to
 		// return but doesn't actually destroy the OS HWND, so the user
 		// still sees the window after Close() reports success. Force the
-		// OS-level close by posting WM_CLOSE (Win32) / [w close] (Cocoa)
-		// / gtk_widget_destroy (Linux) to the underlying handle, then
+		// OS-level close by posting WM_CLOSE to the underlying HWND, then
 		// fall through to wv.Terminate so the webview's deferred cleanup
 		// (`reg.delete`, `wv.Destroy`) still runs.
 		if err := platformDestroyWindow(wv.Window()); err != nil {
 			log.Printf("[panels] platformDestroyWindow(%s): %v (falling back to wv.Terminate)", id, err)
 		}
-		wv.Terminate()
+		// Terminate MUST run on the webview's own thread. terminate_impl() is
+		// PostQuitMessage(0) (win32), which posts WM_QUIT to the CALLING
+		// thread — and this runs on whatever goroutine served the close RPC.
+		// So the bare call never reached the panel's loop, and left a WM_QUIT
+		// sitting on a random runtime M that nothing would ever consume.
+		//
+		// That stray message is not inert. The next webview created on that M
+		// (panel goroutines LockOSThread, so they inherit one) pumps the queue
+		// while waiting for WebView2 to initialize, treats the queued WM_QUIT
+		// as "give up" (embed() -> got_quit_msg -> return false), and leaves
+		// m_webview NULL. webview_create validated only the WINDOW, so it handed
+		// back that browserless engine happily and the first Bind dereferenced
+		// NULL — an access violation, which is why the crash always followed a
+		// panel.close + panel.spawn pair and never reproduced on a fresh start.
+		//
+		// Dispatch hands the call to the engine's own message window, so the
+		// quit lands in the loop it is meant to stop.
+		//
+		// The impl.done check is not redundant. If the panel was ALREADY
+		// tearing down when this ran (user closed the window, or the daemon
+		// called Close in response to the closed event), the loop is gone and
+		// the WM_APP sits unread until ~win32_edge_engine's
+		// deplete_run_loop_event_queue drains it mid-destruction — running
+		// this closure and posting the very WM_QUIT the dispatch exists to
+		// avoid, onto an M about to be unlocked and reused. done is closed
+		// before Destroy in the spawn goroutine's defer chain, so by then this
+		// sees it and does nothing.
+		wv.Dispatch(func() {
+			select {
+			case <-impl.done:
+				return
+			default:
+			}
+			wv.Terminate()
+		})
 	}
 	return nil
 }
@@ -585,7 +834,9 @@ func (s *panelService) SetInteractiveRegions(id PanelID, rects []PanelRect) erro
 	if wv == nil {
 		return formatPanelError("set_regions", id, fmt.Errorf("window not ready"))
 	}
-	if err := platformSetInteractiveRegions(wv.Window(), rects); err != nil {
+	if err := withPanelWindow(wv, func(h unsafe.Pointer) error {
+		return platformSetInteractiveRegions(h, rects)
+	}); err != nil {
 		return formatPanelError("set_regions", id, err)
 	}
 	return nil
@@ -604,10 +855,33 @@ func (s *panelService) SetClickThrough(id PanelID, clickThrough bool) error {
 	if wv == nil {
 		return formatPanelError("set_clickthrough", id, fmt.Errorf("window not ready"))
 	}
-	if err := platformSetClickThrough(wv.Window(), clickThrough); err != nil {
+	if err := withPanelWindow(wv, func(h unsafe.Pointer) error {
+		return platformSetClickThrough(h, clickThrough)
+	}); err != nil {
 		return formatPanelError("set_clickthrough", id, err)
 	}
 	return nil
+}
+
+// windowClosed reports whether the panel's window is already gone even though
+// its registry entry is still there.
+//
+// The entry outlives the window by a scheduling beat: on macOS the window
+// closes on the main thread, which closes uiClosed, and only then does the
+// spawn goroutine wake and delete the entry. Focus and SetWindowState queue
+// their AppKit work onto the main thread, so one that lands in that gap would
+// re-show a closed window the registry no longer tracks, and the next "open
+// dashboard" would put a second one beside it. Checking here narrows that gap
+// to the queue hop itself (on Linux the GTK wrappers also re-check the window
+// on the loop's thread). uiClosed is only ever closed on the shared-loop
+// platforms (macOS, Linux), so on Windows this is always false.
+func (p *panelImpl) windowClosed() bool {
+	select {
+	case <-p.uiClosed:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *panelService) Focus(id PanelID) error {
@@ -619,11 +893,14 @@ func (s *panelService) Focus(id PanelID) error {
 	if !ok {
 		return formatPanelError("focus", id, fmt.Errorf("window not ready"))
 	}
+	if impl.windowClosed() {
+		return formatPanelError("focus", id, errPanelWindowClosed)
+	}
 	wv := impl.loadWV()
 	if wv == nil {
 		return formatPanelError("focus", id, fmt.Errorf("window not ready"))
 	}
-	if err := platformFocusWindow(wv.Window()); err != nil {
+	if err := withPanelWindow(wv, platformFocusWindow); err != nil {
 		return formatPanelError("focus", id, err)
 	}
 	return nil
@@ -642,11 +919,16 @@ func (s *panelService) SetWindowState(id PanelID, state PanelWindowState) error 
 	if !ok {
 		return formatPanelError("set_window_state", id, fmt.Errorf("window not ready"))
 	}
+	if impl.windowClosed() {
+		return formatPanelError("set_window_state", id, errPanelWindowClosed)
+	}
 	wv := impl.loadWV()
 	if wv == nil {
 		return formatPanelError("set_window_state", id, fmt.Errorf("window not ready"))
 	}
-	if err := platformSetWindowState(wv.Window(), state); err != nil {
+	if err := withPanelWindow(wv, func(h unsafe.Pointer) error {
+		return platformSetWindowState(h, state)
+	}); err != nil {
 		return formatPanelError("set_window_state", id, err)
 	}
 	return nil

@@ -3,26 +3,31 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 )
 
 // ── Element Cache ──────────────────────────────────────────────────────
 
-// elementCache stores the last tree snapshot so click_element / type_text
-// can reference elements by their [id] without re-walking the tree.
-var elementCache struct {
-	mu        sync.Mutex
-	elements  []map[string]any
-	pid       int
-	timestamp time.Time
+// walkDesktopElements is the walk that mints element ids, and the one
+// resolveDesktopElement repeats to confirm one (desktop_element_cache.go).
+var walkDesktopElements = func(pid, depth int, budget time.Duration) ([]any, error) {
+	tree, err := tryATSPI(pid, depth, budget)
+	if err != nil {
+		return nil, err
+	}
+	elems, _ := tree["elements"].([]any)
+	return elems, nil
 }
 
 // ── list_windows ──────────────────────────────────────────────────────
@@ -107,14 +112,14 @@ func parseWmctrlOutput(output, activeWID string) ([]map[string]any, error) {
 		}
 
 		windows = append(windows, map[string]any{
-			"hwnd":         widInt,
-			"title":        title,
-			"pid":          pid,
-			"process_name": procName,
-			"left":         x,
-			"top":          y,
-			"right":        x + w,
-			"bottom":       y + h,
+			"hwnd":          widInt,
+			"title":         title,
+			"pid":           pid,
+			"process_name":  procName,
+			"left":          x,
+			"top":           y,
+			"right":         x + w,
+			"bottom":        y + h,
 			"is_foreground": wid == activeWID || fmt.Sprintf("%d", widInt) == activeWID,
 		})
 	}
@@ -226,7 +231,23 @@ for i in range(desktop.get_child_count()):
 print(json.dumps({'elements': elements, 'element_count': len(elements)}))
 `
 
+// handleGetWindowTree walks the AT-SPI2 tree through python3. It deliberately
+// does not read params["semantic"]: durable refs (sig/path/ordinal) are
+// implemented only in the Windows UIA walk, so `semantic: true` is a no-op here
+// and elements come back without refs rather than with an error. Documented in
+// docs/sidecar/SIDECAR_PROTOCOL.md, "Surface Limits"; the shared sig helpers in
+// semantic.go are provider-independent if this walk ever grows them.
 func handleGetWindowTree(params map[string]any) (*RPCResult, error) {
+	// Every path that does not fill the cache retires it instead, so a failed
+	// or empty snapshot leaves no earlier ids live (desktop_element_cache.go,
+	// forget). Deferred so a return added later cannot skip it.
+	filled := false
+	defer func() {
+		if !filled {
+			elementCache.forget()
+		}
+	}()
+
 	pid := 0
 	if v, ok := params["pid"].(float64); ok {
 		pid = int(v)
@@ -259,15 +280,17 @@ func handleGetWindowTree(params map[string]any) (*RPCResult, error) {
 	}
 
 	// Try AT-SPI2 via python3
-	tree, atSPIErr := tryATSPI(pid, depth)
+	tree, atSPIErr := tryATSPI(pid, depth, atSPIWalkTimeout)
 	if atSPIErr == nil {
 		// Merge in window title and pid
 		tree["window_title"] = windowTitle
 		tree["pid"] = pid
 
-		// Cache elements
+		// Cache elements, with the depth that produced them: a read-back at a
+		// different depth walks a different tree and its indices do not line up.
 		if elems, ok := tree["elements"].([]any); ok {
-			cacheElements(elems, pid)
+			elementCache.fill(elems, pid, depth)
+			filled = true
 		}
 
 		return &RPCResult{Result: tree}, nil
@@ -283,8 +306,24 @@ func handleGetWindowTree(params map[string]any) (*RPCResult, error) {
 	}}, nil
 }
 
+// atSPIWalkTimeout bounds one AT-SPI walk, for a snapshot and for the
+// read-back ahead of an element action alike (see the budget note in
+// desktop_element_cache.go: 10s + 5s click + 10s keystroke = 25s).
+const atSPIWalkTimeout = 10 * time.Second
+
+// desktopPlatformName names this platform in an unsupported-action refusal.
+const desktopPlatformName = "Linux"
+
+// desktopPointerTargetChecked: dispatchPointer checks the window under the
+// pointer before it clicks (#705).
+const desktopPointerTargetChecked = true
+
+// linuxReadBack is the read-back every Linux element action gets: the walk's
+// own budget for a click and ahead of a keystroke alike.
+var linuxReadBack = readBackPolicy{budget: atSPIWalkTimeout}
+
 // tryATSPI runs the embedded Python3 AT-SPI2 script and parses its output.
-func tryATSPI(pid, depth int) (map[string]any, error) {
+func tryATSPI(pid, depth int, timeout time.Duration) (map[string]any, error) {
 	// Write script to a temp file to avoid shell escaping issues
 	tmpFile, err := os.CreateTemp("", "jarvis-atspi-*.py")
 	if err != nil {
@@ -298,7 +337,7 @@ func tryATSPI(pid, depth int) (map[string]any, error) {
 	}
 	tmpFile.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "python3", tmpFile.Name(), strconv.Itoa(pid), strconv.Itoa(depth))
@@ -314,100 +353,155 @@ func tryATSPI(pid, depth int) (map[string]any, error) {
 	return result, nil
 }
 
-// cacheElements stores the AT-SPI element list for subsequent click/type calls.
-func cacheElements(elems []any, pid int) {
-	elementCache.mu.Lock()
-	defer elementCache.mu.Unlock()
-	elementCache.elements = make([]map[string]any, 0, len(elems))
-	for _, e := range elems {
-		if m, ok := e.(map[string]any); ok {
-			elementCache.elements = append(elementCache.elements, m)
-		}
-	}
-	elementCache.pid = pid
-	elementCache.timestamp = time.Now()
-}
-
 // ── click_element ────────────────────────────────────────────────────
 
 func handleClickElement(params map[string]any) (*RPCResult, error) {
-	elemID, ok := params["element_id"].(float64)
-	if !ok {
-		return nil, fmt.Errorf("missing required parameter: element_id")
-	}
-	id := int(elemID)
+	return handleClickElementWith(params, linuxReadBack)
+}
 
-	action, _ := params["action"].(string)
-	if action == "" {
-		action = "click"
+// dispatchPointer moves the pointer to (x, y) and performs action there, for
+// clickElement (desktop_element_action.go), which has already confirmed the
+// element and the action -- but only once the window under the pointer is
+// shown to belong to pid, the process whose window the element was read from
+// (#705).
+//
+// AT-SPI extents ignore stacking: an element that passed the read-back can be
+// covered by another window, or be on another workspace, and a click at its
+// centre goes to whatever is on top. So the pointer is moved first and xdotool
+// asked, in the same invocation, which window is under it and whose it is:
+// `getmouselocation` puts that window on xdotool's window stack and
+// `getwindowpid` reads its _NET_WM_PID. Only a match is clicked. A window
+// whose owner cannot be read is refused too: there is nothing to match.
+//
+// The cost is one more xdotool process per click (the locate and the click
+// cannot share one, because the decision sits between them): about 2 ms, the
+// median of an X client's round trip measured on the machine this was written
+// on, against an AT-SPI read-back whose python3 start alone is about 9 ms. The
+// locate gets locateBudget and the click the rest of pointerDispatchTimeout,
+// so the action budget is unchanged.
+//
+// The click re-places the pointer itself (`mousemove --sync X Y click`), so a
+// pointer moved in the few milliseconds between the two runs -- by the person,
+// say -- is put back before the button goes down. A window that appears over
+// the point in that gap is not caught; closing that needs the check and the
+// click in one X connection under a server grab.
+//
+// The check is per process, not per window: AT-SPI walks every window of the
+// app, so another window of the SAME program covering the element passes it.
+//
+// _NET_WM_PID is what this sidecar already trusts to find a pid's window
+// (focus_window, the window title in get_window_tree, the launch probe), so an
+// app that misreports it -- a sandbox whose pid namespace differs, say --
+// fails here as it already fails there.
+func dispatchPointer(id int, action string, x, y, pid int) error {
+	deadline := time.Now().Add(pointerDispatchTimeout)
+	X, Y := strconv.Itoa(x), strconv.Itoa(y)
+	// Where the pointer was, then the move, then what is under it now.
+	located := runProbe(locateBudget, "xdotool", "getmouselocation", "--shell",
+		"mousemove", "--sync", X, Y, "getmouselocation", "--shell", "getwindowpid")
+	if located.timedOut || (located.exitCode == -1 && located.err != nil) {
+		return fmt.Errorf("%s failed: could not move the pointer: %v", action, located.err)
 	}
-
-	// Look up cached element for its bounding rect
-	elementCache.mu.Lock()
-	var rect map[string]any
-	if id >= 0 && id < len(elementCache.elements) {
-		if r, ok := elementCache.elements[id]["rect"].(map[string]any); ok {
-			rect = r
+	if window, _, _ := windowUnderPointer(located.stdout); window == "" {
+		// xdotool ran and found no window at all: no X display, a Wayland-only
+		// session, an X error. Not a covered element, so not a code that tells
+		// the model to refocus and retry; and the pointer may have moved.
+		return fmt.Errorf("%s failed: xdotool could not report the window under the pointer (%s)",
+			action, firstLine(strings.TrimSpace(located.stderr)))
+	}
+	if why := pointerTargetMismatch(located.stdout, pid); why != "" {
+		// Put the pointer back where it was, so a refusal leaves it neither
+		// over the covering window (which focus-follows-mouse would hand the
+		// focus to) nor hovering anything.
+		if ox, oy, ok := pointerOrigin(located.stdout); ok {
+			_, _ = runWithTimeout(time.Until(deadline), "xdotool", "mousemove", strconv.Itoa(ox), strconv.Itoa(oy))
 		}
+		return &codedError{code: desktopTargetObscuredCode, err: fmt.Errorf(
+			"element [%d] %s at its centre (%d, %d), so nothing was clicked. "+
+				"Bring its window to the front with desktop_focus_window, then take a new desktop_snapshot", id, why, x, y)}
 	}
-	elementCache.mu.Unlock()
-
-	if rect == nil {
-		return nil, fmt.Errorf("element [%d] not found in cache — run desktop_snapshot first", id)
-	}
-
-	x := toInt(rect["x"]) + toInt(rect["w"])/2
-	y := toInt(rect["y"]) + toInt(rect["h"])/2
-
+	click := []string{"mousemove", "--sync", X, Y}
 	switch action {
-	case "click":
-		if _, err := runWithTimeout(5*time.Second, "xdotool", "mousemove", "--sync",
-			strconv.Itoa(x), strconv.Itoa(y), "click", "1"); err != nil {
-			return nil, fmt.Errorf("click failed: %w", err)
-		}
 	case "double_click":
-		if _, err := runWithTimeout(5*time.Second, "xdotool", "mousemove", "--sync",
-			strconv.Itoa(x), strconv.Itoa(y), "click", "--repeat", "2", "1"); err != nil {
-			return nil, fmt.Errorf("double_click failed: %w", err)
-		}
+		click = append(click, "click", "--repeat", "2", "1")
 	case "right_click":
-		if _, err := runWithTimeout(5*time.Second, "xdotool", "mousemove", "--sync",
-			strconv.Itoa(x), strconv.Itoa(y), "click", "3"); err != nil {
-			return nil, fmt.Errorf("right_click failed: %w", err)
-		}
-	case "focus":
-		if _, err := runWithTimeout(5*time.Second, "xdotool", "mousemove", "--sync",
-			strconv.Itoa(x), strconv.Itoa(y), "click", "1"); err != nil {
-			return nil, fmt.Errorf("focus failed: %w", err)
-		}
-	default:
-		return nil, fmt.Errorf("action '%s' is not supported on Linux (supported: click, double_click, right_click, focus)", action)
+		click = append(click, "click", "3")
+	default: // click, focus
+		click = append(click, "click", "1")
 	}
+	if _, err := runWithTimeout(time.Until(deadline), "xdotool", click...); err != nil {
+		return fmt.Errorf("%s failed: %w", action, err)
+	}
+	return nil
+}
 
-	return &RPCResult{Result: map[string]any{"success": true, "action": action, "x": x, "y": y}}, nil
+// locateBudget bounds the move-and-locate run, leaving the click at least
+// pointerDispatchTimeout - locateBudget (3s) for a process that takes
+// milliseconds: a click is never started with a sliver of budget and killed
+// half done, a double-click's second click or a button left down.
+const locateBudget = 2 * time.Second
+
+// pointerOrigin is the first X=/Y= pair the locate run printed: where the
+// pointer was before it moved.
+func pointerOrigin(out string) (x, y int, ok bool) {
+	gotX, gotY := false, false
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if v, found := strings.CutPrefix(line, "X="); found && !gotX {
+			x, gotX = toInt(v), true
+		} else if v, found := strings.CutPrefix(line, "Y="); found && !gotY {
+			y, gotY = toInt(v), true
+		}
+	}
+	return x, y, gotX && gotY
+}
+
+// pointerTargetMismatch reads what the locate run printed and says why the
+// window under the pointer is not pid's, or "". The window is the LAST
+// WINDOW= line: the first getmouselocation reported where the pointer was.
+func pointerTargetMismatch(out string, pid int) string {
+	window, owner, ok := windowUnderPointer(out)
+	switch {
+	case !ok && window == "":
+		return "could not be located under the pointer"
+	case !ok:
+		return fmt.Sprintf("is under a window (%s) whose owning program cannot be read", window)
+	case owner != pid:
+		return fmt.Sprintf("is covered by a window of another program (pid %d, not %d)", owner, pid)
+	}
+	return ""
+}
+
+// windowUnderPointer parses `xdotool getmouselocation --shell getwindowpid`:
+// the shell lines X=, Y=, SCREEN=, WINDOW=, then the pid on a line of its own,
+// which is missing when getwindowpid failed. ok is true only with both.
+func windowUnderPointer(out string) (window string, pid int, ok bool) {
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if v, found := strings.CutPrefix(line, "WINDOW="); found {
+			window = v
+			continue
+		}
+		if strings.Contains(line, "=") || line == "" {
+			continue
+		}
+		if n, err := strconv.Atoi(line); err == nil && n > 0 {
+			pid = n
+		}
+	}
+	return window, pid, window != "" && pid > 0
 }
 
 // ── type_text ────────────────────────────────────────────────────────
 
 func handleTypeText(params map[string]any) (*RPCResult, error) {
-	text, _ := params["text"].(string)
-	if text == "" {
-		return nil, fmt.Errorf("missing required parameter: text")
-	}
-
-	// If element_id is given, click it first
-	if elemID, ok := params["element_id"].(float64); ok {
-		if _, err := handleClickElement(map[string]any{"element_id": elemID}); err != nil {
-			return nil, fmt.Errorf("failed to click element before typing: %w", err)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	if _, err := runWithTimeout(10*time.Second, "xdotool", "type", "--delay", "12", text); err != nil {
-		return nil, fmt.Errorf("type_text failed: %w", err)
-	}
-
-	return &RPCResult{Result: map[string]any{"success": true}}, nil
+	return handleTypeTextWith(params, linuxReadBack, func(text string) error {
+		// "--" ends xdotool's option parsing, so text such as "-h" or
+		// "--file=/home/me/.ssh/id_ed25519" is typed literally instead of being
+		// read as an option (--file would type out the named file).
+		_, err := runWithTimeout(keystrokeTimeout, "xdotool", "type", "--delay", "12", "--", text)
+		return err
+	})
 }
 
 // ── press_keys ───────────────────────────────────────────────────────
@@ -419,8 +513,17 @@ func handlePressKeys(params map[string]any) (*RPCResult, error) {
 	}
 
 	combo := convertKeysToXdotool(keys)
+	if err := checkXdotoolKeySequence(combo); err != nil {
+		// Refused before xdotool ran: say so, so the model fixes the key
+		// name instead of checking whether something was pressed.
+		return nil, &codedError{code: "DESKTOP_INVALID_KEYS",
+			err: fmt.Errorf("press_keys refused, nothing was pressed: %w", err)}
+	}
 
-	if _, err := runWithTimeout(5*time.Second, "xdotool", "key", combo); err != nil {
+	// The trailing "+" is an empty last key, which libxdo skips. It keeps the
+	// argument from equalling any xdotool command name, so `xdotool key`
+	// cannot chain into a command, whatever commands a later xdotool adds.
+	if _, err := runWithTimeout(5*time.Second, "xdotool", "key", "--", combo+"+"); err != nil {
 		return nil, fmt.Errorf("press_keys failed: %w", err)
 	}
 
@@ -472,11 +575,117 @@ func handleLaunchApp(params map[string]any) (*RPCResult, error) {
 		name = executable[idx+1:]
 	}
 
-	return &RPCResult{Result: map[string]any{
-		"success": true,
-		"pid":     pid,
-		"name":    name,
-	}}, nil
+	// A spawned process is not an open app: returning immediately made the
+	// next tool call race the window ("no window found"). Poll for a visible
+	// window owned by this PID before declaring success.
+	win, probe, probeErr := waitForWindowLinux(pid, 5*time.Second)
+	return launchResultLinux(pid, name, win, probe, probeErr), nil
+}
+
+// launchResultLinux turns a window probe into the launch_app result.
+//
+// The three outcomes stay distinct on purpose. "A window appeared" and "no
+// window appeared" are both observations, and success reports them. "The
+// window could not be looked for" is not an observation at all, and
+// reporting it as success:false would be exactly the kind of confident
+// wrong answer this handler exists to stop: on a Wayland session or a box
+// without xdotool that would mark every successful GUI launch as a failure,
+// and the model would launch the app a second time.
+func launchResultLinux(pid int, name string, win map[string]any, probe launchProbe, probeErr error) *RPCResult {
+	res := map[string]any{"pid": pid, "name": name}
+
+	switch probe {
+	case probeWindowFound:
+		res["success"] = true
+		res["window_visible"] = true
+		res["window_title"] = win["title"]
+
+	case probeProcessGone:
+		res["success"] = false
+		res["window_visible"] = false
+		res["note"] = fmt.Sprintf("process (pid %d) exited without showing a window - it may be a short-lived launcher, a CLI tool, or it crashed. Run desktop_list_windows to see what is actually open.", pid)
+
+	case probeUncheckable:
+		// The process is alive and nothing contradicts the launch, so this is
+		// not a failure; it is an unverified success, and the note has to say
+		// so rather than let the flag speak for it.
+		res["success"] = true
+		res["window_visible"] = nil
+		res["note"] = fmt.Sprintf("process started (pid %d) but whether a window opened could NOT be checked: %v. This is not a failure report - the app may well be on screen. Run desktop_list_windows to see what is actually open before interacting, and do not launch it again on the strength of this result.", pid, probeErr)
+
+	default: // probeWindowAbsent
+		res["success"] = false
+		res["window_visible"] = false
+		res["note"] = fmt.Sprintf("process started (pid %d) but no window appeared within 5s - the app may still be starting, be windowless, or have exited. Run desktop_list_windows to check before interacting; do NOT assume it is open.", pid)
+	}
+
+	return &RPCResult{Result: res}
+}
+
+// classifyWindowSearch reads one `xdotool search` run.
+//
+// The exit status alone cannot answer the question: xdotool exits 1 both
+// when it matched nothing and when it could not run at all (no DISPLAY, for
+// instance). What separates them is that a clean no-match is silent and
+// exits exactly 1, while a failure either says something on stderr, exits
+// with another status, or never returns. Returning (nil, nil) claims "there
+// is no window", so every other shape has to come back as an error.
+func classifyWindowSearch(r probeRun) ([]string, error) {
+	switch {
+	case r.timedOut:
+		return nil, fmt.Errorf("%w: xdotool search did not return in time", errWindowCheckUnavailable)
+	case strings.TrimSpace(r.stderr) != "":
+		return nil, fmt.Errorf("%w: xdotool search failed: %s", errWindowCheckUnavailable, firstLine(strings.TrimSpace(r.stderr)))
+	case r.exitCode == 1:
+		return nil, nil // ran cleanly and matched nothing
+	case r.err != nil:
+		return nil, fmt.Errorf("%w: could not run xdotool (exit %d): %v", errWindowCheckUnavailable, r.exitCode, r.err)
+	}
+	return strings.Fields(r.stdout), nil
+}
+
+// probeWindowOnce asks xdotool for a visible window owned by pid. A nil
+// window with a nil error means "looked, found none"; a non-nil error means
+// the question could not be put at all.
+func probeWindowOnce(pid int) (map[string]any, error) {
+	if _, err := exec.LookPath("xdotool"); err != nil {
+		return nil, fmt.Errorf("%w: xdotool is not installed", errWindowCheckUnavailable)
+	}
+
+	ids, err := classifyWindowSearch(runProbe(2*time.Second, "xdotool", "search", "--onlyvisible", "--pid", strconv.Itoa(pid)))
+	if err != nil || len(ids) == 0 {
+		return nil, err
+	}
+
+	title := ""
+	if t := runProbe(2*time.Second, "xdotool", "getwindowname", ids[0]); t.err == nil {
+		title = t.stdout
+	}
+	return map[string]any{"title": title}, nil
+}
+
+// waitForWindowLinux polls for a visible window owned by pid. It stops early
+// when the process disappears (no point waiting out the timeout for a window
+// that can no longer appear) and when the check itself is unusable.
+func waitForWindowLinux(pid int, timeout time.Duration) (map[string]any, launchProbe, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		win, err := probeWindowOnce(pid)
+		if win != nil {
+			return win, probeWindowFound, nil
+		}
+		// A dead process settles the question whether or not xdotool worked.
+		if syscall.Kill(pid, 0) != nil {
+			return nil, probeProcessGone, err
+		}
+		if errors.Is(err, errWindowCheckUnavailable) {
+			return nil, probeUncheckable, err
+		}
+		if time.Now().After(deadline) {
+			return nil, probeWindowAbsent, nil
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
 }
 
 // splitArgs splits a string into arguments, respecting double-quoted groups.
@@ -526,8 +735,9 @@ func handleFocusWindow(params map[string]any) (*RPCResult, error) {
 // ── find_element ─────────────────────────────────────────────────────
 
 func handleFindElement(params map[string]any) (*RPCResult, error) {
-	// Snapshot the tree to populate the cache, then filter in Go
-	_, err := handleGetWindowTree(params)
+	// Walk (which fills the cache and mints this walk's ids), then filter THAT
+	// walk's reply -- see findInWalk.
+	res, err := handleGetWindowTree(params)
 	if err != nil {
 		return nil, fmt.Errorf("find_element failed: %w", err)
 	}
@@ -537,32 +747,7 @@ func handleFindElement(params map[string]any) (*RPCResult, error) {
 	className, _ := params["class_name"].(string)
 	// automation_id is ignored on Linux (not an AT-SPI concept)
 
-	elementCache.mu.Lock()
-	defer elementCache.mu.Unlock()
-
-	var matches []map[string]any
-	for _, el := range elementCache.elements {
-		if name != "" {
-			elName, _ := el["name"].(string)
-			if elName != name {
-				continue
-			}
-		}
-		if controlType != "" {
-			elType, _ := el["control_type"].(string)
-			if elType != controlType {
-				continue
-			}
-		}
-		if className != "" {
-			elClass, _ := el["class_name"].(string)
-			if elClass != className {
-				continue
-			}
-		}
-		matches = append(matches, el)
-	}
-
+	matches := findInWalk(res.Result, name, controlType, className)
 	return &RPCResult{Result: map[string]any{
 		"match_count": len(matches),
 		"elements":    matches,
@@ -570,6 +755,44 @@ func handleFindElement(params map[string]any) (*RPCResult, error) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+// probeRun is everything needed to tell a tool that ran and found nothing
+// apart from one that could not run. runWithTimeout throws all of it away
+// except stdout, which is why the window check cannot use it.
+type probeRun struct {
+	stdout   string
+	stderr   string
+	exitCode int // 0 on success, the tool's status on exit, -1 if it never ran
+	timedOut bool
+	err      error
+}
+
+// runProbe runs a command with a timeout and keeps the full outcome.
+func runProbe(timeout time.Duration, name string, args ...string) probeRun {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+
+	r := probeRun{
+		stdout:   strings.TrimSpace(string(out)),
+		stderr:   stderr.String(),
+		timedOut: errors.Is(ctx.Err(), context.DeadlineExceeded),
+		err:      err,
+	}
+	var exitErr *exec.ExitError
+	switch {
+	case err == nil:
+		r.exitCode = 0
+	case errors.As(err, &exitErr):
+		r.exitCode = exitErr.ExitCode()
+	default:
+		r.exitCode = -1
+	}
+	return r
+}
 
 // runWithTimeout runs a command with a timeout and returns trimmed stdout.
 // Stderr is discarded; only stdout is returned.
@@ -633,6 +856,77 @@ func convertKeysToXdotool(keys string) string {
 
 	all := append(modifiers, mapped...)
 	return strings.Join(all, "+")
+}
+
+// xdotoolKeyName matches the key names xdotool can press: X keysym names
+// (Return, minus, F5, XF86AudioPlay, U20AC) and xdotool's aliases (ctrl,
+// super, enter). xdotool ignores or rejects anything else, so refusing it
+// loses no working key, and it keeps a leading "-" from ever reaching xdotool.
+//
+// This, the command checks and maxChordKeys are mirrored by the daemon's
+// toXdotoolKeySequence (src/actions/app-control/linux.ts); keep them in sync.
+var xdotoolKeyName = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
+// xdotoolCommands is xdotool's command table. `xdotool key` stops at the
+// first argument that names one and runs it as a chained command, "--" or
+// not, so a lone key spelled like a command ("exec", "selectwindow") would run
+// that command instead of being pressed. handlePressKeys also ends the
+// argument with "+" (see there), which no command name contains; refusing
+// these as well keeps a later edit to that argument from reopening the hole.
+var xdotoolCommands = map[string]bool{
+	"behave": true, "behave_screen_edge": true, "click": true, "exec": true, "get_desktop": true,
+	"get_desktop_for_window": true, "get_desktop_viewport": true, "get_num_desktops": true,
+	"getactivewindow": true, "getdisplaygeometry": true, "getmouselocation": true, "getwindowclassname": true,
+	"getwindowfocus": true, "getwindowgeometry": true, "getwindowname": true, "getwindowpid": true, "help": true,
+	"key": true, "keydown": true, "keyup": true, "mousedown": true, "mousemove": true, "mousemove_relative": true, "mouseup": true,
+	"search": true, "selectwindow": true, "set_desktop": true, "set_desktop_for_window": true,
+	"set_desktop_viewport": true, "set_num_desktops": true, "set_window": true, "sleep": true, "type": true, "version": true,
+	"windowactivate": true, "windowclose": true, "windowfocus": true, "windowkill": true, "windowlower": true,
+	"windowmap": true, "windowminimize": true, "windowmove": true, "windowquit": true, "windowraise": true,
+	"windowreparent": true, "windowsize": true, "windowstate": true, "windowunmap": true,
+}
+
+// maxChordKeys bounds a combo: libxdo grows its key array with the wrong
+// element size once a sequence reaches 10 keys (xdo.c
+// `realloc(*keys, keys_size * sizeof(KeyCode))`) and then writes past it. No
+// real chord comes close, so stay well below.
+const maxChordKeys = 8
+
+// keysymsNamedLikeCommands holds the real keysyms that share a name with a
+// command. Help (the "help" command) is the only one. The trailing "+" in
+// handlePressKeys is what lets it be pressed; were that ever lost, xdotool
+// would merely print its help text.
+var keysymsNamedLikeCommands = map[string]bool{"Help": true}
+
+// checkXdotoolKeySequence refuses a "+"-joined combo that xdotool would read
+// as anything other than keys to press. Empty items are skipped, as xdotool
+// itself skips them. The checks run in the same order as the daemon's: names,
+// then empty, then count, then command names.
+func checkXdotoolKeySequence(combo string) error {
+	named := 0
+	for _, k := range strings.Split(combo, "+") {
+		if k == "" {
+			continue
+		}
+		if !xdotoolKeyName.MatchString(k) {
+			return fmt.Errorf("invalid key name %q: use names such as enter, tab or f5, or X keysym names such as minus and slash", k)
+		}
+		named++
+	}
+	if named == 0 {
+		return fmt.Errorf("no keys given")
+	}
+	if named > maxChordKeys {
+		return fmt.Errorf("too many keys in one combo (%d); press at most %d at once", named, maxChordKeys)
+	}
+	if xdotoolCommands[strings.ToLower(combo)] && !keysymsNamedLikeCommands[combo] {
+		hint := ""
+		if strings.ToLower(combo) == "help" {
+			hint = ` (the Help key is spelled "Help")`
+		}
+		return fmt.Errorf("%q is an xdotool command name and cannot be pressed as a key%s", combo, hint)
+	}
+	return nil
 }
 
 // mapKeyToXdotool maps human-readable key names to xdotool key names.
@@ -699,5 +993,3 @@ func mapKeyToXdotool(key string) string {
 		return key
 	}
 }
-
-

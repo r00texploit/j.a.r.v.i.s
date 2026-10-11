@@ -52,6 +52,8 @@ func NewHandlerRegistry(cfg *SidecarConfig, cfgMu sync.Locker, availableCaps []S
 	if caps[CapDesktop] {
 		registry["list_windows"] = handleListWindows
 		registry["get_window_tree"] = handleGetWindowTree
+		registry["recorder_start"] = handleRecorderStart
+		registry["recorder_stop"] = handleRecorderStop
 		registry["click_element"] = handleClickElement
 		registry["type_text"] = handleTypeText
 		registry["press_keys"] = handlePressKeys
@@ -66,10 +68,26 @@ func NewHandlerRegistry(cfg *SidecarConfig, cfgMu sync.Locker, availableCaps []S
 		registry["browser_snapshot"] = makeBrowserSnapshotHandler(cfg)
 		registry["browser_click"] = makeBrowserClickHandler(cfg)
 		registry["browser_type"] = makeBrowserTypeHandler(cfg)
+		registry["browser_hover"] = makeBrowserHoverHandler(cfg)
+		registry["browser_press_key"] = makeBrowserPressKeyHandler(cfg)
 		registry["browser_screenshot"] = makeBrowserScreenshotHandler(cfg)
 		registry["browser_scroll"] = makeBrowserScrollHandler(cfg)
 		registry["browser_evaluate"] = makeBrowserEvaluateHandler(cfg)
 		registry["browser_close"] = makeBrowserCloseHandler(cfg)
+		// Read-only, and note what is missing: no `cfg`. Every handler above
+		// takes one because it may need to find and launch a browser;
+		// browser_element_point answers from a browser that is already running
+		// or refuses, so the launch path is structurally out of its reach
+		// (#591, browser_element_point.go). There is one browser capability for
+		// all of these, so "read-only" cannot be expressed here -- it is
+		// enforced in the handler and asserted by
+		// TestBrowserElementPointSendsOnlyReads.
+		registry["browser_element_point"] = handleBrowserElementPoint
+		// Accessibility-tree provider (structural runtime, Phase 1 spike):
+		// element-addressed snapshot/actions over backendDOMNodeId + refs.
+		registry["browser_ax_snapshot"] = makeBrowserAXSnapshotHandler(cfg)
+		registry["browser_ax_click"] = makeBrowserAXClickHandler(cfg)
+		registry["browser_ax_set_value"] = makeBrowserAXSetValueHandler(cfg)
 	}
 
 	if caps[CapWindows] && panels != nil {
@@ -112,6 +130,29 @@ func NewHandlerRegistry(cfg *SidecarConfig, cfgMu sync.Locker, availableCaps []S
 	registry["get_config"] = makeGetConfigHandler(cfg)
 	registry["update_config"] = makeUpdateConfigHandler(cfg, cfgMu, onReloaded)
 
+	// OS permissions (permissions_rpc.go). Dotted like the other daemon-driven
+	// UI services (panel.*, pebble.*) rather than bare like the brain's tool
+	// handlers, because that is what these are: the onboarding wizard asking
+	// about the machine it is being looked at on.
+	//
+	// Ungated on purpose. The report is about the MACHINE, not a capability,
+	// and it matters most exactly when a capability is missing - a denied
+	// Screen Recording grant is WHY awareness isn't working, and a wizard that
+	// couldn't ask because the capability was off would be silent about the
+	// reason. The request half was weighed separately, since it can pop an OS
+	// dialog with no local gesture and a declined notification prompt is
+	// one-shot on macOS: left ungated because the brain can already do
+	// strictly more through update_config, and because the daemon only
+	// forwards it in response to a click on that screen.
+	registry["system.permissions"] = handleSystemPermissions
+	registry["system.request_permission"] = handleSystemRequestPermission
+
+	// Self-update (client_update.go). Ungated like the permissions pair: the
+	// update is about the sidecar itself, not a capability, and reloadConfig
+	// rebuilds this registry, so they must not live in the per-connection set.
+	registry["sidecar.update_prompt"] = handleUpdatePrompt
+	registry["sidecar.update_apply"] = handleUpdateApply
+
 	return registry
 }
 
@@ -134,6 +175,11 @@ func makeRunCommandHandler(cfg *SidecarConfig) RPCHandler {
 			timeoutMs = int(t)
 		}
 
+		// A convenience deny-list for plainly written commands, not an
+		// authorization boundary: substring matching cannot contain shell
+		// syntax (quoting, variables, subshells). Whether a command may run is
+		// decided brain-side: the authority engine gates agent tool calls, and
+		// workflow tool steps run as the owner configured them.
 		for _, blocked := range cfg.Terminal.BlockedCommands {
 			if strings.Contains(command, blocked) {
 				return &RPCResult{Result: map[string]any{
@@ -184,11 +230,22 @@ func makeRunCommandHandler(cfg *SidecarConfig) RPCHandler {
 
 // --- Filesystem ---
 
+// isBlockedPath reports whether filePath is, or lies inside, one of the
+// blocked entries. Both sides are canonicalised first (absolute, cleaned,
+// symlinks resolved, case-folded where the filesystem is), and containment is
+// a path-segment test rather than a string prefix, so "~/.ssh" blocks
+// "/home/u/.ssh/id_rsa", a symlink pointing into it, and "C:\USERS\U\.SSH",
+// while leaving "/home/u/.sshfoo" alone.
 func isBlockedPath(filePath string, blockedPaths []string) bool {
-	resolved, _ := filepath.Abs(filePath)
+	if len(blockedPaths) == 0 {
+		return false
+	}
+	target := canonicalPath(filePath)
 	for _, bp := range blockedPaths {
-		abs, _ := filepath.Abs(bp)
-		if strings.HasPrefix(resolved, abs) {
+		if strings.TrimSpace(bp) == "" {
+			continue
+		}
+		if pathWithin(target, canonicalPath(bp)) {
 			return true
 		}
 	}
@@ -329,7 +386,23 @@ func captureScreenBytes() ([]byte, error) {
 	return os.ReadFile(tmpFile)
 }
 
+// captureWindowUnsupportedCode marks a capture_screen refused for naming a
+// window (#710). Returned before anything is captured.
+const captureWindowUnsupportedCode = "SCREENSHOT_WINDOW_UNSUPPORTED"
+
 func handleCaptureScreen(params map[string]any) (*RPCResult, error) {
+	// There is no window capture here: every platform's capture is the whole
+	// screen. A `pid` used to be ignored, so a request for one window came back
+	// as everything on the screen with nothing saying so (#710). The daemon
+	// refuses that before dispatching; this refuses it for one that predates
+	// that, before any pixels are read.
+	// Any pid at all, not only a number: an older daemon passes the model's
+	// arguments through as they came.
+	if pid, present := params["pid"]; present && pid != nil {
+		return nil, &codedError{code: captureWindowUnsupportedCode, err: fmt.Errorf(
+			"capture_screen captures the whole screen and cannot capture one window (pid %v), so nothing was captured; "+
+				"call it without pid for the whole screen", pid)}
+	}
 	data, err := captureScreenBytes()
 	if err != nil {
 		return nil, err
@@ -458,47 +531,9 @@ func makeCleanupCapturesHandler(cfg *SidecarConfig) RPCHandler {
 			return nil, fmt.Errorf("cutoff must be in the past")
 		}
 
-		captureDir := cfg.Awareness.CaptureDir
-		filesDeleted := 0
-		dirsRemoved := 0
-
-		entries, err := os.ReadDir(captureDir)
+		filesDeleted, dirsRemoved, err := deleteCapturesBefore(cfg.Awareness.CaptureDir, cutoff)
 		if err != nil {
-			if os.IsNotExist(err) {
-				return &RPCResult{Result: map[string]any{"files_deleted": 0, "dirs_removed": 0}}, nil
-			}
-			return nil, fmt.Errorf("read capture dir: %w", err)
-		}
-
-		for _, dateEntry := range entries {
-			if !dateEntry.IsDir() {
-				continue
-			}
-			dateDir := filepath.Join(captureDir, dateEntry.Name())
-			files, err := os.ReadDir(dateDir)
-			if err != nil {
-				continue
-			}
-			for _, f := range files {
-				if f.IsDir() {
-					continue
-				}
-				p := filepath.Join(dateDir, f.Name())
-				info, err := f.Info()
-				if err != nil {
-					continue
-				}
-				if info.ModTime().Before(cutoff) {
-					if err := os.Remove(p); err == nil {
-						filesDeleted++
-					}
-				}
-			}
-			if remaining, _ := os.ReadDir(dateDir); len(remaining) == 0 {
-				if err := os.Remove(dateDir); err == nil {
-					dirsRemoved++
-				}
-			}
+			return nil, err
 		}
 
 		return &RPCResult{Result: map[string]any{
@@ -765,6 +800,7 @@ func makeGetConfigHandler(cfg *SidecarConfig) RPCHandler {
 				"window_interval_ms":   cfg.Awareness.WindowIntervalMs,
 				"min_change_threshold": cfg.Awareness.MinChangeThreshold,
 				"stuck_threshold_ms":   cfg.Awareness.StuckThresholdMs,
+				"capture_ttl_hours":    cfg.Awareness.CaptureTTLHours,
 			},
 		}}, nil
 	}
@@ -851,6 +887,9 @@ func makeUpdateConfigHandler(cfg *SidecarConfig, mu sync.Locker, onReloaded func
 			}
 			if v, ok := awareness["stuck_threshold_ms"].(float64); ok {
 				cfg.Awareness.StuckThresholdMs = int(v)
+			}
+			if v, ok := awareness["capture_ttl_hours"].(float64); ok {
+				cfg.Awareness.CaptureTTLHours = int(v)
 			}
 		}
 

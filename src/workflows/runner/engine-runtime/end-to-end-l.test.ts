@@ -97,10 +97,13 @@ describe("Phase L: plumbing smoke (connection resolver + store + run-progress)",
     if (!cached && buildOptIn) cached = await buildEngineBundle();
     if (!cached) return;
     if (buildOptIn) await buildAllJarvisPieces();
-    runtime = new EngineRuntime({ api, bundlePath: cached.bundlePath });
+    runtime = new EngineRuntime({ api, bundlePath: cached.bundlePath, expectedDigest: cached.digest });
   });
 
   afterAll(async () => {
+    // Engines first: reclaim anything this runtime spawned while the
+    // SandboxApi it talks to is still up (#491).
+    await runtime?.shutdown();
     await api.stop();
     closeWorkflowDb();
   });

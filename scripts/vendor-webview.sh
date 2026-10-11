@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Re-vendor github.com/webview/webview_go into sidecar/third_party/webview_go at
-# a given version and re-apply the jarvis SW_HIDE patch (jarvis.patch).
+# a given version and re-apply the jarvis patches (jarvis.patch).
 #
 # We vendor + patch webview_go because upstream's Win32 engine constructor shows
 # the window before WebView2 finishes initializing, producing a black flash. The
@@ -74,14 +74,45 @@ rm -rf "$STASH"
 # Re-apply our patch with GNU patch (no git-index awareness, unlike `git apply`,
 # which would see the committed header as already-patched and skip). Strict on
 # purpose: if upstream moved the win32 constructor this fails loudly and a human
-# must regenerate jarvis.patch (the SW_HIDE edit).
+# must regenerate jarvis.patch. Regenerate it by diffing pristine upstream
+# against the patched tree for EVERY file we touch, not just the header.
 echo "Applying jarvis.patch..."
 ( cd "$VENDOR_DIR" && patch -p1 --no-backup-if-mismatch -i "$PATCH_FILE" )
 
-# Sanity-check the patch actually landed.
+# Sanity-check the patch actually landed. One assertion PER patched behavior:
+# the re-copy above restores pristine upstream over every vendored file except
+# KEEP_FILES, so anything jarvis.patch stops carrying is silently reverted, the
+# build still passes, and the monthly update PR goes green having dropped it.
+# A grep that only covers some of the patches cannot tell that apart, so every
+# hunk gets a marker here.
 HEADER="$VENDOR_DIR/libs/webview/include/webview.h"
 grep -q "PATCHED (jarvis)" "$HEADER"
-grep -q "ShowWindow(m_window, SW_HIDE)" "$HEADER"
+grep -q "ShowWindow(m_window, SW_HIDE)" "$HEADER"           # win32: no open flash
+grep -q "isMainThread" "$HEADER"                            # cocoa: main-thread window
+grep -q "w->browser_controller()" "$HEADER"                 # reject half-built engines
+# The cocoa terminate guard, in BOTH directions. It had no marker until a lost
+# first run made the case for one: the no-op half protects the tray's shared
+# loop, and the stop_run_loop half is what lets the pre-tray connect and
+# onboarding windows hand control back to main(). Losing either silently is a
+# hang, not a build failure, so assert both.
+grep -q "webview_set_host_owns_run_loop" "$HEADER"          # cocoa: host-owned loop flag
+# The whole guard, not just its condition: an inverted `if (` or an emptied body
+# both leave the string "jarvis_host_owns_run_loop()) {" in place while breaking
+# it in the direction where first run hangs.
+grep -A1 'if (!jarvis_host_owns_run_loop()) {' "$HEADER" | grep -q 'stop_run_loop();'
+# The GTK half of the same guard: the Linux sidecar runs one gtk_main for its
+# overlays and every panel window, and a panel closing must not quit it. Assert
+# the guarded quit AND that the setter reaches the GTK flag, since losing either
+# leaves the build green and the pebble frozen after the first panel closes.
+grep -A1 'if (!jarvis_host_owns_run_loop()) {' "$HEADER" | grep -q 'gtk_main_quit'
+grep -q 'defined(WEBVIEW_COCOA) || defined(WEBVIEW_GTK)' "$HEADER"
+# win32: a create that fails before the message window exists must return NULL,
+# not spin forever in the destructor's event-queue pump. Losing this is a hang
+# of the panel goroutine and a stuck "panel already exists", not a build error.
+grep -q 'if (m_owns_window && m_message_window) {' "$HEADER"
+grep -q "PATCHED (jarvis)" "$VENDOR_DIR/webview.go"         # nil WebView on NULL handle
+grep -q "PATCHED (jarvis)" "$VENDOR_DIR/jarvis_native.go"   # browser controller accessor
+grep -q "SetHostOwnsRunLoop" "$VENDOR_DIR/jarvis_native.go" # cocoa: the flag's Go binding
 
 # Record the pinned version (single source of truth for the update workflow).
 printf '%s\n' "$VERSION" > "$VENDOR_DIR/UPSTREAM_VERSION"

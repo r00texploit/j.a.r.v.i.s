@@ -54,6 +54,7 @@ export interface PieceCatalogAction {
   name: string;
   displayName: string;
   description: string;
+  requireAuth?: boolean;
   inputSchema?: PieceInputSchema;
   /**
    * Optional declared output sample: the same JSON shape the action returns
@@ -262,18 +263,6 @@ export function discoverPieces(rootDirs: string[]): {
 }
 
 /**
- * Build a deterministic cache-invalidation key from the engine bundle and
- * every piece's compiled `dist/src/index.js`. An edit to any of those forces
- * a catalog rebuild even when the engine bundle is unchanged.
- *
- * We hash content (not mtime+size) because mtime resolution on common
- * filesystems is too coarse to detect successive writes within ~1ms (e.g.
- * dev loops where you edit and rebuild back-to-back, or tests). Reading and
- * hashing each bundle is O(bytes) but only happens at daemon startup and
- * cache-rebuild time -- the on-disk catalog cache absorbs the cost across
- * subsequent boots.
- */
-/**
  * Catalog projection schema version. Mixed into the cache key so any
  * daemon-side change to the projected `PieceCatalogEntry` shape (new
  * fields, reshaped existing fields, anything that `metadataToCatalogEntry`
@@ -304,21 +293,22 @@ export function discoverPieces(rootDirs: string[]): {
  *         pair on the piece source. Editor renders flow_ref as a
  *         searchable workflow picker.
  */
-export const CATALOG_SCHEMA_VERSION = "6";
+export const CATALOG_SCHEMA_VERSION = "8"; // v8: retain ARRAY row contracts for readiness
 
-export function computeCatalogCacheKey(opts: {
-  bundlePath: string;
-  pieceRoots: string[];
-}): string {
+/**
+ * GLOBAL cache invalidators only — the projection schema, the engine bundle,
+ * and the event-type registry. Per-piece source changes deliberately do NOT
+ * feed this key anymore: each cached entry carries its own content hash
+ * (`pieceContentHash`), so one changed/added piece invalidates one entry
+ * instead of the whole catalog. That is what makes a large SHARED read-only
+ * cache usable — a user installing a single community piece re-extracts that
+ * piece, not all 650+.
+ */
+export function computeCatalogCacheKey(opts: { bundlePath: string }): string {
   const h = createHash("sha256");
   h.update(`schema\0${CATALOG_SCHEMA_VERSION}\0`);
   h.update("bundle\0");
   hashFileContents(h, opts.bundlePath);
-  const { entries } = discoverPieces(opts.pieceRoots);
-  for (const e of entries) {
-    h.update(`piece\0${e.name}\0${e.version}\0`);
-    hashFileContents(h, resolve(e.dir, "dist/src/index.js"));
-  }
   // Mix in the event-type registry so adding/removing an entry in
   // `WORKFLOW_EVENT_TYPES` invalidates caches automatically. The
   // jarvis-trigger:on_event projection synthesizes its
@@ -339,6 +329,18 @@ export function computeCatalogCacheKey(opts: {
       [...WORKFLOW_EVENT_TYPES].sort((a, b) => a.type.localeCompare(b.type)),
     ),
   );
+  return h.digest("hex");
+}
+
+/**
+ * Per-piece cache validity: the compiled bundle's content hash ("absent" when
+ * there is no dist — npm-published community pieces ship src/index.js only,
+ * which degenerates the check to name@version, exactly what makes one shared
+ * cache file valid for every user of the same shared pieces tree).
+ */
+export function pieceContentHash(dir: string): string {
+  const h = createHash("sha256");
+  hashFileContents(h, resolve(dir, "dist/src/index.js"));
   return h.digest("hex");
 }
 
@@ -372,15 +374,24 @@ export interface BuildCatalogOptions {
   pieceRoots: string[];
   /**
    * Path to the on-disk cache file. When set together with `cacheKey`, the
-   * builder reads from this file if `cacheKey` matches; on miss it extracts
-   * fresh and writes back. Default: no caching.
+   * builder reuses per-piece entries whose content hash still matches and
+   * extracts only the misses, writing the result back. Default: no caching.
    */
   cacheFile?: string;
   /**
-   * Cache invalidation key -- typically `computeCatalogCacheKey({...})`.
-   * Stored alongside the cached entries; mismatch forces a rebuild.
+   * GLOBAL cache invalidation key -- `computeCatalogCacheKey({...})`
+   * (projection schema + engine bundle + event-type registry). Mismatch
+   * invalidates every entry; per-piece changes are handled per entry.
    */
   cacheKey?: string;
+  /**
+   * Additional READ-ONLY cache files consulted for entries the user's own
+   * cache doesn't satisfy (multi-tenant hosting: one prebuilt file for the
+   * shared pieces tree, generated at version-install time). Never written;
+   * entries served from here are not copied into the user's cache file, so
+   * per-user caches stay small (only the user's own installs).
+   */
+  sharedCacheFiles?: string[];
   /** projectId for the synthetic extraction sandbox. Default: DEFAULT_IDS.project. */
   projectId?: string;
   /**
@@ -395,6 +406,22 @@ export interface BuildCatalogOptions {
    */
   overallTimeoutMs?: number;
   /**
+   * Give up after this many extractions in a row get NO ANSWER from the
+   * engine. A wedged engine burns `pieceTimeoutMs` on every remaining piece,
+   * so without this one broken engine costs the whole catalog times that
+   * timeout -- on the hosted shared-runtime build that is 659 pieces x 30s,
+   * about five and a half hours, against an install op that gives up after
+   * thirty minutes. The build then reports nothing at all: it is killed
+   * mid-loop, so even the failures never surface.
+   *
+   * TIMEOUTS ONLY. An error REPLY proves the engine is alive and answering, so
+   * counting those would end a healthy build on a run of legitimately broken
+   * pieces -- and discovery is sorted, which groups families (piece-google-*
+   * and friends), so a shared broken dependency produces exactly such a run.
+   * Reset by a success; an error reply leaves it alone. Default 5.
+   */
+  maxConsecutiveTimeouts?: number;
+  /**
    * Optional reporter for `discoverPieces` conflicts and per-piece extraction
    * failures. Defaults to `console.warn`. Pass a noop in tests.
    */
@@ -406,28 +433,65 @@ export interface BuildCatalogResult {
   failures: PieceExtractionFailure[];
 }
 
+export interface CachedPieceEntry {
+  /** `pieceContentHash(dir)` at extraction time; entry valid while it matches. */
+  contentHash: string;
+  entry: PieceCatalogEntry;
+}
+
 export interface CacheFileShape {
+  /** Global invalidators (schema + bundle + event types); see computeCatalogCacheKey. */
   cacheKey: string;
-  entries: PieceCatalogEntry[];
+  /** Keyed by `${name}@${version}`. */
+  pieces: Record<string, CachedPieceEntry>;
 }
 
 /**
- * Read the cache file if `cacheKey` matches; otherwise return null. Exposed
- * separately from the full builder for tests + readability.
+ * Read a cache file's per-piece entry map if its global `cacheKey` matches;
+ * otherwise null. Pre-per-entry cache files (the old `entries[]` array shape)
+ * fail the `pieces` check and read as a full miss — a one-time re-extraction
+ * on upgrade, never a crash. Exposed separately from the full builder for
+ * tests + readability.
  */
-export function readCachedCatalog(
+export function readCachedEntries(
   cacheFile: string,
   cacheKey: string,
-): PieceCatalog | null {
+): Map<string, CachedPieceEntry> | null {
   if (!existsSync(cacheFile)) return null;
+  // Size cap: the whole file is parsed in every tenant process — a runaway
+  // producer must degrade to extraction, not to an OOM at JSON.parse.
+  try {
+    if (statSync(cacheFile).size > 256 * 1024 * 1024) return null;
+  } catch {
+    return null;
+  }
   let cached: CacheFileShape;
   try {
     cached = JSON.parse(readFileSync(cacheFile, "utf8")) as CacheFileShape;
   } catch {
     return null;
   }
-  if (cached.cacheKey !== cacheKey || !Array.isArray(cached.entries)) return null;
-  return new PieceCatalog(cached.entries);
+  if (cached.cacheKey !== cacheKey) return null;
+  if (typeof cached.pieces !== "object" || cached.pieces === null || Array.isArray(cached.pieces)) {
+    return null;
+  }
+  // Validate VALUES, not just the container: a shared cache is a root-supplied
+  // file the tenant can't repair — one null/garbage entry must drop THAT entry
+  // (degrading to extraction for that piece), never crash daemon boot.
+  const out = new Map<string, CachedPieceEntry>();
+  for (const [key, value] of Object.entries(cached.pieces)) {
+    if (
+      value !== null &&
+      typeof value === "object" &&
+      typeof (value as CachedPieceEntry).contentHash === "string" &&
+      (value as CachedPieceEntry).entry !== null &&
+      typeof (value as CachedPieceEntry).entry === "object" &&
+      typeof (value as CachedPieceEntry).entry.name === "string"
+    ) {
+      out.set(key, value as CachedPieceEntry);
+    }
+  }
+  return out;
 }
 
 /**
@@ -440,6 +504,31 @@ export function readCachedCatalog(
  * logged via `reporter`, and surfaced on `failures[]`. The catalog still
  * boots with whichever pieces succeeded; the daemon can log/UI-display the
  * failures without blocking startup.
+ *
+ * An extraction that gets NO ANSWER also ends that engine. Our per-piece race
+ * abandons an operation the engine is still running (nothing cancels it), so
+ * the next piece would queue behind it; the following one gets a fresh engine
+ * instead. An error REPLY is left alone -- the engine answered, so it is alive
+ * and reusable, and destroying it would be churn (and a no-op under a pooled
+ * runtime, which would simply park and re-hand the same process).
+ *
+ * `maxConsecutiveTimeouts` unanswered extractions in a row end the build, with
+ * the remainder reported as unattempted rather than paying `pieceTimeoutMs` on
+ * every one of them.
+ *
+ * WHAT PROMPTED THIS, now established: on the hosted shared-runtime build a
+ * single piece got NO reply and every one of the 658 after it timed out,
+ * against an engine process still alive. The cause was not the engine at all.
+ * `@activepieces/piece-ampeco@0.2.8` replies with 2.68MB of metadata, over
+ * socket.io's 1MB default frame limit, which CLOSES the connection rather than
+ * erroring; the reply never came, and the handle went on emitting into a dead
+ * socket. The limit is raised in sandbox-api/worker-rpc.ts and the handle now
+ * re-resolves its client per send.
+ *
+ * This loop is what stands behind those: an engine that stops answering for
+ * ANY reason -- an oversized frame, a piece that blocks the event loop, a
+ * future cause nobody has met yet -- costs one piece instead of the rest of
+ * the catalog.
  */
 export async function buildPieceCatalog(
   opts: BuildCatalogOptions,
@@ -447,11 +536,7 @@ export async function buildPieceCatalog(
   const reporter = opts.reporter ?? ((m) => console.warn(`[piece-catalog] ${m}`));
   const pieceTimeoutMs = opts.pieceTimeoutMs ?? 10_000;
   const overallTimeoutMs = opts.overallTimeoutMs ?? 60_000;
-
-  if (opts.cacheFile && opts.cacheKey) {
-    const fromCache = readCachedCatalog(opts.cacheFile, opts.cacheKey);
-    if (fromCache) return { catalog: fromCache, failures: [] };
-  }
+  const maxConsecutiveTimeouts = opts.maxConsecutiveTimeouts ?? 5;
 
   const { entries: discovered, conflicts } = discoverPieces(opts.pieceRoots);
   for (const c of conflicts) {
@@ -460,53 +545,179 @@ export async function buildPieceCatalog(
     );
   }
 
-  const projectId = opts.projectId ?? DEFAULT_IDS.project;
-  const runId = "metadata-extract-" + SandboxRegistry.newSandboxId();
+  // Per-entry cache lookup: the user's own cache first, then any read-only
+  // shared files. Every source is gated on the GLOBAL key (schema + bundle +
+  // event types) and each hit on the piece's own content hash.
+  const userCache =
+    opts.cacheFile && opts.cacheKey ? readCachedEntries(opts.cacheFile, opts.cacheKey) : null;
+  const sharedCaches = (opts.sharedCacheFiles ?? [])
+    .map((f) => (opts.cacheKey ? readCachedEntries(f, opts.cacheKey) : null))
+    .filter((m): m is Map<string, CachedPieceEntry> => m !== null);
 
-  const handle = await opts.runtime.acquire({ runId, projectId });
   const out: PieceCatalogEntry[] = [];
   const failures: PieceExtractionFailure[] = [];
-  const overallDeadline = Date.now() + overallTimeoutMs;
-  try {
-    for (const piece of discovered) {
-      if (Date.now() > overallDeadline) {
-        const pending = discovered.length - out.length - failures.length;
-        if (pending > 0) {
-          reporter(
-            `overall extraction deadline (${overallTimeoutMs}ms) exceeded; ${pending} piece(s) skipped`,
-          );
-          for (const skipped of discovered.slice(out.length + failures.length)) {
-            failures.push({
-              pieceName: skipped.name,
-              pieceVersion: skipped.version,
-              reason: "overall extraction deadline exceeded",
-            });
+  /** Entries the USER cache file should contain after this build (its own
+   * previous hits + fresh extractions; shared-served entries excluded so
+   * per-user files stay small). */
+  const userEntries: Record<string, CachedPieceEntry> = {};
+  const misses: Array<{ piece: PieceDiscoveryEntry; contentHash: string }> = [];
+
+  for (const piece of discovered) {
+    const key = `${piece.name}@${piece.version}`;
+    const contentHash = pieceContentHash(piece.dir);
+    const own = userCache?.get(key);
+    if (own && own.contentHash === contentHash) {
+      out.push(own.entry);
+      userEntries[key] = own;
+      continue;
+    }
+    const shared = sharedCaches
+      .map((m) => m.get(key))
+      .find((e) => e != null && e.contentHash === contentHash);
+    if (shared) {
+      out.push(shared.entry);
+      continue;
+    }
+    misses.push({ piece, contentHash });
+  }
+
+  // Full cache hit: no engine spawn at all (the common warm-boot path — and,
+  // with a prebuilt shared cache, the common FIRST-boot path too).
+  let extracted = 0;
+  if (misses.length > 0) {
+    const projectId = opts.projectId ?? DEFAULT_IDS.project;
+    // A FRESH run id per engine: the loop below replaces the engine after a
+    // failure, and two live sandboxes must not share one.
+    const newRunId = () => "metadata-extract-" + SandboxRegistry.newSandboxId();
+
+    let handle = await opts.runtime.acquire({ runId: newRunId(), projectId });
+    /** Set while `handle` has already been released and not yet replaced, so
+     * the `finally` below cannot release the same engine twice. */
+    let handleReleased = false;
+    const overallDeadline = Date.now() + overallTimeoutMs;
+    let processed = 0;
+    let consecutiveTimeouts = 0;
+    try {
+      for (const { piece, contentHash } of misses) {
+        if (Date.now() > overallDeadline) {
+          const pending = misses.length - processed;
+          if (pending > 0) {
+            reporter(
+              `overall extraction deadline (${overallTimeoutMs}ms) exceeded; ${pending} piece(s) skipped`,
+            );
+            for (const skipped of misses.slice(processed)) {
+              failures.push({
+                pieceName: skipped.piece.name,
+                pieceVersion: skipped.piece.version,
+                reason: "overall extraction deadline exceeded",
+              });
+            }
           }
+          break;
         }
-        break;
-      }
-      try {
-        const meta = await withTimeout(
-          handle.extractPieceMetadata({
+        processed++;
+        try {
+          const meta = await withTimeout(
+            handle.extractPieceMetadata({
+              pieceName: piece.name,
+              pieceVersion: piece.version,
+            }),
+            pieceTimeoutMs,
+            `extract ${piece.name}@${piece.version} timed out after ${pieceTimeoutMs}ms`,
+          );
+          const entry = metadataToCatalogEntry(meta);
+          out.push(entry);
+          userEntries[`${piece.name}@${piece.version}`] = { contentHash, entry };
+          extracted++;
+          consecutiveTimeouts = 0;
+        } catch (e) {
+          const reason = e instanceof Error ? e.message : String(e);
+          failures.push({
             pieceName: piece.name,
             pieceVersion: piece.version,
-          }),
-          pieceTimeoutMs,
-          `extract ${piece.name}@${piece.version} timed out after ${pieceTimeoutMs}ms`,
-        );
-        out.push(metadataToCatalogEntry(meta));
-      } catch (e) {
-        const reason = e instanceof Error ? e.message : String(e);
-        failures.push({
-          pieceName: piece.name,
-          pieceVersion: piece.version,
-          reason,
-        });
-        reporter(`extract ${piece.name}@${piece.version} failed: ${reason}`);
+            reason,
+          });
+          reporter(`extract ${piece.name}@${piece.version} failed: ${reason}`);
+
+          // An error REPLY means the engine answered: it is alive, idle and
+          // reusable, so keep it. Only a timeout is grounds for destroying it.
+          //
+          // This distinction is what stops the give-up below from ending a
+          // healthy build. Discovery is sorted, which groups piece families
+          // (piece-google-*, piece-microsoft-*), and the shared-runtime build
+          // installs with --ignore-scripts, so one broken dependency across a
+          // family yields a run of error replies from engines that answered
+          // promptly every time. Counting those as evidence of a wedge would
+          // abandon the remaining hundreds of pieces over a handful of bad
+          // ones.
+          if (!(e instanceof PieceExtractionTimeoutError)) continue;
+
+          consecutiveTimeouts++;
+
+          // NO ANSWER: replace the engine. `withTimeout` above stopped waiting
+          // but nothing cancelled the operation -- there is no cancel message
+          // in EngineContract -- so this engine is still working on the piece
+          // we gave up on, and the next one would queue behind it and time out
+          // too. That is the shape the hosted build hit: one failure, then 658
+          // timeouts against a process still alive at 486MB.
+          //
+          // `release()` is the right call and not a shortcut: it kills rather
+          // than pools an engine with work still in flight, and the send() we
+          // abandoned is exactly that (`inFlight` is still 1 here, because it
+          // is decremented in send()'s own finally, which has not run). On an
+          // error reply it would instead PARK the process under `pool: true`
+          // and hand the same one back on the next acquire -- another reason
+          // the two cases are not interchangeable.
+          //
+          // The transport has its own deadline that marks such an engine
+          // abandoned, but it is CONTROL_OPERATION_TIMEOUT_S (60s) plus a 30s
+          // margin, always later than this loop's budget, so it never fires
+          // first and that machinery never runs.
+          handleReleased = true;
+          await handle.release().catch(() => {
+            // A failed release is a leaked engine, not a reason to abandon the
+            // build; the run id is dead either way.
+          });
+
+          if (consecutiveTimeouts >= maxConsecutiveTimeouts) {
+            const pending = misses.length - processed;
+            reporter(
+              `${consecutiveTimeouts} extractions in a row got no answer from the engine; ` +
+                `giving up with ${pending} piece(s) unattempted (a wedged engine costs ` +
+                `${pieceTimeoutMs}ms on every remaining piece)`,
+            );
+            for (const skipped of misses.slice(processed)) {
+              failures.push({
+                pieceName: skipped.piece.name,
+                pieceVersion: skipped.piece.version,
+                reason: `not attempted: gave up after ${consecutiveTimeouts} consecutive extraction timeouts`,
+              });
+            }
+            break;
+          }
+
+          try {
+            handle = await opts.runtime.acquire({ runId: newRunId(), projectId });
+            handleReleased = false;
+          } catch (spawnErr) {
+            // No engine, no catalog. Report the rest rather than throwing away
+            // the entries that already extracted successfully.
+            const why = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
+            reporter(`could not start a replacement engine: ${why}`);
+            for (const skipped of misses.slice(processed)) {
+              failures.push({
+                pieceName: skipped.piece.name,
+                pieceVersion: skipped.piece.version,
+                reason: `not attempted: replacement engine could not start (${why})`,
+              });
+            }
+            break;
+          }
+        }
       }
+    } finally {
+      if (!handleReleased) await handle.release();
     }
-  } finally {
-    await handle.release();
   }
 
   // Cache write policy: persist the successful entries even when some
@@ -516,22 +727,33 @@ export async function buildPieceCatalog(
   // one was uninstalled. The catalog endpoint already returns only
   // successes (failures are surfaced via the daemon log + audit
   // script), so persisting the partial set is strictly better than
-  // discarding it. We still skip the write when zero pieces succeeded
-  // -- there's nothing useful to cache.
-  if (opts.cacheFile && opts.cacheKey && out.length > 0) {
+  // discarding it. Written only when something was freshly extracted —
+  // a pure cache-hit boot (or a pure shared-cache boot) leaves the
+  // user's file untouched.
+  if (opts.cacheFile && opts.cacheKey && extracted > 0) {
     mkdirSync(dirname(opts.cacheFile), { recursive: true });
-    const payload: CacheFileShape = { cacheKey: opts.cacheKey, entries: out };
+    const payload: CacheFileShape = { cacheKey: opts.cacheKey, pieces: userEntries };
     writeFileSync(opts.cacheFile, JSON.stringify(payload, null, 2) + "\n");
   }
   return { catalog: new PieceCatalog(out), failures };
 }
+
+/**
+ * Thrown when an extraction outruns its per-piece budget.
+ *
+ * A distinct type because the two failure shapes need opposite handling and a
+ * substring match on a message is not a fact: an engine that ANSWERED with an
+ * error is alive and reusable, an engine that did not answer is still working
+ * on the piece we walked away from and must be destroyed.
+ */
+export class PieceExtractionTimeoutError extends Error {}
 
 /** Race a promise against a timeout; rejects with `message` on timeout. */
 function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
   return Promise.race([
     p,
     new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(message)), ms),
+      setTimeout(() => reject(new PieceExtractionTimeoutError(message)), ms),
     ),
   ]);
 }
@@ -563,6 +785,7 @@ export interface RawPieceMetadata {
 }
 
 export interface RawActionOrTrigger {
+  requireAuth?: boolean;
   name?: string;
   displayName?: string;
   description?: string;
@@ -578,6 +801,7 @@ export interface RawProp {
   description?: string;
   placeholder?: string;
   required?: boolean;
+  properties?: Record<string, unknown>;
   defaultValue?: unknown;
   options?: { options?: Array<{ value: unknown; label?: string; description?: string }> };
 }
@@ -766,6 +990,7 @@ function rawActionToCatalogAction(
     displayName: typeof raw.displayName === "string" ? raw.displayName : fallbackName,
     description: typeof raw.description === "string" ? raw.description : "",
   };
+  if (typeof raw.requireAuth === 'boolean') out.requireAuth = raw.requireAuth;
   if (raw.props) {
     out.inputSchema = propsToInputSchema(raw.props);
   }
@@ -799,6 +1024,7 @@ function mapProp(name: string, prop: RawProp): PieceInputField | null {
   if (type === null) return null; // auth fields, markdown -- not user inputs
   const out: PieceInputField = {
     name,
+    sourceType: prop.type,
     label:
       typeof prop.displayName === "string" && prop.displayName.length > 0
         ? prop.displayName
@@ -813,6 +1039,10 @@ function mapProp(name: string, prop: RawProp): PieceInputField | null {
     out.placeholder = prop.placeholder;
   }
   if (prop.defaultValue !== undefined) out.default = prop.defaultValue;
+  if (prop.type === 'ARRAY') {
+    out.arrayHasProperties = !!prop.properties;
+    if (prop.properties !== undefined) out.arrayProperties = prop.properties;
+  }
   if (
     (type === "enum" || type === "multi_enum") &&
     prop.options &&

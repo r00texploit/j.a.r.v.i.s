@@ -18,6 +18,7 @@ import {
   claimNextJob,
   completeJob,
   failJob,
+  getJob,
   type Job,
 } from "../db/repos/job-queue";
 
@@ -28,7 +29,7 @@ export interface WorkerOptions {
   handlers: Record<string, JobHandler>;
   /** Idle poll interval; lower = lower latency, higher CPU. Default 250ms. */
   pollIntervalMs?: number;
-  /** Lease for a claimed job. If a worker dies mid-job the lease lapses and another claim picks it up. */
+  /** Lease for retryable jobs. Workflow execution claims are never reassigned. */
   leaseMs?: number;
   /** Optional logger; defaults to console. Pass a no-op to silence. */
   log?: (line: string) => void;
@@ -125,8 +126,10 @@ export class Worker {
     }
     try {
       await handler(job);
-      completeJob(job.id);
+      // Cancellation is terminal queue bookkeeping, not a handler failure.
+      if (getJob(job.id)?.status === "RUNNING") completeJob(job.id);
     } catch (e) {
+      if (getJob(job.id)?.status === "CANCELED") return;
       const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       this.log(`job ${job.id} (${job.jobType}) failed: ${msg}`);
       try {

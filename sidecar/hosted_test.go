@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -89,13 +92,7 @@ func fakeHandshakeServer(t *testing.T, poll func(n int, w http.ResponseWriter)) 
 // A structurally valid unsigned-looking JWT for DecodeJWTPayload.
 func testJWT(t *testing.T) string {
 	t.Helper()
-	header := `{"alg":"ES256"}`
-	payload := `{"sid":"s1","name":"desktop","brain":"wss://x/sidecar/connect","jwks":"https://x/jwks.json","iat":1}`
-	enc := func(s string) string {
-		return strings.TrimRight(strings.NewReplacer("+", "-", "/", "_").Replace(
-			base64StdNoPad(s)), "=")
-	}
-	return enc(header) + "." + enc(payload) + ".sig"
+	return enrollJWT(t, "wss://x/sidecar/connect")
 }
 
 func base64StdNoPad(s string) string {
@@ -256,5 +253,32 @@ func TestHostedShellWithErrorBakesTheMessageIn(t *testing.T) {
 	}
 	if strings.Contains(html, "/*__BOOT__*/") {
 		t.Fatal("placeholder was not replaced")
+	}
+}
+
+func TestHostedShellWithSelfHostHintBakesTheBootIn(t *testing.T) {
+	html := hostedShellWithSelfHostHint()
+	if !strings.Contains(html, "window.__setSelfHostHint();") {
+		t.Fatalf("boot script missing:\n%s", html)
+	}
+	if strings.Contains(html, "/*__BOOT__*/") {
+		t.Fatal("placeholder was not replaced")
+	}
+}
+
+func TestIsNoSuchHostErr(t *testing.T) {
+	// The wrapped shape url.Error{Op:"Post"} -> net.OpError -> net.DNSError is
+	// what hostedHTTPClient.Do returns when the hosted origin doesn't resolve.
+	dns := &net.DNSError{Err: "no such host", Name: "app.usejarvis.dev", IsNotFound: true}
+	wrapped := &url.Error{Op: "Post", URL: "https://app.usejarvis.dev/api/handshake/register",
+		Err: &net.OpError{Op: "dial", Net: "tcp", Err: dns}}
+	if !isNoSuchHostErr(wrapped) {
+		t.Fatal("wrapped DNS not-found error not detected")
+	}
+	if isNoSuchHostErr(&net.DNSError{Err: "server misbehaving", Name: "app.usejarvis.dev"}) {
+		t.Fatal("transient DNS error must not count as no-such-host")
+	}
+	if isNoSuchHostErr(errors.New("connection refused")) {
+		t.Fatal("non-DNS error must not count as no-such-host")
 	}
 }

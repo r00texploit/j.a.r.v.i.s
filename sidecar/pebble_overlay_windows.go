@@ -139,6 +139,16 @@ type pebbleServiceWindows struct {
 
 	hwnd uintptr
 
+	// The main cursor pebble owns one reusable software surface for its whole
+	// lifetime. Recreating a 32-bit DIB and memory DC on every 16 ms frame was
+	// needlessly expensive and could make the hardware cursor feel sluggish on
+	// some Windows machines. These handles are created on the overlay thread in
+	// createWindow and released on that same thread in destroyWindow.
+	renderDC        uintptr
+	renderDIB       uintptr
+	renderOldBitmap uintptr
+	renderBits      unsafe.Pointer
+
 	// hotkeyStop / paletteHotkeyStop / paletteMouseHookStop are cleanup
 	// functions for the summon (Ctrl+Space) hotkey, the Ctrl+K palette hotkey,
 	// and the Ctrl+MMB low-level mouse hook respectively. Called on Close.
@@ -255,9 +265,19 @@ func (s *pebbleServiceWindows) Spawn(spec PebbleSpec) error {
 // purely visual now — state changes flow exclusively from the daemon via
 // SetState() so the brain stays the source of truth (wake-word, LLM
 // lifecycle, manual hotkey all funnel through the same path).
+// Called INLINE, not `go cb()` (#587). The hotkey dispatcher already runs this
+// on its own goroutine, and it holds a claim across the call -- that claim is
+// what lets stop() promise no callback begins after it returns, and what makes
+// the in-flight count in its log mean anything. Re-spawning here handed the
+// real callback to an unclaimed goroutine, so the gate only ever suppressed
+// this two-line trampoline while cb ran on regardless, and the count was
+// structurally zero by the time stop() read it.
+//
+// Linux and darwin have always called cb() inline for this reason
+// (pebble_overlay_linux.go, pebble_overlay_darwin.go); this was the odd one out.
 func (s *pebbleServiceWindows) onSummonHotkey() {
 	if cb, ok := s.summonCallback.Load().(func()); ok && cb != nil {
-		go cb()
+		cb()
 	}
 }
 
@@ -266,8 +286,9 @@ func (s *pebbleServiceWindows) OnSummon(callback func()) {
 }
 
 // onPaletteHotkey fires the user-supplied palette callback. Like the summon
-// callback, this runs on whatever goroutine the hotkey listener used; the
-// daemon owns the open/close lifecycle of the palette panel itself.
+// callback, this runs on the goroutine the hotkey dispatcher gave it, inline
+// and not re-spawned -- see onSummonHotkey for why that matters. The daemon
+// owns the open/close lifecycle of the palette panel itself.
 func (s *pebbleServiceWindows) onPaletteHotkey() {
 	cb, ok := s.paletteCallback.Load().(func())
 	if !ok || cb == nil {
@@ -275,7 +296,7 @@ func (s *pebbleServiceWindows) onPaletteHotkey() {
 		return
 	}
 	log.Printf("[pebble] palette hotkey fired — invoking callback")
-	go cb()
+	cb()
 }
 
 func (s *pebbleServiceWindows) OnPalette(callback func()) {
@@ -319,6 +340,7 @@ func (s *pebbleServiceWindows) Close() error {
 // destroyWindow tears down the layered window. The shared runtime
 // (runPebbleLoop) calls it when the frame loop exits. Implements pebblePlatform.
 func (s *pebbleServiceWindows) destroyWindow() {
+	s.destroyRenderSurface()
 	if s.hwnd != 0 {
 		procDestroyWindow.Call(s.hwnd)
 		s.hwnd = 0
@@ -350,18 +372,19 @@ func (s *pebbleServiceWindows) pumpMessages() {
 
 // ─────────────────────────── Window creation ────────────────────────────────
 
-// Window size and anchor — the window is sized to fit the pebble pill PLUS
-// a bubble that drops below it. Most pixels are alpha=0 (true transparent);
-// only the pebble + bubble paint visible content. The pebble's centre is
-// pinned at (pebbleAnchorX, pebbleAnchorY) within the window, and the
-// window is positioned so that anchor lands at (cursor + offset).
+// The backing-buffer dimensions remain large because the Windows drawing
+// helpers are shared with sub-pebbles and the dormant bubble renderer. The
+// main cursor pebble itself no longer paints a bubble, so its actual layered
+// window is cropped to the visual's bounds. This prevents DWM from moving and
+// blending a mostly-transparent 460x480 surface whenever the cursor moves.
 const (
-	// Window is sized to hold the disc PLUS a generous bubble area that
-	// drops below — large enough for multi-paragraph responses without
-	// ellipsizing. The disc still anchors near the top-left so cursor-
-	// follow math is unchanged from the smaller-window design.
 	pebbleWindowW = 460
 	pebbleWindowH = 480
+
+	// Includes the drop's 2.1x glow, the pointing halo, and the awareness eye
+	// around the (40,28) anchor, with a few pixels of AA breathing room.
+	mainPebbleWindowW = 72
+	mainPebbleWindowH = 64
 	// pebbleAnchorX / pebbleAnchorY are shared in pebble_core.go.
 )
 
@@ -396,8 +419,8 @@ func (s *pebbleServiceWindows) createWindow() error {
 	style := uintptr(pblWsPopup | pblWsVisible)
 	x := int32(0)
 	y := int32(0)
-	w := int32(pebbleWindowW)
-	h := int32(pebbleWindowH)
+	w := int32(mainPebbleWindowW)
+	h := int32(mainPebbleWindowH)
 
 	hwnd, _, err := procCreateWindowExW.Call(
 		exStyle,
@@ -427,7 +450,82 @@ func (s *pebbleServiceWindows) createWindow() error {
 		swpNoMove|swpNoSize|swpNoActivate|swpShowWindow)
 
 	s.hwnd = hwnd
+	if err := s.createRenderSurface(); err != nil {
+		procDestroyWindow.Call(hwnd)
+		s.hwnd = 0
+		return err
+	}
 	return nil
+}
+
+// createRenderSurface allocates the main pebble's memory DC and DIB once.
+// The DIB keeps the shared renderer's 460 px stride, but only the top
+// mainPebbleWindowH rows are cleared, drawn, and presented for this overlay.
+func (s *pebbleServiceWindows) createRenderSurface() error {
+	screenDC, _, _ := procGetDC.Call(0)
+	if screenDC == 0 {
+		return fmt.Errorf("GetDC failed")
+	}
+	defer procReleaseDC.Call(0, screenDC)
+
+	memDC, _, _ := procCreateCompatibleDC.Call(screenDC)
+	if memDC == 0 {
+		return fmt.Errorf("CreateCompatibleDC failed")
+	}
+
+	bi := pblBitmapInfo{
+		Header: pblBitmapInfoHeader{
+			BiSize:        uint32(unsafe.Sizeof(pblBitmapInfoHeader{})),
+			BiWidth:       pebbleWindowW,
+			BiHeight:      -pebbleWindowH,
+			BiPlanes:      1,
+			BiBitCount:    32,
+			BiCompression: 0,
+		},
+	}
+	var bits unsafe.Pointer
+	dib, _, _ := procCreateDIBSection.Call(
+		memDC,
+		uintptr(unsafe.Pointer(&bi)),
+		0, // DIB_RGB_COLORS
+		uintptr(unsafe.Pointer(&bits)),
+		0, 0,
+	)
+	if dib == 0 || bits == nil {
+		procDeleteDC.Call(memDC)
+		return fmt.Errorf("CreateDIBSection failed")
+	}
+
+	oldBitmap, _, _ := procSelectObject.Call(memDC, dib)
+	// SelectObject has two failure sentinels depending on object type:
+	// NULL and HGDI_ERROR ((HGDIOBJ)-1). Never retain HGDI_ERROR as the
+	// bitmap to restore during cleanup or the DIB/DC can leak.
+	if oldBitmap == 0 || oldBitmap == ^uintptr(0) {
+		procDeleteObjectGdi.Call(dib)
+		procDeleteDC.Call(memDC)
+		return fmt.Errorf("SelectObject failed")
+	}
+	s.renderDC = memDC
+	s.renderDIB = dib
+	s.renderOldBitmap = oldBitmap
+	s.renderBits = bits
+	return nil
+}
+
+func (s *pebbleServiceWindows) destroyRenderSurface() {
+	if s.renderDC != 0 && s.renderOldBitmap != 0 {
+		procSelectObject.Call(s.renderDC, s.renderOldBitmap)
+	}
+	if s.renderDIB != 0 {
+		procDeleteObjectGdi.Call(s.renderDIB)
+	}
+	if s.renderDC != 0 {
+		procDeleteDC.Call(s.renderDC)
+	}
+	s.renderDC = 0
+	s.renderDIB = 0
+	s.renderOldBitmap = 0
+	s.renderBits = nil
 }
 
 // pebbleWndProc handles WM_NCHITTEST (disc-only clicks) + WM_LBUTTONDOWN/UP
@@ -573,72 +671,30 @@ func (s *pebbleServiceWindows) present() error {
 	winX := s.renderedX.Load()
 	winY := s.renderedY.Load()
 
-	// Create memory DC + 32-bit DIB
+	if s.renderDC == 0 || s.renderBits == nil {
+		return fmt.Errorf("pebble render surface is not initialized")
+	}
+
+	// Acquire only the desktop DC needed by UpdateLayeredWindow. The memory DC
+	// and DIB are persistent for the overlay's lifetime.
 	screenDC, _, _ := procGetDC.Call(0)
+	if screenDC == 0 {
+		return fmt.Errorf("GetDC failed")
+	}
 	defer procReleaseDC.Call(0, screenDC)
-	memDC, _, _ := procCreateCompatibleDC.Call(screenDC)
-	defer procDeleteDC.Call(memDC)
 
-	bi := pblBitmapInfo{
-		Header: pblBitmapInfoHeader{
-			BiSize:        uint32(unsafe.Sizeof(pblBitmapInfoHeader{})),
-			BiWidth:       pebbleWindowW,
-			BiHeight:      -pebbleWindowH, // top-down
-			BiPlanes:      1,
-			BiBitCount:    32,
-			BiCompression: 0,
-		},
-	}
-	var bits unsafe.Pointer
-	dib, _, _ := procCreateDIBSection.Call(
-		memDC,
-		uintptr(unsafe.Pointer(&bi)),
-		0, // DIB_RGB_COLORS
-		uintptr(unsafe.Pointer(&bits)),
-		0, 0,
-	)
-	if dib == 0 {
-		return fmt.Errorf("CreateDIBSection failed")
-	}
-	// Save the DC's default bitmap and restore it before deleting the DIB.
-	// DeleteObject fails on a bitmap still selected into a DC (and DeleteDC does
-	// NOT free a selected bitmap), so without the restore the DIB and its
-	// full-window pixel buffer leak every frame -> GDI handle/memory exhaustion
-	// within minutes at the 60fps frame loop. defer LIFO ordering puts this
-	// before the procDeleteDC(memDC) defer above, which is required.
-	oldBmp, _, _ := procSelectObject.Call(memDC, dib)
-	defer func() {
-		procSelectObject.Call(memDC, oldBmp)
-		procDeleteObjectGdi.Call(dib)
-	}()
-
-	pixels := unsafe.Slice((*uint32)(bits), pebbleWindowW*pebbleWindowH)
-	for i := range pixels {
+	pixels := unsafe.Slice((*uint32)(s.renderBits), pebbleWindowW*pebbleWindowH)
+	// The main renderer never paints below its compact layered-window crop.
+	// Clear just those rows instead of all 220,800 backing pixels.
+	for i := range pixels[:pebbleWindowW*mainPebbleWindowH] {
 		pixels[i] = 0
 	}
 	state, _ := s.state.Load().(PebbleState)
-	// Auto-fit bubble height: measure the wrapped body text first (DT_CALCRECT
-	// against the same memDC + body font we'll paint with) so the rounded card
-	// is exactly tall enough to hold the response — no wasted black space for
-	// short replies, but still capped so it can't overflow the layered window.
-	bubbleY1 := s.computeBubbleBottom(memDC, state)
-	s.drawState(pixels, state, bubbleY1)
-	// GDI text rendering on top of the bubble's fully-opaque (alpha=255)
-	// pixels. DrawText writes RGB *and corrupts* alpha on the glyph
-	// pixels — repairBubbleTextAlpha clamps alpha back to 255 across the
-	// text region so the bubble doesn't end up "see-through" wherever
-	// glyphs were drawn.
-	if state == PebbleListening || state == PebbleSpeaking {
-		s.drawBubbleText(memDC, state, bubbleY1)
-		repairBubbleTextAlpha(pixels, bubbleY1)
-		// Long-answer overflow button — only meaningful while bubble shows.
-		s.drawAnswerOverflowButton(pixels, state == PebbleSpeaking, bubbleY1)
-		s.drawAnswerOverflowButtonText(memDC, state == PebbleSpeaking, bubbleY1)
-		repairBubbleTextAlpha(pixels, bubbleY1)
-		s.lastBubbleY1.Store(bubbleY1)
-	} else {
-		s.lastBubbleY1.Store(0)
-	}
+	// No transcript bubble: the speaking state is just the blue drop (see
+	// drawState). The pebble never paints a caption card at the cursor, so
+	// there's no bubble height to measure and no glyph alpha to repair.
+	s.drawState(pixels, state, 0)
+	s.lastBubbleY1.Store(0)
 	// W6-T4 — outward halo around disc when JARVIS is remotely controlling
 	// (PointAt active). Drawn before the eye glyph so the glyph sits on
 	// top of the halo, not under it.
@@ -666,7 +722,7 @@ func (s *pebbleServiceWindows) present() error {
 		AlphaFormat:         acSrcAlpha,
 	}
 	winPt := pblPoint{X: winX, Y: winY}
-	winSz := pblSize{CX: pebbleWindowW, CY: pebbleWindowH}
+	winSz := pblSize{CX: mainPebbleWindowW, CY: mainPebbleWindowH}
 	srcPt := pblPoint{X: 0, Y: 0}
 
 	r, _, _ := procUpdateLayeredWindow.Call(
@@ -674,7 +730,7 @@ func (s *pebbleServiceWindows) present() error {
 		screenDC,
 		uintptr(unsafe.Pointer(&winPt)),
 		uintptr(unsafe.Pointer(&winSz)),
-		memDC,
+		s.renderDC,
 		uintptr(unsafe.Pointer(&srcPt)),
 		0, // crKey (unused with ULW_ALPHA)
 		uintptr(unsafe.Pointer(&blend)),

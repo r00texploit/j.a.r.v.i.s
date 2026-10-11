@@ -34,6 +34,8 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  accessSync,
+  constants as fsConstants,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -85,6 +87,9 @@ export interface BuildPieceOptions {
 function pieceHash(pieceDir: string): string {
   const hasher = createHash("sha256");
   hasher.update(bundleHash()).update("\0");
+  // Jarvis pieces import the daemon's pure action-outcome wire contract.
+  // Include it so contract edits cannot leave an old assertion in dist/.
+  hasher.update(readFileSync(resolve(ENGINE_BUILD_PATHS.VENDOR_PACKAGES, '../../../actions/action-outcome.ts'))).update('\0');
   const pkgPath = resolve(pieceDir, "package.json");
   if (existsSync(pkgPath)) {
     hasher.update(readFileSync(pkgPath)).update("\0");
@@ -131,7 +136,11 @@ async function ensureStagingInstalled(): Promise<void> {
   // they used to throw on missing esbuild. Now both paths share the
   // same install promise (bun install dedupes naturally; consecutive
   // calls return without re-running once the tree is in place).
-  if (existsSync(resolve(STAGING_NODE_MODULES, "esbuild"))) return;
+  //
+  // ALWAYS delegated (#836): an "esbuild is there" shortcut here accepted a
+  // staging tree installed for another lockfile, or one an install died half
+  // way through, and compiled pieces against it under the new hash. The
+  // engine path's check is cheap once the tree is stamped.
   await ensureEngineStagingInstalled();
 }
 
@@ -178,6 +187,21 @@ export async function buildPiece(
 
   // Miss path: stage check first (esbuild presence is required for the
   // actual build below; the cached path above never reaches it).
+  //
+  // Read-only install guard (multi-tenant hosting): the install tree is
+  // root-owned and tenants cannot write dist/. Published versions ship
+  // prebuilt dist/ so the fast-path above normally hits — reaching HERE on a
+  // read-only tree means the version was published without them, which every
+  // instance on the host would rediscover as a raw EACCES mid-boot. Fail
+  // with the actionable message instead.
+  try {
+    accessSync(pieceDir, fsConstants.W_OK);
+  } catch {
+    throw new Error(
+      `piece ${pkg.name} needs a rebuild (missing/stale dist/) but the install tree is read-only — ` +
+        `this version was published without prebuilt piece bundles; republish with 'bun run build:workflows'`,
+    );
+  }
   await ensureStagingInstalled();
   mkdirSync(resolve(distDir, "src"), { recursive: true });
 

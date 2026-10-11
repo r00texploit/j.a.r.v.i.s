@@ -1,5 +1,197 @@
 import type { AppController, WindowInfo, UIElement } from './interface.ts';
+import { ActionOutcomeError } from '../action-outcome.ts';
+import { awaitCaptureTool, awaitCaptureToolOutput, CaptureTimeoutError, captureViaPrivateFileAsync } from './capture-file.ts';
 import { $ } from 'bun';
+import { modelExecEnv } from '../../util/model-exec-env.ts';
+
+/**
+ * Key names xdotool can press: X keysym names (Return, minus, F5, XF86AudioPlay,
+ * U20AC) and xdotool's aliases (ctrl, alt, super, enter). Anything else is
+ * ignored or rejected by xdotool itself, so refusing it loses no working key,
+ * and it keeps a leading "-" from ever reaching xdotool.
+ *
+ * This, the command checks and MAX_CHORD_KEYS are mirrored by the sidecar's
+ * checkXdotoolKeySequence (sidecar/desktop_linux.go); keep them in sync.
+ */
+const KEYSYM_NAME = /^[A-Za-z0-9_]+$/;
+
+/**
+ * xdotool's commands (its dispatch table). `xdotool key` stops at the first
+ * argument that names one and runs it as a chained command, `--` or not, so a
+ * lone key spelled like a command ("exec", "selectwindow") would run that
+ * command instead of being pressed. pressKeys also ends the argument with "+"
+ * (see there), which no command name contains; refusing these as well keeps a
+ * later edit to that argument from reopening the hole.
+ */
+const XDOTOOL_COMMANDS = new Set([
+  'behave', 'behave_screen_edge', 'click', 'exec', 'get_desktop',
+  'get_desktop_for_window', 'get_desktop_viewport', 'get_num_desktops',
+  'getactivewindow', 'getdisplaygeometry', 'getmouselocation', 'getwindowclassname',
+  'getwindowfocus', 'getwindowgeometry', 'getwindowname', 'getwindowpid', 'help',
+  'key', 'keydown', 'keyup', 'mousedown', 'mousemove', 'mousemove_relative', 'mouseup',
+  'search', 'selectwindow', 'set_desktop', 'set_desktop_for_window',
+  'set_desktop_viewport', 'set_num_desktops', 'set_window', 'sleep', 'type', 'version',
+  'windowactivate', 'windowclose', 'windowfocus', 'windowkill', 'windowlower',
+  'windowmap', 'windowminimize', 'windowmove', 'windowquit', 'windowraise',
+  'windowreparent', 'windowsize', 'windowstate', 'windowunmap',
+]);
+
+/**
+ * libxdo grows its key array with the wrong element size once a sequence
+ * reaches 10 keys (xdo.c `realloc(*keys, keys_size * sizeof(KeyCode))`) and
+ * then writes past it. No real chord comes close, so stay well below.
+ */
+const MAX_CHORD_KEYS = 8;
+
+/**
+ * Real keysyms that share a name with a command. Help (the "help" command) is
+ * the only one. The trailing "+" in pressKeys is what lets it be pressed; were
+ * that ever lost, xdotool would merely print its help text.
+ */
+const KEYSYMS_NAMED_LIKE_COMMANDS = new Set(['Help']);
+
+/**
+ * The friendly key names the tool description advertises ("ctrl,s", "alt,f4",
+ * "enter", "tab", "escape"; modifiers ctrl, alt, shift, win), mapped to the
+ * names xdotool actually presses. X keysym names are case-sensitive, so
+ * "escape", "f4" and "pgup" are not keys at all: without this table the local
+ * path refused exactly the names the description tells the model to use, while
+ * the same names worked when the call was routed to a sidecar.
+ *
+ * A PORT of the sidecar's mapKeyToXdotool plus the modifier arm of
+ * convertKeysToXdotool (sidecar/desktop_linux.go); keep the two in sync. Every
+ * entry is the sidecar's, and only the sidecar's: a name the sidecar leaves
+ * alone is left alone here too, so a chord cannot press one key locally and
+ * another through a sidecar.
+ *
+ * Unlike the sidecar this does NOT reorder anything. The sidecar takes a
+ * comma-separated string and hoists the modifiers to the front; here the chord
+ * arrives as a list and its order is the caller's. Hoisting would silently turn
+ * "a,ctrl" (press a, then hold ctrl) into Ctrl+A, i.e. a different action, and
+ * the order a model writes is already modifiers-first.
+ */
+export const FRIENDLY_KEY_NAMES: ReadonlyMap<string, string> = new Map(Object.entries({
+  // convertKeysToXdotool's modifier arm. xdotool's own aliases, so these are
+  // identities except "control", which xdotool does accept but the sidecar
+  // normalizes.
+  ctrl: 'ctrl', control: 'ctrl', alt: 'alt', shift: 'shift', super: 'super', win: 'super',
+  // mapKeyToXdotool.
+  enter: 'Return', return: 'Return',
+  tab: 'Tab',
+  escape: 'Escape', esc: 'Escape',
+  backspace: 'BackSpace', bs: 'BackSpace',
+  delete: 'Delete', del: 'Delete',
+  up: 'Up', down: 'Down', left: 'Left', right: 'Right',
+  home: 'Home', end: 'End',
+  pageup: 'Page_Up', pgup: 'Page_Up',
+  pagedown: 'Page_Down', pgdn: 'Page_Down',
+  space: 'space',
+  f1: 'F1', f2: 'F2', f3: 'F3', f4: 'F4', f5: 'F5', f6: 'F6',
+  f7: 'F7', f8: 'F8', f9: 'F9', f10: 'F10', f11: 'F11', f12: 'F12',
+}));
+
+/**
+ * One key name as xdotool spells it. An unknown name passes through unchanged
+ * (the sidecar's default arm), so X keysym names, xdotool aliases and single
+ * characters are untouched and the validation below still sees them.
+ *
+ * No mapped name is option-shaped or an xdotool command name, so mapping can
+ * only ever turn a name xdotool would refuse into one it presses -- never the
+ * other way round, and never past the checks in toXdotoolKeySequence, which run
+ * on the mapped names as the sidecar's run on its mapped combo.
+ *
+ * One input lowercases differently from the sidecar's `strings.ToLower`: JS
+ * expands U+0130 (dotted capital I) to "i" + U+0307, Go's simple fold does not,
+ * so "WİN" is "win" to the sidecar and stays "WİN" here. That direction is the
+ * safe one -- an unmapped name is then REFUSED by KEYSYM_NAME below, never
+ * pressed as some other key. Only names containing "i" can differ at all
+ * (shift, win, right); U+0131, U+212A and U+1E9E fold the same in both.
+ */
+export function mapKeyToXdotool(key: string): string {
+  return FRIENDLY_KEY_NAMES.get(key.toLowerCase()) ?? key;
+}
+
+/** A refused chord never reaches xdotool: the caller should fix the key names, not check what happened. */
+function invalidKeys(message: string): ActionOutcomeError {
+  return new ActionOutcomeError({ status: 'error', code: 'DESKTOP_INVALID_KEYS', effect: 'not_started',
+    message: `Error: ${message}. Nothing was pressed.` });
+}
+
+/**
+ * Join a chord like ["ctrl", "shift", "t"] into xdotool's "ctrl+shift+t",
+ * refusing anything that xdotool would read as other than a key sequence.
+ * Each "+"-separated name is mapped through mapKeyToXdotool and then checked,
+ * so a key given as "ctrl+s" still works and "alt+f4" becomes "alt+F4"; empty
+ * names are skipped, as xdotool skips them. Mapping comes first and the checks
+ * see only mapped names, in the same order as the sidecar's: names, then empty,
+ * then count, then command names.
+ */
+export function toXdotoolKeySequence(keys: string[]): string {
+  // Empty segments are preserved rather than dropped (mapKeyToXdotool returns
+  // "" for one), so the returned sequence is what libxdo gets and skips,
+  // exactly as before the mapping existed.
+  const sequence = keys.join('+').split('+').map(part => mapKeyToXdotool(part)).join('+');
+  const names = sequence.split('+').filter(Boolean);
+  for (const name of names) {
+    if (!KEYSYM_NAME.test(name)) {
+      throw invalidKeys(`Invalid key name ${JSON.stringify(name)}: use X keysym names such as Return, Tab, minus, slash or F5`);
+    }
+  }
+  if (names.length === 0) {
+    throw invalidKeys('No keys given');
+  }
+  if (names.length > MAX_CHORD_KEYS) {
+    throw invalidKeys(`Too many keys in one chord (${names.length}); press at most ${MAX_CHORD_KEYS} at once`);
+  }
+  if (XDOTOOL_COMMANDS.has(sequence.toLowerCase()) && !KEYSYMS_NAMED_LIKE_COMMANDS.has(sequence)) {
+    const hint = sequence.toLowerCase() === 'help' ? ' (the Help key is spelled "Help")' : '';
+    throw invalidKeys(`"${sequence}" is an xdotool command name and cannot be pressed as a key${hint}`);
+  }
+  return sequence;
+}
+
+/**
+ * How every call that talks to the X server is spawned, and bounded: the
+ * captures, and since #895 the input and window calls too. Bun `$` has no
+ * timeout, so on a wedged X server those calls never settled and the agent
+ * waited on them forever (without blocking the event loop: `$` is async).
+ *
+ * The bound is CAPTURE_TIMEOUT_MS, 30 s, killed with SIGKILL. These calls are
+ * far quicker than a capture -- measured against WSLg's X server, n=30 each:
+ * `xdotool getmouselocation` median 3.2 ms (max 3.8), `getdisplaygeometry`
+ * 3.4 (max 207), `search --name .` 3.7, `xprop -root` 1.8 -- so the bound
+ * leaves ample room and only ever cuts off a call that is not coming back.
+ * The exception is `xdotool type`, whose time grows with the text: see
+ * TYPE_MS_PER_CHAR.
+ *
+ * CAPTURE_TOOL discards stdout (awaitCaptureTool); LOOKUP_TOOL returns it
+ * (awaitCaptureToolOutput).
+ */
+const CAPTURE_TOOL = { stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' } as const;
+const LOOKUP_TOOL = { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' } as const;
+
+/**
+ * How much longer `xdotool type` may run per character, on top of the bound.
+ * xdotool types with a 12 ms delay between keys by default; measured here as
+ * 12.8 ms per character, linear (50, 200 and 800 characters: 643, 2559 and
+ * 10220 ms median of 3 each). A flat 30 s would stop a text of about 2300
+ * characters part-way through; twice the measured rate keeps a slower machine
+ * clear of that too. Characters outside the keymap, which xdotool types by
+ * remapping a spare keycode for each, cost barely more (#895 review; 100
+ * characters, median of 3: e-acute 13.2 ms each, a CJK ideograph 13.3, an
+ * emoji 13.3, against 12.9 for "x"). Not measured: a remote X server, where
+ * each remap is a network round trip.
+ */
+const TYPE_MS_PER_CHAR = 26;
+
+/**
+ * Added to a typing or key-press timeout. The kill can land between a key's
+ * press and its release, or before --clearmodifiers puts the modifiers back,
+ * so a key can be left held down in the X server (#895 review). On a wedged
+ * server nothing could release it anyway, and which key it was is not known,
+ * so this says so rather than guessing at a clean-up.
+ */
+const KILLED_MID_INPUT = '. Some of the input may already have been sent, and a key may still be held down.';
 
 export class LinuxAppController implements AppController {
   private async checkTool(tool: string): Promise<boolean> {
@@ -27,14 +219,26 @@ export class LinuxAppController implements AppController {
     await this.ensureTool('xprop');
 
     try {
-      const windowId = (await $`xdotool getactivewindow`.text()).trim();
+      const windowId = (await awaitCaptureToolOutput(Bun.spawn(['xdotool', 'getactivewindow'], LOOKUP_TOOL), 'xdotool getactivewindow')).trim();
+      // Never pass an empty id below. Under Bun `$`, which these calls used
+      // to go through, an empty argument was dropped (see typeText), so
+      // `xdotool getwindowgeometry` ran with no window operand at all; argv
+      // would now pass "" instead, which is no better. xdotool's window
+      // operand is OPTIONAL -- it defaults to `%1`, the window stack -- so
+      // that call does not reliably fail, and whatever geometry it prints is
+      // not this window's. Those bounds are what clickElement turns into
+      // mousemove coordinates, so a missing id has to be an error rather than
+      // a plausible-looking rectangle.
+      if (!windowId) {
+        throw new Error('xdotool getactivewindow reported no window id');
+      }
 
-      const xpropOutput = await $`xprop -id ${windowId}`.text();
+      const xpropOutput = await awaitCaptureToolOutput(Bun.spawn(['xprop', '-id', windowId], LOOKUP_TOOL), 'xprop');
 
       const title = this.extractXpropValue(xpropOutput, 'WM_NAME') || 'Unknown';
       const className = this.extractXpropValue(xpropOutput, 'WM_CLASS') || 'Unknown';
 
-      const geometryOutput = await $`xdotool getwindowgeometry ${windowId}`.text();
+      const geometryOutput = await awaitCaptureToolOutput(Bun.spawn(['xdotool', 'getwindowgeometry', windowId], LOOKUP_TOOL), 'xdotool getwindowgeometry');
       const bounds = this.parseGeometry(geometryOutput);
 
       const pid = parseInt(this.extractXpropValue(xpropOutput, '_NET_WM_PID') || '0', 10);
@@ -68,29 +272,28 @@ export class LinuxAppController implements AppController {
       let windowIds: string[];
 
       if (hasWmctrl) {
-        const wmctrlOutput = await $`wmctrl -l -p`.text();
+        const wmctrlOutput = await awaitCaptureToolOutput(Bun.spawn(['wmctrl', '-l', '-p'], LOOKUP_TOOL), 'wmctrl');
         windowIds = wmctrlOutput
           .split('\n')
           .filter(line => line.trim())
           .map(line => line.split(/\s+/)[0] || '');
       } else {
-        const xdotoolOutput = await $`xdotool search --name "."`.text();
-        windowIds = xdotoolOutput.split('\n').filter(id => id.trim());
+        windowIds = await this.searchWindowIds();
       }
 
       const windows: WindowInfo[] = [];
-      const activeWindowId = (await $`xdotool getactivewindow`.text()).trim();
+      const activeWindowId = (await awaitCaptureToolOutput(Bun.spawn(['xdotool', 'getactivewindow'], LOOKUP_TOOL), 'xdotool getactivewindow')).trim();
 
       for (const windowId of windowIds) {
         if (!windowId) continue;
 
         try {
-          const xpropOutput = await $`xprop -id ${windowId}`.text();
+          const xpropOutput = await awaitCaptureToolOutput(Bun.spawn(['xprop', '-id', windowId], LOOKUP_TOOL), 'xprop');
           const title = this.extractXpropValue(xpropOutput, 'WM_NAME') || 'Unknown';
           const className = this.extractXpropValue(xpropOutput, 'WM_CLASS') || 'Unknown';
           const pid = parseInt(this.extractXpropValue(xpropOutput, '_NET_WM_PID') || '0', 10);
 
-          const geometryOutput = await $`xdotool getwindowgeometry ${windowId}`.text();
+          const geometryOutput = await awaitCaptureToolOutput(Bun.spawn(['xdotool', 'getwindowgeometry', windowId], LOOKUP_TOOL), 'xdotool getwindowgeometry');
           const bounds = this.parseGeometry(geometryOutput);
 
           windows.push({
@@ -100,8 +303,10 @@ export class LinuxAppController implements AppController {
             bounds,
             focused: windowId === activeWindowId,
           });
-        } catch {
-          // Skip windows that can't be queried
+        } catch (error) {
+          // Skip windows that can't be queried. A hung X server is not a
+          // window to skip, and would cost the bound once per window.
+          if (error instanceof CaptureTimeoutError) throw error;
           continue;
         }
       }
@@ -130,39 +335,71 @@ export class LinuxAppController implements AppController {
       const centerX = element.bounds.x + element.bounds.width / 2;
       const centerY = element.bounds.y + element.bounds.height / 2;
 
-      await $`xdotool mousemove ${Math.round(centerX)} ${Math.round(centerY)}`;
+      await awaitCaptureTool(Bun.spawn(['xdotool', 'mousemove', String(Math.round(centerX)), String(Math.round(centerY))], CAPTURE_TOOL), 'xdotool mousemove');
       if (action === 'double_click') {
-        await $`xdotool click --repeat 2 1`;
+        await awaitCaptureTool(Bun.spawn(['xdotool', 'click', '--repeat', '2', '1'], CAPTURE_TOOL), 'xdotool click');
         return;
       }
       if (action === 'right_click') {
-        await $`xdotool click 3`;
+        await awaitCaptureTool(Bun.spawn(['xdotool', 'click', '3'], CAPTURE_TOOL), 'xdotool click');
         return;
       }
-      await $`xdotool click 1`;
+      await awaitCaptureTool(Bun.spawn(['xdotool', 'click', '1'], CAPTURE_TOOL), 'xdotool click');
     } catch (error) {
       throw new Error(`Failed to click element: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   async typeText(text: string): Promise<void> {
+    // ensureTool first, so "xdotool is not installed" is still reported for an
+    // empty string rather than silently succeeding on a machine where typing
+    // anything real would fail.
     await this.ensureTool('xdotool');
 
+    // Nothing to type. Under Bun `$` (which this used before #895) an empty
+    // interpolated argument was DROPPED rather than passed as "" (Bun
+    // 1.3.8), so the call reached xdotool as `type --clearmodifiers --` with
+    // no text operand: it printed its usage, exited non-zero, and
+    // desktop_type_text reported "Failed to type text" for a request that
+    // asked for nothing (#554). Returning here makes it the no-op it should
+    // be, whatever the spawn does with "".
+    //
+    // This DIVERGES from the sidecars, which reject "" as
+    // "missing required parameter: text" (handleTypeText in
+    // sidecar/desktop_linux.go, desktop_darwin.go and desktop_windows.go), so
+    // the same call is a no-op here and an error when routed to a `target`.
+    // Deliberate, and the local reading is the right one: "" was supplied, so
+    // it is not a missing parameter, and a request to type nothing is satisfied
+    // by typing nothing. Unlike the key-name mapping above, nothing here can
+    // press one key locally and another through a sidecar; the divergence is
+    // only in whether doing nothing is reported as success. Worth one Go
+    // one-liner per platform as a follow-up, not a reason to fail here.
+    if (text === '') return;
+
     try {
-      await $`xdotool type --clearmodifiers ${text}`;
+      // `--` ends xdotool's option parsing, so text such as "-h" or
+      // "--file=/home/me/.ssh/id_ed25519" is typed literally instead of
+      // being read as an option (--file would type out the named file).
+      // The bound grows with the text: see TYPE_MS_PER_CHAR.
+      await awaitCaptureTool(Bun.spawn(['xdotool', 'type', '--clearmodifiers', '--', text], CAPTURE_TOOL), 'xdotool type',
+        [...text].length * TYPE_MS_PER_CHAR);
     } catch (error) {
-      throw new Error(`Failed to type text: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Failed to type text: ${error instanceof Error ? error.message : String(error)}${error instanceof CaptureTimeoutError ? KILLED_MID_INPUT : ''}`);
     }
   }
 
   async pressKeys(keys: string[]): Promise<void> {
+    // Outside the try below, so a refusal stays a not-started outcome.
+    const keyString = toXdotoolKeySequence(keys);
     await this.ensureTool('xdotool');
 
     try {
-      const keyString = keys.join('+');
-      await $`xdotool key --clearmodifiers ${keyString}`;
+      // The trailing "+" is an empty last key, which libxdo skips. It keeps
+      // the argument from equalling any xdotool command name, so `xdotool key`
+      // cannot chain into a command, whatever commands a later xdotool adds.
+      await awaitCaptureTool(Bun.spawn(['xdotool', 'key', '--clearmodifiers', '--', `${keyString}+`], CAPTURE_TOOL), 'xdotool key');
     } catch (error) {
-      throw new Error(`Failed to press keys: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Failed to press keys: ${error instanceof Error ? error.message : String(error)}${error instanceof CaptureTimeoutError ? KILLED_MID_INPUT : ''}`);
     }
   }
 
@@ -179,18 +416,16 @@ export class LinuxAppController implements AppController {
     }
 
     try {
-      const tmpFile = `/tmp/jarvis-screen-${Date.now()}.png`;
-
-      if (hasImport) {
-        await $`import -window root ${tmpFile}`;
-      } else {
-        await $`scrot ${tmpFile}`;
-      }
-
-      const buffer = await Bun.file(tmpFile).arrayBuffer();
-      await $`rm ${tmpFile}`;
-
-      return Buffer.from(buffer);
+      // Through a private, unpredictable file (#746): see capture-file.ts.
+      // Bun.spawn rather than `$`, which has no timeout: a hung import or
+      // scrot never settled (#802). See CAPTURE_TIMEOUT_MS.
+      return await captureViaPrivateFileAsync(async (file) => {
+        if (hasImport) {
+          await awaitCaptureTool(Bun.spawn(['import', '-window', 'root', file], CAPTURE_TOOL), 'import');
+        } else {
+          await awaitCaptureTool(Bun.spawn(['scrot', file], CAPTURE_TOOL), 'scrot');
+        }
+      });
     } catch (error) {
       throw new Error(`Failed to capture screen: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -210,13 +445,9 @@ export class LinuxAppController implements AppController {
     try {
       const windowId = await this.findWindowByPid(pid);
 
-      const tmpFile = `/tmp/jarvis-window-${pid}-${Date.now()}.png`;
-      await $`import -window ${windowId} ${tmpFile}`;
-
-      const buffer = await Bun.file(tmpFile).arrayBuffer();
-      await $`rm ${tmpFile}`;
-
-      return Buffer.from(buffer);
+      return await captureViaPrivateFileAsync(async (file) => {
+        await awaitCaptureTool(Bun.spawn(['import', '-window', windowId, file], CAPTURE_TOOL), 'import');
+      });
     } catch (error) {
       throw new Error(`Failed to capture window: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -227,7 +458,7 @@ export class LinuxAppController implements AppController {
 
     try {
       const windowId = await this.findWindowByPid(pid);
-      await $`xdotool windowactivate ${windowId}`;
+      await awaitCaptureTool(Bun.spawn(['xdotool', 'windowactivate', windowId], CAPTURE_TOOL), 'xdotool windowactivate');
     } catch (error) {
       throw new Error(`Failed to focus window: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -245,6 +476,9 @@ export class LinuxAppController implements AppController {
           stdin: 'ignore',
           stdout: 'ignore',
           stderr: 'ignore',
+          // A model-chosen executable: the desktop session, not the daemon's
+          // secrets (#514; see util/model-exec-env.ts).
+          env: modelExecEnv(),
         },
       );
 
@@ -258,20 +492,40 @@ export class LinuxAppController implements AppController {
     }
   }
 
-  private async findWindowByPid(pid: number): Promise<string> {
-    const windowIds = (await $`xdotool search --name "."`.text())
+  /**
+   * Every window id xdotool can see, trimmed and non-empty.
+   *
+   * One copy for both callers, which had the same parse written twice. Trimmed
+   * so a stray "\r" or space cannot travel as part of the id into `xprop -id`
+   * or `import -window`; `filter(Boolean)` then makes non-empty an invariant of
+   * what this returns, which `import -window ${windowId} ${file}` relies on
+   * -- an empty id is the one value `$` would DROP, sliding the temp path into
+   * the -window slot rather than passing an empty operand (see typeText).
+   */
+  private async searchWindowIds(): Promise<string[]> {
+    // Bounded like a capture (#802 review): it talks to the X server, so it
+    // hangs when a capture would, and captureWindow runs it first.
+    return (await awaitCaptureToolOutput(Bun.spawn(['xdotool', 'search', '--name', '.'], LOOKUP_TOOL), 'xdotool search'))
       .split('\n')
-      .filter(id => id.trim());
+      .map(id => id.trim())
+      .filter(Boolean);
+  }
+
+  private async findWindowByPid(pid: number): Promise<string> {
+    const windowIds = await this.searchWindowIds();
 
     for (const windowId of windowIds) {
       try {
-        const xpropOutput = await $`xprop -id ${windowId}`.text();
+        const xpropOutput = await awaitCaptureToolOutput(Bun.spawn(['xprop', '-id', windowId], LOOKUP_TOOL), 'xprop');
         const windowPid = parseInt(this.extractXpropValue(xpropOutput, '_NET_WM_PID') || '0', 10);
 
         if (windowPid === pid) {
           return windowId;
         }
-      } catch {
+      } catch (error) {
+        // A window that cannot be read is skipped; a hung X server is not a
+        // window to skip, and would cost the bound once per window.
+        if (error instanceof CaptureTimeoutError) throw error;
         continue;
       }
     }

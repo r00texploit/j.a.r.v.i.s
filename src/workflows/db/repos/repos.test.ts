@@ -1,5 +1,9 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { closeWorkflowDb, DEFAULT_IDS, initWorkflowDb } from "../index";
+import { closeWorkflowDb, DEFAULT_IDS, getWorkflowDb, initWorkflowDb } from "../index";
+import { setEncryptionKey } from "../encryption";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   createFlow,
   deleteFlow,
@@ -17,25 +21,35 @@ import {
   listVersions,
   lockVersion,
   mergeRunOutputsIntoSampleData,
+  replaceSampleData,
   setSampleDataEntry,
+  setSampleInputEntry,
   SAMPLE_DATA_AUTO_CAPTURE_MAX_BYTES,
   updateDraftVersion,
 } from "./flow-version";
+import { FlowVersionRequestError } from "./flow-version-ownership";
 import { createFlowRun, getFlowRun, listRuns, updateRun } from "./flow-run";
 import {
   deleteConnection,
+  deleteConnectionInProject,
   getConnection,
   getConnectionByExternalId,
+  getConnectionInProject,
   listConnections,
+  updateConnectionById,
   upsertConnection,
 } from "./app-connection";
 
+// Pin the connection-encryption key: without it the module resolves the
+// developer's real key file (and generates one into their live data dir).
 beforeEach(() => {
   initWorkflowDb(":memory:");
+  setEncryptionKey(Buffer.alloc(32, 0x11));
 });
 
 afterEach(() => {
   closeWorkflowDb();
+  setEncryptionKey(null);
 });
 
 describe("flow repo", () => {
@@ -59,11 +73,12 @@ describe("flow repo", () => {
 
   test("updateFlowStatus and setPublishedVersion mutate fields", () => {
     const flow = createFlow();
+    const version = lockVersion(createDraftVersion({ flowId: flow.id, displayName: "Published", trigger: { name: "trigger", type: "EMPTY" } }).id);
+    setPublishedVersion(flow.id, version.id);
     updateFlowStatus(flow.id, "ENABLED");
-    setPublishedVersion(flow.id, "fv_xyz");
     const got = getFlow(flow.id);
     expect(got?.status).toBe("ENABLED");
-    expect(got?.published_version_id).toBe("fv_xyz");
+    expect(got?.published_version_id).toBe(version.id);
   });
 
   test("metadata round-trips through JSON column", () => {
@@ -72,6 +87,46 @@ describe("flow repo", () => {
     updateFlowMetadata(flow.id, { tag: "evening", priority: 1 });
     const got = getFlow(flow.id);
     expect(got && parseFlowMetadata(got)).toEqual({ tag: "evening", priority: 1 });
+  });
+
+  /**
+   * #598. The column reaches a chat prompt through `manage_workflow`'s
+   * `summarizeFlow`, the dashboard through the API's `serializeFlow`, and the
+   * vendored engine through the sandbox API -- and all three treat it as an
+   * object. The HTTP routes refuse a non-object, which is where a caller gets a
+   * useful 400; these are the sink-level backstop and the defensive read, so a
+   * future writer cannot reintroduce the problem one layer below the validation.
+   */
+  test("both write sinks refuse a metadata that is not an object", () => {
+    // `createFlow` is a sink too, not just `updateFlowMetadata`: a restore path
+    // or an eval harness reaches for it directly.
+    expect(() => createFlow({ metadata: "just text" as never })).toThrow(/must be a JSON object or null/);
+    expect(() => createFlow({ metadata: [1, 2] as never })).toThrow(/must be a JSON object or null/);
+    const flow = createFlow();
+    expect(() => updateFlowMetadata(flow.id, "just text" as never)).toThrow(/must be a JSON object or null/);
+    expect(() => updateFlowMetadata(flow.id, 7 as never)).toThrow(/must be a JSON object or null/);
+    // null still clears, and an object still writes.
+    updateFlowMetadata(flow.id, null);
+    expect(parseFlowMetadata(getFlow(flow.id)!)).toBeNull();
+  });
+
+  /**
+   * The rows the defensive read exists for. Because the sinks now refuse a
+   * non-object, raw SQL is the only honest way to build the fixture -- which is
+   * exactly how a pre-#598 row got there.
+   */
+  test("a legacy row that is not a JSON object reads back as null, not as a lie", () => {
+    const flow = createFlow();
+    for (const stored of ['"just text"', "7", "true", "[1,2]", "not json at all", ""]) {
+      getWorkflowDb().run(`UPDATE flow SET metadata = ? WHERE id = ?`, [stored, flow.id]);
+      // The bare `JSON.parse(...) as Record<string, unknown>` this replaced
+      // either threw (unparseable) or handed every reader a non-object in a
+      // field they all treat as one.
+      expect(parseFlowMetadata(getFlow(flow.id)!)).toBeNull();
+    }
+    // Still not vacuous: a real object round-trips.
+    getWorkflowDb().run(`UPDATE flow SET metadata = ? WHERE id = ?`, ['{"ok":1}', flow.id]);
+    expect(parseFlowMetadata(getFlow(flow.id)!)).toEqual({ ok: 1 });
   });
 
   test("deleteFlow removes the row", () => {
@@ -100,18 +155,43 @@ describe("flow-version repo", () => {
     expect(draft.trigger).toEqual({ name: "trigger", type: "EMPTY" });
 
     const updated = updateDraftVersion(draft.id, {
-      trigger: { name: "trigger", type: "PIECE_TRIGGER", settings: { pieceName: "schedule" } },
+      trigger: { name: "trigger", type: "PIECE_TRIGGER", settings: { pieceName: "schedule", input: { cron_expression: "0 9 * * *" } } },
       valid: true,
       connectionIds: ["conn1", "conn2"],
     });
     expect(updated.valid).toBe(true);
     expect(updated.connectionIds).toEqual(["conn1", "conn2"]);
-    expect(updated.trigger).toEqual({ name: "trigger", type: "PIECE_TRIGGER", settings: { pieceName: "schedule" } });
+    expect(updated.trigger).toEqual({ name: "trigger", type: "PIECE_TRIGGER", settings: { pieceName: "schedule", input: { cron_expression: "0 9 * * *" } } });
 
     const locked = lockVersion(draft.id);
     expect(locked.state).toBe("LOCKED");
 
     expect(() => updateDraftVersion(draft.id, { displayName: "x" })).toThrow(/LOCKED/);
+  });
+
+  // #693: the four DRAFT-only writers refuse a LOCKED version as a 409
+  // `FlowVersionRequestError`, which `trapErrors` answers verbatim. A plain
+  // Error there read as a 500.
+  test("every DRAFT-only writer refuses a LOCKED version with a 409 request error", () => {
+    const flow = createFlow();
+    const v = createDraftVersion({ flowId: flow.id, displayName: "v" });
+    lockVersion(v.id);
+    const writers: Array<[string, () => unknown]> = [
+      ["updateDraftVersion", () => updateDraftVersion(v.id, { displayName: "x" })],
+      ["setSampleDataEntry", () => setSampleDataEntry(v.id, "s", { x: 1 })],
+      ["setSampleInputEntry", () => setSampleInputEntry(v.id, "s", { x: 1 })],
+      ["replaceSampleData", () => replaceSampleData(v.id, null)],
+    ];
+    for (const [name, write] of writers) {
+      let caught: unknown;
+      try {
+        write();
+      } catch (e) {
+        caught = e;
+      }
+      expect({ name, isRequestError: caught instanceof FlowVersionRequestError }).toEqual({ name, isRequestError: true });
+      expect((caught as FlowVersionRequestError).status).toBe(409);
+    }
   });
 
   test("getLatestDraft returns the most recently updated DRAFT only", async () => {
@@ -148,6 +228,77 @@ describe("flow-run repo", () => {
     expect(run.status).toBe("QUEUED");
     expect(run.projectId).toBe(DEFAULT_IDS.project);
     expect(run.steps).toBeNull();
+  });
+
+  /**
+   * #843. Before, no caller passed a project and `createFlowRun` fell back to
+   * DEFAULT_IDS.project, so a run of another project's flow landed in the
+   * default project -- and the engine token and effect records are scoped by
+   * this column. The flow is put in a project that is NOT the default, so a
+   * fallback to the default cannot pass.
+   */
+  test("a run belongs to its flow's project, not the default (#843)", () => {
+    const other = "proj_other_843";
+    const flow = createFlow({ projectId: other });
+    const v = createDraftVersion({ flowId: flow.id, displayName: "v1" });
+    const run = createFlowRun({ flowId: flow.id, flowVersionId: v.id });
+    expect(run.projectId).toBe(other);
+    const stored = getWorkflowDb()
+      .query<{ project_id: string }, [string]>("SELECT project_id FROM flow_run WHERE id = ?").get(run.id);
+    expect(stored?.project_id).toBe(other);
+  });
+
+  test("opening the store backfills an old run to its flow's project, and leaves the rest alone (#843)", () => {
+    // Rows written before #843 say DEFAULT_IDS.project whatever their flow's
+    // project is, and the column is what a resumed run's engine token is
+    // minted from. A file-backed store, reopened, is what a daemon restart is.
+    closeWorkflowDb();
+    const dir = mkdtempSync(join(tmpdir(), "jarvis-843-backfill-"));
+    try {
+      initWorkflowDb(join(dir, "workflow.db"));
+      const other = "proj_other_843";
+      const theirs = createFlow({ projectId: other });
+      const mine = createFlow();
+      const tv = createDraftVersion({ flowId: theirs.id, displayName: "t" });
+      const mv = createDraftVersion({ flowId: mine.id, displayName: "m" });
+      const old = createFlowRun({ flowId: theirs.id, flowVersionId: tv.id, status: "PAUSED" });
+      const ok = createFlowRun({ flowId: mine.id, flowVersionId: mv.id });
+      getWorkflowDb().run("UPDATE flow_run SET project_id = ? WHERE id = ?", [DEFAULT_IDS.project, old.id]);
+      const before = getWorkflowDb().query("SELECT * FROM flow_run WHERE id = ?").get(ok.id);
+      expect(getFlowRun(old.id)?.projectId).toBe(DEFAULT_IDS.project);
+      closeWorkflowDb();
+      initWorkflowDb(join(dir, "workflow.db"));
+      expect(getFlowRun(old.id)?.projectId).toBe(other);
+      expect(getFlowRun(old.id)?.status).toBe("PAUSED");
+      expect(getWorkflowDb().query("SELECT * FROM flow_run WHERE id = ?").get(ok.id)).toEqual(before);
+    } finally {
+      closeWorkflowDb();
+      rmSync(dir, { recursive: true, force: true });
+      initWorkflowDb(":memory:");
+    }
+  });
+
+  test("a run naming another flow's version is refused and writes nothing (#843 review)", () => {
+    // Since the run's project comes from its flow, a version from a different
+    // flow would run that flow's definition under this flow's project.
+    const a = createFlow();
+    const b = createFlow({ projectId: "proj_other_843" });
+    createDraftVersion({ flowId: a.id, displayName: "a" });
+    const bv = createDraftVersion({ flowId: b.id, displayName: "b" });
+    const count = () => getWorkflowDb().query<{ n: number }, []>("SELECT COUNT(*) AS n FROM flow_run").get()!.n;
+    const before = count();
+    expect(() => createFlowRun({ flowId: a.id, flowVersionId: bv.id })).toThrow(`version ${bv.id} is not a version of flow ${a.id}`);
+    expect(count()).toBe(before);
+    // The control: the same version with its own flow is accepted.
+    expect(createFlowRun({ flowId: b.id, flowVersionId: bv.id }).projectId).toBe("proj_other_843");
+  });
+
+  test("a run of a flow that does not exist is refused and writes nothing (#843)", () => {
+    const flow = createFlow();
+    const v = createDraftVersion({ flowId: flow.id, displayName: "v1" });
+    const before = getWorkflowDb().query<{ n: number }, []>("SELECT COUNT(*) AS n FROM flow_run").get()!.n;
+    expect(() => createFlowRun({ flowId: "no_such_flow", flowVersionId: v.id })).toThrow(/flow not found/);
+    expect(getWorkflowDb().query<{ n: number }, []>("SELECT COUNT(*) AS n FROM flow_run").get()!.n).toBe(before);
   });
 
   test("updateRun applies status, steps, failed_step, finishTime", () => {
@@ -278,6 +429,45 @@ describe("app-connection repo", () => {
     });
     deleteConnection(c.id);
     expect(getConnection(c.id)).toBeNull();
+  });
+
+  /**
+   * #692, at the repo. The route tests stop a foreign id at the route's first
+   * read, so they would not notice the scope dropped from either of these.
+   */
+  describe("the by-id writers are scoped to a project (#692)", () => {
+    const A = "proj_a_692";
+    const B = "proj_b_692";
+    function seedInB() {
+      return upsertConnection({
+        projectId: B,
+        externalId: "scoped",
+        displayName: "In B",
+        type: "SECRET_TEXT",
+        pieceName: "http",
+        pieceVersion: "1.0.0",
+        value: { secret: "b" },
+      });
+    }
+    const stored = (id: string) =>
+      getWorkflowDb().query<Record<string, unknown>, [string]>("SELECT * FROM app_connection WHERE id = ?").get(id);
+
+    test("another project sees nothing, and changes nothing", () => {
+      const c = seedInB();
+      const before = stored(c.id);
+      expect(getConnectionInProject(A, c.id)).toBeNull();
+      expect(updateConnectionById(A, c.id, { displayName: "x", value: { secret: "a" }, status: "ERROR" })).toBeNull();
+      expect(deleteConnectionInProject(A, c.id)).toBe(false);
+      expect(stored(c.id)).toEqual(before);
+    });
+
+    test("its own project reads, updates and deletes it", () => {
+      const c = seedInB();
+      expect(getConnectionInProject(B, c.id)?.value).toEqual({ secret: "b" });
+      expect(updateConnectionById(B, c.id, { value: { secret: "b2" } })?.value).toEqual({ secret: "b2" });
+      expect(deleteConnectionInProject(B, c.id)).toBe(true);
+      expect(stored(c.id)).toBeNull();
+    });
   });
 });
 

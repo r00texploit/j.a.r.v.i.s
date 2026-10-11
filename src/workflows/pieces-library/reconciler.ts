@@ -21,10 +21,13 @@ import { resolve, join } from "node:path";
 import {
   piecesBaseDir,
   readManifest,
+  runPiecesBunInstall,
+  writeManifest,
   synthesizePackageJson,
   type InstalledManifest,
   type InstalledPiece,
 } from "./installer";
+import { catalogById } from "./catalog";
 
 export interface ReconcileResult {
   /** True when the manifest had at least one piece (otherwise we skipped install). */
@@ -60,6 +63,25 @@ export async function reconcilePiecesLibrary(
     return { ranInstall: false, declared: 0, materialized: [], missing: [], drifted: [] };
   }
 
+  // Verified pieces follow the catalog's exact pin, not the range captured
+  // when they were installed: the pin is what "reviewed" means, and a
+  // manifest written before pinning existed would otherwise keep floating
+  // to unreviewed minors on every boot. Community pieces keep the range
+  // they were installed with.
+  const byId = catalogById();
+  const repinnedIds = new Set<string>();
+  for (const piece of manifest.pieces) {
+    const entry = byId.get(piece.id);
+    if (entry && entry.tier === "verified" && entry.versionRange !== piece.versionRange) {
+      piece.versionRange = entry.versionRange;
+      repinnedIds.add(piece.id);
+    }
+  }
+  if (repinnedIds.size > 0) {
+    await writeManifest(manifest, base);
+    log(`reconcile: re-pinned ${repinnedIds.size} verified piece(s) to the catalog version`);
+  }
+
   // Always rewrite package.json so it matches the manifest (defensive: if
   // someone edited package.json by hand, the manifest still wins).
   mkdirSync(base, { recursive: true });
@@ -74,6 +96,7 @@ export async function reconcilePiecesLibrary(
   const materialized: InstalledPiece[] = [];
   const missing: InstalledPiece[] = [];
   const drifted: Array<{ piece: InstalledPiece; onDiskVersion: string }> = [];
+  let resolvedDirty = false;
   for (const piece of manifest.pieces) {
     const pkgPath = join(base, "node_modules", piece.npmPackage, "package.json");
     if (!existsSync(pkgPath)) {
@@ -85,11 +108,21 @@ export async function reconcilePiecesLibrary(
     try {
       const pkg = JSON.parse(await fs.readFile(pkgPath, "utf8")) as { version?: unknown };
       if (typeof pkg.version === "string" && pkg.version !== piece.resolvedVersion) {
-        drifted.push({ piece, onDiskVersion: pkg.version });
+        if (repinnedIds.has(piece.id)) {
+          // The re-pin moved the range on purpose; the install that just
+          // ran is the new truth, not drift to warn about every boot.
+          piece.resolvedVersion = pkg.version;
+          resolvedDirty = true;
+        } else {
+          drifted.push({ piece, onDiskVersion: pkg.version });
+        }
       }
     } catch {
       // Couldn't read the package.json; treat as drift but don't fail the reconcile.
     }
+  }
+  if (resolvedDirty) {
+    await writeManifest(manifest, base);
   }
   if (drifted.length > 0) {
     log(
@@ -107,17 +140,9 @@ export async function reconcilePiecesLibrary(
 }
 
 function defaultRunBunInstall(cwd: string): Promise<void> {
-  return new Promise((res, rej) => {
-    // Import lazily so tests that don't run installs aren't penalized.
-    import("node:child_process").then(({ spawn }) => {
-      const child = spawn("bun", ["install", "--silent"], { cwd, stdio: "inherit" });
-      child.on("close", (code) => {
-        if (code === 0) res();
-        else rej(new Error(`bun install (pieces reconcile) exited with code ${code}`));
-      });
-      child.on("error", rej);
-    });
-  });
+  // The installer's spawn, not a copy of it: two copies were two places to
+  // forget the env, and #512 found both had.
+  return runPiecesBunInstall(cwd, "pieces reconcile");
 }
 
 /**

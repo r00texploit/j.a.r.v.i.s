@@ -1,0 +1,673 @@
+name: Installer Release
+
+# Builds, signs and publishes the desktop installer (Jarvis-Setup.exe /
+# Install-Jarvis.dmg) on its OWN cadence, versioned from
+# sidecar/installer/VERSION.
+#
+# The installer is independent software: it resolves whichever sidecar version
+# the npm registry tags `latest` at run time and embeds no sidecar version at
+# all. So it ships when the INSTALLER changes — a sidecar release does not
+# require a new installer, and an installer release does not require the
+# sidecar to have changed. (A sidecar rework may of course imply installer
+# work; that is a judgement call, not an automatic coupling.)
+#
+# Driven two ways:
+#   * workflow_dispatch — the normal path (dry_run defaults to true).
+#   * pushing an `installer-v*` tag.
+# Idempotent: if a release for the current installer/VERSION already exists it
+# stops as a no-op success.
+#
+# Assets are published TWICE, both with make_latest=false so the repo's
+# /releases/latest keeps pointing at the brain:
+#   * installer-v<VERSION> — immutable, per-version, for history + rollback.
+#   * installer-latest     — rolling; its ASSETS are replaced every release,
+#                            giving the website permanently stable URLs:
+#                            releases/download/installer-latest/Jarvis-Setup.exe
+#                            releases/download/installer-latest/Install-Jarvis.dmg
+#                            (Only the assets roll: the underlying git tag is
+#                            created on the first publish and is not moved
+#                            afterwards, so that release's "Source code"
+#                            archives stay pinned to that first commit. Use the
+#                            installer-v<VERSION> releases to reason about
+#                            source, and the rolling one only for downloads.)
+
+on:
+  push:
+    tags:
+      - "installer-v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build, sign and validate without publishing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# Two runs in flight would race on the rolling installer-latest release.
+concurrency:
+  group: installer-release
+  cancel-in-progress: false
+
+env:
+  # Spelled as in release-exec.yml and sidecar-release.yml (#685), so
+  # release-exec.test.sh holds this file to the same one-decision rule: the
+  # readiness step in sign-windows reads it to decide whether a run missing
+  # its signing config may continue (#869), and nothing may redefine it. On a
+  # tag push there are no inputs and it is false, as `|| false` gave before.
+  DRY_RUN: ${{ inputs.dry_run == true }}
+
+jobs:
+  # ─── Resolve version + idempotency gate ────────────────────────
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      should_release: ${{ steps.v.outputs.should_release }}
+    steps:
+      # persist-credentials: false (#779): nothing here runs git; `gh` takes
+      # GH_TOKEN from the step env.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          VERSION="$(cat sidecar/installer/VERSION)"
+          # Checked before it becomes an output or reaches any message (#818),
+          # as sidecar-release.yml checks sidecar/VERSION (#684). A newline
+          # here would write extra lines into $GITHUB_OUTPUT, and every job
+          # below takes the value as a tag name and a linker flag, so it must
+          # be a plain semver with nothing a shell or the linker would read
+          # as syntax. LC_ALL=C first: under a UTF-8 locale glibc's [A-Za-z]
+          # and [0-9] match letters and digits outside ASCII.
+          # SemVer 2.0 pre-release identifiers: no empty one, no leading zero
+          # on a numeric one.
+          id='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-${id}(\.${id})*)?$ ]]; then
+            printf '::error::sidecar/installer/VERSION is not a plain semver: %q\n' "$VERSION"
+            exit 1
+          fi
+          # A tag push must agree with the version file, or the run silently
+          # does the wrong thing: a stale file no-ops the whole workflow with a
+          # green check, and a mistyped tag publishes under a DIFFERENT tag
+          # than the one pushed. Checked before any output is written.
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF_NAME}" != "installer-v${VERSION}" ]; then
+            printf '::error::tag %q does not match sidecar/installer/VERSION (%s) -- bump the file or retag as installer-v%s\n' "$GITHUB_REF_NAME" "$VERSION" "$VERSION"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Dry run — building/signing installer v${VERSION} without publishing."
+            exit 0
+          fi
+          if gh release view "installer-v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::installer-v${VERSION} is already released — nothing to do (bump sidecar/installer/VERSION to ship a new installer)."
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "Installer v${VERSION} is not yet released — building."
+          fi
+
+  # ─── Windows: mingw cross-build (no OIDC) ───────────────────────
+  # Split from signing (#779), as #682 split the sidecar: mingw, `make
+  # manifest-installer` and the Go module graph run here, in a job that
+  # cannot mint an OIDC token, so a compromised toolchain or module cannot ask
+  # Workload Identity Federation for a token and have KMS sign anything. The
+  # binary crosses to sign-windows with its digest as a job output.
+  build-windows:
+    needs: resolve
+    if: needs.resolve.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # The Actions cache is writable by any run on main, and Go reuses
+          # cached modules and build output without re-verifying them (#681).
+          cache: false
+          go-version-file: sidecar/go.mod
+          cache-dependency-path: sidecar/go.sum
+
+      - name: Install mingw-w64
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+
+      - name: Build installer
+        working-directory: sidecar
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "1"
+          # Checked by resolve (#818); read from its output, not the file.
+          INSTALLER_VERSION: ${{ needs.resolve.outputs.version }}
+          # Pins the publisher whose payloads this installer will accept —
+          # chain validity alone would accept ANY signed exe. Set it together
+          # with the signing credentials; empty means chain-only + a warning.
+          SIGNING_PUBLISHER_CN: ${{ vars.SIGNING_PUBLISHER_CN }}
+        run: |
+          set -euo pipefail
+          export CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++
+          export CGO_CFLAGS="-I$(pwd)/include" CGO_CXXFLAGS="-I$(pwd)/include"
+          if [ -z "${SIGNING_PUBLISHER_CN}" ]; then
+            echo "::warning::SIGNING_PUBLISHER_CN repo variable is unset — the installer will accept any validly signed payload."
+          fi
+          make manifest-installer
+          # The go tool splits -ldflags on whitespace, so the CN (a company
+          # name — always contains spaces) must carry its own quotes through
+          # to the linker.
+          LDFLAGS="-s -w -H windowsgui -X main.installerVersion=${INSTALLER_VERSION}"
+          LDFLAGS="$LDFLAGS -X 'github.com/jarvis/sidecar/internal/update.expectedPublisherCN=${SIGNING_PUBLISHER_CN}'"
+          # -trimpath keeps -ldflags out of the embedded build info, so the
+          # check below sees the pin only when the -X target really exists.
+          go build -trimpath -ldflags "$LDFLAGS" -o Jarvis-Setup.exe ./installer/
+          # Via a file, not a pipe: `grep -q` exiting early SIGPIPEs strings,
+          # which pipefail would report as a missing pin.
+          strings Jarvis-Setup.exe > /tmp/installer-strings.txt
+          if [ -n "${SIGNING_PUBLISHER_CN}" ] && ! grep -qF "${SIGNING_PUBLISHER_CN}" /tmp/installer-strings.txt; then
+            echo "::error::publisher pin '${SIGNING_PUBLISHER_CN}' is not present in Jarvis-Setup.exe — check the -ldflags quoting"
+            exit 1
+          fi
+
+      - name: Digest
+        id: digest
+        working-directory: sidecar
+        run: echo "sha256=$(sha256sum Jarvis-Setup.exe | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      # Not under the installer-* name: that is the signed installer, which
+      # only sign-windows uploads and publish downloads by that pattern.
+      - name: Upload unsigned installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-installer-win32-x64
+          path: sidecar/Jarvis-Setup.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  # ─── Windows: Authenticode via Cloud KMS ────────────────────────
+  # The only job here that holds id-token. It builds nothing and installs
+  # nothing: it verifies the installer build-windows reported, signs it with
+  # scripts/sign-windows.sh (whose jsign download is checksum-pinned), and
+  # uploads the result as installer-win32-x64 -- signed, or, when signing is
+  # not configured, unsigned on a dry run or with ALLOW_UNSIGNED_WINDOWS set,
+  # and otherwise not at all (#869: see the readiness step). The post-sign
+  # check runs in verify-windows (#817).
+  sign-windows:
+    needs: [resolve, build-windows]
+    if: needs.resolve.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    # OIDC, for google-github-actions/auth: signing federates into Google
+    # Cloud KMS with no stored credential. Only this job gets a token — the
+    # workflow default stays contents: read.
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
+      # Whether the signing step ran, so verify-windows knows whether there
+      # is a signature to check (false only on a dry run or under
+      # ALLOW_UNSIGNED_WINDOWS, #869).
+      signed: ${{ steps.winsign.outputs.ready }}
+    steps:
+      # For scripts/sign-windows.sh and the committed certificate chain.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Into a directory of its own, never the checkout (#817 review): an
+      # artifact is a zip any job in this run can write, and extracted over
+      # sidecar/ it could replace scripts/sign-windows.sh before that runs
+      # with the KMS token.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: unsigned-installer-win32-x64
+          path: ${{ runner.temp }}/unsigned
+
+      # The digest travels as a job output, which only build-windows can set;
+      # the artifact store is writable by every job in this run. Exactly one
+      # regular file, that digest, and only then a copy into place.
+      - name: Verify the installer
+        working-directory: sidecar
+        env:
+          SHA256: ${{ needs.build-windows.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::build-windows reported no digest"; exit 1; }
+          in="${RUNNER_TEMP}/unsigned"
+          if [ "$(find "$in" -mindepth 1 -print)" != "${in}/Jarvis-Setup.exe" ] || [ -L "${in}/Jarvis-Setup.exe" ] || [ ! -f "${in}/Jarvis-Setup.exe" ]; then
+            echo "::error::the unsigned-installer-win32-x64 artifact is not exactly one file, Jarvis-Setup.exe"
+            exit 1
+          fi
+          echo "${SHA256}  ${in}/Jarvis-Setup.exe" | sha256sum -c -
+          install -m 0644 "${in}/Jarvis-Setup.exe" Jarvis-Setup.exe
+
+      # Windows signing needs BOTH the KMS keyring variable AND the issued
+      # certificate chain in the repo. They arrive at DIFFERENT times: the
+      # Sectigo CSR is generated FROM the KMS key, so the keyring necessarily
+      # exists days before the certificate does -- so this checks the chain
+      # file too, and says which of the two is missing.
+      #
+      # A real run missing either one FAILS here (#869). It used to warn and
+      # carry on, and since every signing and verification step follows this
+      # decision, a release then shipped an UNSIGNED Jarvis-Setup.exe with nothing
+      # but a warning in a green run. Shipping unsigned is now a recorded
+      # choice: set the repository variable ALLOW_UNSIGNED_WINDOWS to exactly
+      # `true` and the run warns and continues as it used to. A dry run
+      # still only warns, so a rehearsal needs no signing configuration.
+      # release-exec.test.sh runs this script verbatim against every case.
+      - name: Windows signing readiness
+        id: winsign
+        env:
+          GCP_KMS_KEYRING: ${{ vars.GCP_KMS_KEYRING }}
+          ALLOW_UNSIGNED_WINDOWS: ${{ vars.ALLOW_UNSIGNED_WINDOWS }}
+        run: |
+          set -euo pipefail
+          missing=""
+          if [ -z "${GCP_KMS_KEYRING}" ]; then
+            missing="Windows signing is not configured (GCP_KMS_KEYRING unset)"
+            fix="Set the GCP_KMS_KEYRING repository variable"
+          elif [ ! -f sidecar/packaging/windows/codesign-chain.pem ]; then
+            missing="GCP_KMS_KEYRING is set but sidecar/packaging/windows/codesign-chain.pem is missing -- the certificate has not been issued/committed yet"
+            fix="Issue the certificate and commit sidecar/packaging/windows/codesign-chain.pem"
+          fi
+          if [ -z "$missing" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            if [ "${ALLOW_UNSIGNED_WINDOWS}" = "true" ]; then
+              echo "::warning::ALLOW_UNSIGNED_WINDOWS is set but signing is configured, so it changed nothing this run. Delete the variable, or the next missing signing config ships an UNSIGNED Jarvis-Setup.exe instead of failing."
+            fi
+          elif [ "${DRY_RUN}" = "true" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::${missing}. This dry run continues and builds an UNSIGNED Jarvis-Setup.exe; a real release would stop here unless ALLOW_UNSIGNED_WINDOWS is true."
+          elif [ "${ALLOW_UNSIGNED_WINDOWS}" = "true" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::${missing}. Shipping an UNSIGNED Jarvis-Setup.exe because ALLOW_UNSIGNED_WINDOWS is true (SmartScreen will block it)."
+          else
+            echo "::error::${missing}, so this release would ship an UNSIGNED Jarvis-Setup.exe. ${fix}, or set the repository variable ALLOW_UNSIGNED_WINDOWS to true to ship unsigned on purpose."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        id: gcp-auth
+        if: steps.winsign.outputs.ready == 'true'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SIGNING_SERVICE_ACCOUNT }}
+          token_format: "access_token"
+          # Only access_token is used. The default (true) writes a
+          # gha-creds-*.json into the workspace that carries what is needed
+          # to mint further OIDC tokens; nothing here reads it (#779, as #682
+          # did for the sidecar).
+          create_credentials_file: false
+
+      # --defer-verify (#817): the check needs osslsigncode, an apt package,
+      # and apt maintainer scripts run as root beside this job's OIDC token.
+      # verify-windows runs it instead, and publish waits for it.
+      - name: Sign installer (Cloud KMS)
+        if: steps.winsign.outputs.ready == 'true'
+        working-directory: sidecar
+        env:
+          GCP_ACCESS_TOKEN: ${{ steps.gcp-auth.outputs.access_token }}
+          GCP_KMS_KEYRING: ${{ vars.GCP_KMS_KEYRING }}
+          GCP_KMS_KEY_ALIAS: ${{ vars.GCP_KMS_KEY_ALIAS }}
+        run: scripts/sign-windows.sh --defer-verify Jarvis-Setup.exe
+
+      # The SIGNED installer's digest: signing changes the bytes, and publish
+      # takes the artifact only by this.
+      - name: Digest
+        id: digest
+        working-directory: sidecar
+        run: echo "sha256=$(sha256sum Jarvis-Setup.exe | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installer-win32-x64
+          path: sidecar/Jarvis-Setup.exe
+          if-no-files-found: error
+
+  # --- Windows: post-sign verification (no OIDC) ---
+  # #817. The check needs osslsigncode, which comes from apt, and apt runs
+  # package maintainer scripts as root: in sign-windows they ran beside the
+  # Workload Identity token, so a mirror or archive compromise reached the
+  # KMS signing identity. Here nothing can mint a token. The installer is
+  # taken by the digest sign-windows reported, which is also what publish
+  # checks, so what is verified here is what ships; and publish waits for
+  # this job. sign-windows.sh --verify-only fails when osslsigncode is
+  # missing, so dropping the install cannot turn into a skipped check.
+  verify-windows:
+    needs: [resolve, sign-windows]
+    if: needs.resolve.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # For scripts/sign-windows.sh.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Outside the checkout, as in sign-windows: extracted over sidecar/, an
+      # artifact could replace the script that does the checking.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: installer-win32-x64
+          path: ${{ runner.temp }}/signed
+
+      - name: Verify the signed installer digest
+        env:
+          SHA256: ${{ needs.sign-windows.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::sign-windows reported no digest"; exit 1; }
+          in="${RUNNER_TEMP}/signed"
+          if [ "$(find "$in" -mindepth 1 -print)" != "${in}/Jarvis-Setup.exe" ] || [ -L "${in}/Jarvis-Setup.exe" ] || [ ! -f "${in}/Jarvis-Setup.exe" ]; then
+            echo "::error::the installer-win32-x64 artifact is not exactly one file, Jarvis-Setup.exe"
+            exit 1
+          fi
+          echo "${SHA256}  ${in}/Jarvis-Setup.exe" | sha256sum -c -
+
+      # #869, checked again in a job that holds no token: the signer decides
+      # whether to sign, and this refuses its answer when a real run without
+      # ALLOW_UNSIGNED_WINDOWS says it did not, so a mistake in that decision
+      # cannot reach the publish on its own. An empty answer (the signer did
+      # not say) is a refusal too.
+      - name: Refuse an unsigned binary on a real run
+        env:
+          SIGNED: ${{ needs.sign-windows.outputs.signed }}
+          ALLOW_UNSIGNED_WINDOWS: ${{ vars.ALLOW_UNSIGNED_WINDOWS }}
+        run: |
+          set -euo pipefail
+          if [ "${SIGNED}" != "true" ] && [ "${DRY_RUN}" != "true" ] && [ "${ALLOW_UNSIGNED_WINDOWS}" != "true" ]; then
+            echo "::error::sign-windows did not sign Jarvis-Setup.exe, and this is a real run without ALLOW_UNSIGNED_WINDOWS set to true, so it would ship unsigned. See its Windows signing readiness step."
+            exit 1
+          fi
+
+      - name: Install osslsigncode
+        if: needs.sign-windows.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y osslsigncode
+
+      - name: Verify the Authenticode signature
+        if: needs.sign-windows.outputs.signed == 'true'
+        working-directory: sidecar
+        env:
+          # The installer must carry OUR publisher: the same identity it then
+          # pins in the payloads it downloads.
+          SIGNING_PUBLISHER_CN: ${{ vars.SIGNING_PUBLISHER_CN }}
+          # Sectigo's roots are publicly trusted, so demand the FULL
+          # verification (osslsigncode exit 0), and a check that runs at all.
+          # This is the script's default too; stated here so the release
+          # posture is visible at the workflow.
+          SIGN_REQUIRE_TRUSTED_CHAIN: "1"
+        run: |
+          if [ -z "${SIGNING_PUBLISHER_CN}" ]; then
+            echo "::warning::SIGNING_PUBLISHER_CN repo variable is unset -- the signature's publisher will not be asserted."
+          fi
+          scripts/sign-windows.sh --verify-only "${RUNNER_TEMP}/signed/Jarvis-Setup.exe"
+
+  # ─── macOS: universal binary → Install Jarvis.app → signed DMG ──
+  build-macos:
+    needs: resolve
+    if: needs.resolve.outputs.should_release == 'true'
+    runs-on: macos-latest
+    env:
+      HAVE_APPLE_SIGNING: ${{ secrets.APPLE_CERT_P12 != '' }}
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # The Actions cache is writable by any run on main, and Go reuses
+          # cached modules and build output without re-verifying them (#681).
+          cache: false
+          go-version-file: sidecar/go.mod
+          cache-dependency-path: sidecar/go.sum
+
+      - name: Build universal installer app
+        working-directory: sidecar
+        env:
+          CGO_ENABLED: "1"
+          # Checked by resolve (#818); read from its output, not the file.
+          INSTALLER_VERSION: ${{ needs.resolve.outputs.version }}
+          # Pins the Developer ID team whose payloads this installer accepts.
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_TEAM_ID}" ]; then
+            echo "::warning::APPLE_TEAM_ID repo variable is unset — the installer will accept any Apple-anchored payload."
+          fi
+          LDFLAGS="-s -w -X main.installerVersion=${INSTALLER_VERSION}"
+          LDFLAGS="$LDFLAGS -X 'github.com/jarvis/sidecar/internal/update.expectedTeamID=${APPLE_TEAM_ID}'"
+          CC="clang -target arm64-apple-macos11"  CXX="clang++ -target arm64-apple-macos11" \
+            GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o /tmp/installer-arm64 ./installer/
+          CC="clang -target x86_64-apple-macos11" CXX="clang++ -target x86_64-apple-macos11" \
+            GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o /tmp/installer-amd64 ./installer/
+          for b in /tmp/installer-arm64 /tmp/installer-amd64; do
+            strings "$b" > /tmp/installer-strings.txt
+            if [ -n "${APPLE_TEAM_ID}" ] && ! grep -qF "${APPLE_TEAM_ID}" /tmp/installer-strings.txt; then
+              echo "::error::team id pin '${APPLE_TEAM_ID}' is not present in $b; check the -X path"
+              exit 1
+            fi
+          done
+          lipo -create -output jarvis-setup /tmp/installer-arm64 /tmp/installer-amd64
+          lipo -info jarvis-setup
+          packaging/macos/make-icns.sh
+          make app-macos-installer BIN_INSTALLER=./jarvis-setup
+
+      - name: Sign, notarize and staple
+        if: env.HAVE_APPLE_SIGNING == 'true'
+        working-directory: sidecar
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          for v in APPLE_CERT_PASSWORD ASC_KEY_ID ASC_ISSUER_ID ASC_API_KEY_P8; do
+            [ -n "${!v}" ] || { echo "::error::secret $v is required when APPLE_CERT_P12 is set"; exit 1; }
+          done
+
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -lut 3600 build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          printf '%s' "$APPLE_CERT_P12" | base64 -d > /tmp/cert.p12
+          security import /tmp/cert.p12 -k build.keychain -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          rm /tmp/cert.p12
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" build.keychain >/dev/null
+          security list-keychains -d user -s build.keychain login.keychain
+          IDENTITY="$(security find-identity -v -p codesigning build.keychain | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+          test -n "$IDENTITY" || { echo "::error::no 'Developer ID Application' identity in APPLE_CERT_P12"; exit 1; }
+
+          trap 'rm -f /tmp/asc_key.p8' EXIT
+          (umask 077; printf '%s' "$ASC_API_KEY_P8" > /tmp/asc_key.p8)
+          APP="dist/macos/Install Jarvis.app"
+
+          # No --entitlements: the installer needs no hardened-runtime
+          # capabilities (it never captures audio/screen — see the sidecar's
+          # entitlements.plist, which is deliberately NOT reused here).
+          codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+          ditto -c -k --keepParent "$APP" /tmp/InstallJarvis.zip
+          xcrun notarytool submit /tmp/InstallJarvis.zip \
+            --key /tmp/asc_key.p8 --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
+            --wait --timeout 30m --output-format json | tee /tmp/notary-app.json
+          APP_ID="$(jq -r '.id // empty' /tmp/notary-app.json)"
+          if [ "$(jq -r '.status // empty' /tmp/notary-app.json)" != "Accepted" ]; then
+            [ -n "$APP_ID" ] && xcrun notarytool log "$APP_ID" \
+              --key /tmp/asc_key.p8 --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" || true
+            echo "::error::installer app notarization failed"; exit 1
+          fi
+          xcrun stapler staple "$APP"
+
+          # The DMG is what users download, so it is signed, notarized and
+          # stapled in its own right — a stapled ticket inside is not enough.
+          make dmg-installer
+          DMG="dist/macos/Install-Jarvis.dmg"
+          codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+          xcrun notarytool submit "$DMG" \
+            --key /tmp/asc_key.p8 --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
+            --wait --timeout 30m --output-format json | tee /tmp/notary-dmg.json
+          DMG_ID="$(jq -r '.id // empty' /tmp/notary-dmg.json)"
+          if [ "$(jq -r '.status // empty' /tmp/notary-dmg.json)" != "Accepted" ]; then
+            [ -n "$DMG_ID" ] && xcrun notarytool log "$DMG_ID" \
+              --key /tmp/asc_key.p8 --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" || true
+            echo "::error::installer DMG notarization failed"; exit 1
+          fi
+          xcrun stapler staple "$DMG"
+          spctl --assess --type open --context context:primary-signature -vv "$DMG"
+
+      - name: Build unsigned DMG
+        if: env.HAVE_APPLE_SIGNING != 'true'
+        working-directory: sidecar
+        run: |
+          echo "::warning::Apple signing credentials not configured — shipping an unsigned Install-Jarvis.dmg (Gatekeeper will block it)."
+          make dmg-installer
+
+      # shasum: macOS has it, and not always sha256sum. Same hex either way.
+      - name: Digest
+        id: digest
+        working-directory: sidecar
+        run: |
+          set -euo pipefail
+          sum="$(shasum -a 256 dist/macos/Install-Jarvis.dmg)"
+          echo "sha256=${sum%% *}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installer-darwin
+          path: sidecar/dist/macos/Install-Jarvis.dmg
+          if-no-files-found: error
+
+  # ─── Publish ───────────────────────────────────────────────────
+  publish:
+    needs: [resolve, sign-windows, verify-windows, build-macos]
+    if: needs.resolve.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    # The gate (#920). Until now this job held `contents: write` with no
+    # environment at all, so a tag push or a dispatch from ANY branch could
+    # publish to `installer-latest` with nobody approving it -- including a
+    # branch whose copy of this workflow had dropped #919's refusal to ship an
+    # unsigned Windows binary. `publish-sidecar` has been gated since #756;
+    # the installer never was.
+    #
+    # A dry run names a DIFFERENT environment, because naming one records a
+    # deployment against it, and a rehearsal would otherwise show as the live
+    # installer. Only `github`, `inputs`, `vars`, `needs`, `strategy` and
+    # `matrix` are allowed in an environment name -- NOT `env`, so this reads
+    # `inputs.dry_run` rather than the DRY_RUN env the steps use. On a tag push
+    # `inputs.dry_run` is unset, which is not `true`, so a tag push gets
+    # `release` and its approval.
+    environment:
+      name: ${{ inputs.dry_run == true && 'release-dry-run' || 'release' }}
+    permissions:
+      contents: write
+    steps:
+      - name: Download built installers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: installer-*
+          path: artifacts
+
+      # Exactly what sign-windows signed and build-macos built (#779): their
+      # digests arrive as job outputs, and the artifacts could have been
+      # replaced by any job in this run since. Exactly these two files, too:
+      # `pattern: installer-*` would fetch any other artifact so named.
+      - name: Verify the installers
+        env:
+          SHA_WIN32_X64: ${{ needs.sign-windows.outputs.sha256 }}
+          SHA_DARWIN: ${{ needs.build-macos.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          for v in SHA_WIN32_X64 SHA_DARWIN; do
+            [[ "${!v}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no digest was reported for ${v#SHA_}"; exit 1; }
+          done
+          cd artifacts
+          got="$(find . -mindepth 1 -not -type d | sort)"
+          want="$(printf '%s\n' ./installer-darwin/Install-Jarvis.dmg ./installer-win32-x64/Jarvis-Setup.exe)"
+          if [ "$got" != "$want" ] || [ -n "$(find . -mindepth 1 -not -type d -not -type f -print -quit)" ]; then
+            echo "::error::the downloaded installer artifacts are not exactly the two that were built"
+            printf '%s\n' "$got"
+            exit 1
+          fi
+          printf '%s  %s\n' "$SHA_WIN32_X64" installer-win32-x64/Jarvis-Setup.exe "$SHA_DARWIN" installer-darwin/Install-Jarvis.dmg |
+            sha256sum --strict -c -
+
+      - name: Stage release assets
+        env:
+          INSTALLER_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # Unversioned asset names: the website links to
+          # releases/download/installer-latest/<name>, which must never change.
+          cp artifacts/installer-win32-x64/Jarvis-Setup.exe release/
+          cp artifacts/installer-darwin/Install-Jarvis.dmg release/
+          (cd release && sha256sum * > SHA256SUMS)
+          ls -lh release/
+
+      # Immutable, per-version — history and rollback.
+      - name: Publish versioned release
+        if: env.DRY_RUN != 'true'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: installer-v${{ needs.resolve.outputs.version }}
+          name: Installer v${{ needs.resolve.outputs.version }}
+          # Never displace the brain's release as the repo's "Latest".
+          make_latest: "false"
+          draft: false
+          files: |
+            release/Jarvis-Setup.exe
+            release/Install-Jarvis.dmg
+            release/SHA256SUMS
+
+      # Rolling pointer — the website's permanent download URLs.
+      - name: Update installer-latest
+        if: env.DRY_RUN != 'true'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: installer-latest
+          name: Installer (latest)
+          body: |
+            Rolling release: always the newest Jarvis desktop installer.
+            Currently **v${{ needs.resolve.outputs.version }}**.
+
+            Permanent download URLs (safe to link from the website):
+            - `releases/download/installer-latest/Jarvis-Setup.exe`
+            - `releases/download/installer-latest/Install-Jarvis.dmg`
+          make_latest: "false"
+          draft: false
+          files: |
+            release/Jarvis-Setup.exe
+            release/Install-Jarvis.dmg
+            release/SHA256SUMS
+
+      # The version through env:, never as ${{ }} in the script (#818).
+      - name: Dry-run summary
+        if: env.DRY_RUN == 'true'
+        env:
+          INSTALLER_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          echo "::notice::DRY RUN -- built and signed installer v${INSTALLER_VERSION} without publishing"
+          ls -lh release/

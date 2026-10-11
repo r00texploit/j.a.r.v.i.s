@@ -2,7 +2,7 @@
  * `M7AgentDelegator` -- backs `jarvis-agent.delegate` with the full M7 sub-agent
  * loop. Spawns a sub-agent under the daemon's primary agent, runs it through
  * `runSubAgent` (LLM + tool-call loop, authority-gated), and returns the final
- * message + tool-call trace + termination reason.
+ * message + tool-call trace + termination reason + declared outcome.
  *
  * Lifecycle per call:
  *   1. Look up the requested role in the specialist registry. Fall back to
@@ -18,6 +18,9 @@
  *      categories are callable.
  *   5. `runSubAgent(...)` with the goal as the task. Authority engine,
  *      audit trail, and emergency controller all flow in if configured.
+ *      With a continuation the audit trail is the run's
+ *      (`runScopedAuditTrail`), so the sub-agent's decisions are recorded
+ *      under the workflow run that caused them.
  *   6. Walk the agent's message log to extract `{name, args, result, error}`
  *      tuples for each tool call (zip assistant `tool_calls` with subsequent
  *      `tool` messages by `tool_call_id`).
@@ -27,10 +30,13 @@
  * Concurrency: each `delegate()` call spawns + terminates its own sub-agent;
  * multiple workflow steps can call this in parallel without sharing state.
  *
- * Authority: sub-agents are denied actions that would require user approval
- * (per `runSubAgent`'s policy). A workflow step that needs a destructive
- * action should expose it via a separate piece (e.g., `jarvis-tool` or
- * `jarvis-notify` + waitpoint), not piggy-back on the sub-agent.
+ * Authority: a governed tool call inside the sub-agent is handed to the
+ * continuation's dispatch, which runs it through the workflow effect
+ * boundary. When that parks the run on an approval, the conversation is
+ * checkpointed and the step returns `approval_required`; the engine runs the
+ * step again after the decision and the conversation resumes where it
+ * stopped. Without a continuation (no workflow around the call) governed
+ * calls are denied outright, as before.
  */
 
 import type {
@@ -44,14 +50,22 @@ import type { LLMMessage } from "../../llm/provider";
 import type { AgentOrchestrator } from "../../agents/orchestrator";
 import type { AuthorityEngine } from "../../authority/engine";
 import type { AuditTrail } from "../../authority/audit";
+import { boundedApprovalLabel } from "../../authority/approval-delivery";
 import type { EmergencyController } from "../../authority/emergency";
 import type { ActionCategory } from "../../roles/authority";
 import type { RoleDefinition } from "../../roles/types";
+import { boundedReceiptText } from "../../roles/untrusted";
+import type { ToolRegistry } from "../../actions/tools/registry";
+import type { ActionOutcome } from "../../actions/action-outcome";
+import type { DelegationCheckpoint } from "../db/repos/delegation";
 import {
   createScopedToolRegistry,
   runSubAgent as defaultRunSubAgent,
+  type GovernedToolCall,
+  type GovernedToolResult,
   type RunSubAgentOptions,
   type SubAgentResult,
+  type SubAgentResume,
 } from "../../agents/sub-agent-runner";
 
 /**
@@ -60,6 +74,28 @@ import {
  * and gets the real `runSubAgent`.
  */
 export type RunSubAgentFn = (opts: RunSubAgentOptions) => Promise<SubAgentResult>;
+
+/**
+ * What a workflow step supplies so a delegation can pause on an approval and
+ * continue later: where its checkpoint lives, what it is bound to, and how a
+ * governed tool call reaches the effect boundary.
+ */
+/** What a checkpoint row holds beyond its identity, role and goal. */
+type DelegationState = Omit<DelegationCheckpoint, keyof DelegationContinuation["identity"] | "roleId" | "goal" | "updatedAt">;
+
+export interface DelegationContinuation {
+  identity: {
+    id: string;
+    runId: string;
+    stepName: string;
+    executionPath: Array<[string, number]>;
+    versionDigest: string;
+  };
+  load(): DelegationCheckpoint | null;
+  save(checkpoint: DelegationCheckpoint): void;
+  /** Runs, pauses or reports the decision for a governed tool call. */
+  dispatch(registry: ToolRegistry, call: GovernedToolCall): Promise<GovernedToolResult>;
+}
 
 export interface M7AgentDelegatorOptions {
   orchestrator: AgentOrchestrator;
@@ -89,11 +125,106 @@ export interface M7AgentDelegatorOptions {
   traceResultMaxChars?: number;
   /** Test seam. Production omits this and gets the real `runSubAgent`. */
   runSubAgentFn?: RunSubAgentFn;
+  /** Test seam. Production omits this and gets the builtin tools for the role's categories. */
+  scopedRegistry?: (allowedCategories: string[]) => ToolRegistry;
 }
 
 const DEFAULT_ROLE_ID = "workflow-default";
 const DEFAULT_MAX_ITERATIONS = 50;
 const DEFAULT_TRACE_RESULT_MAX_CHARS = 1000;
+
+/**
+ * One field of a delegation's tool trace, cut to the cap and left carrying no
+ * delimiter (#609).
+ *
+ * Defang-then-cut rather than cut-then-defang: neither order can CREATE a
+ * marker, and this one keeps the `... (truncated, ...)` note OUTSIDE the bounded
+ * text, where it belongs -- the note is repo-authored, so it should never be
+ * subject to the cut, and the field's length is then exactly the cap plus the
+ * note rather than the cap plus an unexplained allowance.
+ */
+function boundedTraceText(text: string, maxChars: number): string {
+  const safe = boundedReceiptText(text, maxChars);
+  return text.length > maxChars ? safe + `... (truncated, was ${text.length} chars)` : safe;
+}
+
+/**
+ * The audit trail a delegated sub-agent writes to when a workflow run is
+ * behind it (#730): every row its runner writes -- a gate denial, a call run
+ * without approval, an approval it parked, a suspension, a discovery
+ * admission or refusal -- goes under the RUN, where the route's own refusals
+ * (`WorkflowEffectBoundary.auditRefusal`) and the boundary's dispatches
+ * already are.
+ *
+ * Without it those rows carried only the spawned child's id and the role's
+ * name. A new child is spawned on every resume and nothing records which
+ * child belonged to which run, so a query for the run
+ * (`/api/authority/audit?agent_id=workflow:<runId>`) showed the delegation
+ * allowed and then nothing of what the sub-agent decided.
+ *
+ * BOTH columns are rewritten, not only `agent_name`: the audit API filters on
+ * `agent_id` alone, so a name prefix would be readable by a person but still
+ * missing from the run's query. The child id and the role, which the id
+ * column used to carry, move into the name, so the row still says which
+ * sub-agent decided. The name starts with exactly what `auditRefusal` writes,
+ * `Workflow <runId> / <step>`, bounded the same way, so the two kinds of row
+ * for one step share a prefix.
+ */
+export function runScopedAuditTrail(base: AuditTrail, run: { runId: string; stepName: string }): AuditTrail {
+  // The step name is engine-supplied and bounded before it reaches a row, as
+  // `auditRefusal` bounds it (120, one line, no open delimiter).
+  const prefix = `Workflow ${run.runId} / ${boundedApprovalLabel(run.stepName || "unknown step", 120)}`;
+  const scoped = Object.create(base) as AuditTrail;
+  scoped.log = (entry) => base.log({
+    ...entry,
+    agent_id: `workflow:${run.runId}`,
+    // The role name is bounded the same way: it comes from role YAML, so it
+    // is operator-authored, but it is the one free-text part of this label
+    // that is not repo-authored or a pinned graph node.
+    agent_name: `${prefix} / ${boundedApprovalLabel(entry.agent_name, 120)} (sub-agent ${entry.agent_id})`,
+  });
+  return scoped;
+}
+
+const errorResult = (error: string, toolCalls: PieceAgentToolCall[] = []): PieceAgentDelegateResult =>
+  ({ finalMessage: "", toolCalls, status: "error", error });
+
+/**
+ * The declared business outcome of a finished delegation. The conversation
+ * ending is not it: only the required tools completing is. Without declared
+ * tools, `succeeded` says no more than that the agent finished cleanly.
+ */
+export function delegationOutcome(
+  result: Pick<PieceAgentDelegateResult, "status" | "toolCalls" | "error">,
+  requiredTools: string[] = [],
+): ActionOutcome {
+  if (result.status === "error") {
+    return { status: "error", code: "AGENT_ERROR", effect: "may_have_occurred",
+      message: result.error ?? "The delegated agent failed" };
+  }
+  if (result.status === "max_iterations") {
+    return { status: "error", code: "AGENT_INCOMPLETE", effect: "may_have_occurred",
+      message: "The delegated agent reached its iteration limit before finishing" };
+  }
+  if (result.status === "canceled") {
+    return { status: "error", code: "AGENT_CANCELED", effect: "may_have_occurred",
+      message: "The delegated agent was canceled before finishing" };
+  }
+  if (result.status === "approval_required") {
+    return { status: "blocked", code: "APPROVAL_PENDING", effect: "not_started",
+      message: "A governed tool call is waiting for approval" };
+  }
+  const unmet = requiredTools.filter(name =>
+    !result.toolCalls.some(call => call.name === name && call.result !== undefined && call.error === undefined));
+  if (unmet.length > 0) {
+    // A tool that was never called did nothing; one that was called and did
+    // not complete may have.
+    const attempted = unmet.some(name => result.toolCalls.some(call => call.name === name));
+    return { status: "error", code: "REQUIRED_TOOL_NOT_COMPLETED", effect: attempted ? "may_have_occurred" : "not_started",
+      message: `The delegated agent finished without completing: ${unmet.join(", ")}` };
+  }
+  return { status: "succeeded" };
+}
 
 export class M7AgentDelegator implements PieceAgentDelegator {
   private readonly orchestrator: AgentOrchestrator;
@@ -107,6 +238,7 @@ export class M7AgentDelegator implements PieceAgentDelegator {
   private readonly temporaryGrants?: Map<string, ActionCategory[]>;
   private readonly traceResultMaxChars: number;
   private readonly runSubAgentFn: RunSubAgentFn;
+  private readonly scopedRegistry: (allowedCategories: string[]) => ToolRegistry;
 
   constructor(opts: M7AgentDelegatorOptions) {
     this.orchestrator = opts.orchestrator;
@@ -120,79 +252,129 @@ export class M7AgentDelegator implements PieceAgentDelegator {
     if (opts.temporaryGrants) this.temporaryGrants = opts.temporaryGrants;
     this.traceResultMaxChars = opts.traceResultMaxChars ?? DEFAULT_TRACE_RESULT_MAX_CHARS;
     this.runSubAgentFn = opts.runSubAgentFn ?? defaultRunSubAgent;
+    this.scopedRegistry = opts.scopedRegistry ?? createScopedToolRegistry;
   }
 
-  async delegate(input: PieceAgentDelegateInput): Promise<PieceAgentDelegateResult> {
+  async delegate(input: PieceAgentDelegateInput, continuation?: DelegationContinuation): Promise<PieceAgentDelegateResult> {
     const roleId = input.role ?? this.defaultRoleId;
     const role = this.specialists.get(roleId);
     if (!role) {
       const available = Array.from(this.specialists.keys()).join(", ") || "<none>";
-      return {
-        finalMessage: "",
-        toolCalls: [],
-        status: "error",
-        error: `unknown role "${roleId}"; available: ${available}`,
-      };
+      return errorResult(`unknown role "${roleId}"; available: ${available}`);
     }
 
     const parent = this.orchestrator.getPrimary();
     if (!parent) {
-      return {
-        finalMessage: "",
-        toolCalls: [],
-        status: "error",
-        error:
-          "no primary agent registered; the daemon's agent-service hasn't initialized -- workflows can't delegate yet",
-      };
+      return errorResult(
+        "no primary agent registered; the daemon's agent-service hasn't initialized -- workflows can't delegate yet",
+      );
     }
+
+    // A step the engine runs again answers from its record: the finished
+    // result, or a refusal when what the checkpoint was bound to has changed.
+    const checkpoint = continuation?.load() ?? null;
+    if (checkpoint?.status === "completed" && checkpoint.result) {
+      // The declaration is not part of the record's identity, so it is applied as asked now.
+      return { ...checkpoint.result, outcome: delegationOutcome(checkpoint.result, input.requiredTools) };
+    }
+    if (checkpoint && continuation) {
+      if (checkpoint.versionDigest !== continuation.identity.versionDigest) {
+        return errorResult("Workflow version changed while the delegation was paused; start a new run");
+      }
+      if (checkpoint.roleId !== roleId || checkpoint.goal !== input.goal) {
+        return errorResult("Delegation input changed while it was paused; start a new run");
+      }
+    }
+    const resume: SubAgentResume | undefined = checkpoint && checkpoint.status !== "completed"
+      ? { messages: checkpoint.messages, toolsUsed: checkpoint.toolsUsed, tokensUsed: checkpoint.tokensUsed,
+          sequence: checkpoint.sequence, iteration: checkpoint.iteration, taint: checkpoint.taint,
+          failedToolCalls: checkpoint.failedToolCalls, ...(checkpoint.pending ? { pending: checkpoint.pending } : {}) }
+      : undefined;
 
     let childId: string | null = null;
     try {
       const child = this.orchestrator.spawnSubAgent(parent.id, role);
       childId = child.id;
-      const scopedRegistry = createScopedToolRegistry(child.agent.authority.allowed_tools);
+      const registry = this.scopedRegistry(child.agent.authority.allowed_tools);
+      // The durable side of a delegation exists only with a continuation.
+      const durable = continuation ? {
+        save: (state: DelegationState): void =>
+          continuation.save({ ...continuation.identity, roleId, goal: input.goal, ...state, updatedAt: Date.now() }),
+        dispatch: (call: GovernedToolCall) => continuation.dispatch(registry, call),
+      } : null;
 
       const result: SubAgentResult = await this.runSubAgentFn({
         agent: child,
         task: input.goal,
         context: "",
         llmManager: this.llmManager,
-        toolRegistry: scopedRegistry,
-        maxIterations: input.maxIterations ?? this.defaultMaxIterations,
+        toolRegistry: registry,
+        // Provider kinds for the tool-relevance eligibility gate. Optional
+        // call: the tests stand in a partial orchestrator.
+        toolFilterProviders: this.orchestrator.getToolFilterProviders?.(),
+        // Clamped as well as validated at the route: this adapter is also
+        // reachable without it, and 200 is the primary loop's own ceiling.
+        maxIterations: Math.min(input.maxIterations ?? this.defaultMaxIterations, 200),
         ...(this.authorityEngine ? { authorityEngine: this.authorityEngine } : {}),
-        ...(this.auditTrail ? { auditTrail: this.auditTrail } : {}),
+        // Under the run when there is one (#730); see `runScopedAuditTrail`.
+        ...(this.auditTrail
+          ? { auditTrail: continuation ? runScopedAuditTrail(this.auditTrail, continuation.identity) : this.auditTrail }
+          : {}),
         ...(this.emergencyController ? { emergencyController: this.emergencyController } : {}),
         ...(this.temporaryGrants ? { temporaryGrants: this.temporaryGrants } : {}),
+        ...(durable ? {
+          governedTools: durable.dispatch,
+          // After every completed turn the conversation is durable, so a run
+          // that dies mid-conversation continues from here, not from scratch.
+          onTurn: state => durable.save({ ...state, status: "running" }),
+        } : {}),
+        ...(resume ? { resume } : {}),
       });
 
       // Walk the runSubAgent-supplied message log (NOT child.getMessages(),
       // which only carries user/assistant turns). The local log has every
       // assistant tool_calls block + matching tool result.
-      const toolCalls = extractToolCallsTrace(result.messages, this.traceResultMaxChars);
+      const toolCalls = extractToolCallsTrace(result.messages, this.traceResultMaxChars, new Set(result.failedToolCalls ?? []));
+      const stateOf = (iteration: number) => ({ messages: result.messages, toolsUsed: result.toolsUsed, tokensUsed: result.tokensUsed,
+        sequence: result.sequence ?? result.paused?.sequence ?? 0, iteration, taint: result.taint ?? [],
+        failedToolCalls: result.failedToolCalls ?? [] });
 
-      if (result.terminationReason === "error") {
-        return {
-          finalMessage: "",
-          toolCalls,
-          status: "error",
-          error: result.response,
-        };
+      if (result.terminationReason === "paused") {
+        // The dispatch only exists with a continuation, so a pause always has somewhere to go.
+        if (!durable || !result.paused) throw new Error("paused without a continuation");
+        durable.save({ ...stateOf(result.paused.iteration), status: "paused", pending: result.paused });
+        return { finalMessage: "", toolCalls, status: "approval_required", approval: result.paused.approval };
       }
-      return {
-        finalMessage: result.response,
-        toolCalls,
-        status: result.terminationReason,
-      };
+
+      if (result.terminationReason === "error" && result.dispatchError) {
+        // The boundary refused or failed the call (emergency, changed version,
+        // an uncertain earlier attempt). That is this run's answer, not the
+        // delegation's: the checkpoint keeps its state so a later run can
+        // resume once the condition clears.
+        return errorResult(result.response, toolCalls);
+      }
+
+      if (result.terminationReason === "error" && result.canceled) {
+        // The run was stopped between turns. Its delegation rows are already
+        // gone; nothing is written back.
+        const canceled: PieceAgentDelegateResult = { finalMessage: "", toolCalls, status: "canceled", error: result.response };
+        canceled.outcome = delegationOutcome(canceled, input.requiredTools);
+        return canceled;
+      }
+
+      const finished: PieceAgentDelegateResult = result.terminationReason === "error"
+        ? errorResult(result.response, toolCalls)
+        : { finalMessage: result.response, toolCalls,
+            status: result.terminationReason === "max_iterations" ? "max_iterations" : "completed" };
+      finished.outcome = delegationOutcome(finished, input.requiredTools);
+      // The log is dropped once the result exists; the trace is in the step output.
+      durable?.save({ ...stateOf(0), messages: [], status: "completed", result: finished });
+      return finished;
     } catch (e) {
       // spawnSubAgent or runSubAgent threw an unhandled exception. Surface
       // as a clean error rather than letting the engine see a 500.
       const msg = e instanceof Error ? e.message : String(e);
-      return {
-        finalMessage: "",
-        toolCalls: [],
-        status: "error",
-        error: `delegate failed: ${msg}`,
-      };
+      return errorResult(`delegate failed: ${msg}`);
     } finally {
       // Always clean up. terminateAgent recursively removes children, so even
       // if runSubAgent itself spawned grand-children (it doesn't today), they
@@ -216,11 +398,13 @@ export class M7AgentDelegator implements PieceAgentDelegator {
  * Strategy: every `assistant` message carrying `tool_calls` is followed by
  * one or more `tool` messages whose `tool_call_id` matches an entry in that
  * tool_calls array. Zip them by id. Tool calls whose response never landed
- * (mid-loop crash) come through with no `result`.
+ * (mid-loop crash, or a pause) come through with no `result`.
  */
 export function extractToolCallsTrace(
   messages: LLMMessage[],
   maxResultChars: number,
+  /** Tool call ids the runner reported as failed, denied or refused. */
+  failed: Set<string>,
 ): PieceAgentToolCall[] {
   const responseById = new Map<string, string>();
   for (const msg of messages) {
@@ -236,7 +420,14 @@ export function extractToolCallsTrace(
       // Stringify args defensively -- sub-agents shouldn't see the raw object
       // round-trip in step output, just a stable JSON blob.
       try {
-        entry.args = JSON.stringify(call.arguments);
+        // Bounded and defanged like the result below (#609). A sub-agent can
+        // pass one tool's framed return as another tool's argument -- writing it
+        // to a file, posting it, re-querying on it -- so this field could carry
+        // a complete block with a live nonce into the step output, and from
+        // there into the version's `sample_data`. It also had no cap at all,
+        // while being the bigger half of a `write_file` call, which is the cost
+        // the cap below exists to control.
+        entry.args = boundedTraceText(JSON.stringify(call.arguments), maxResultChars);
       } catch {
         entry.args = "<unserializable>";
       }
@@ -245,18 +436,27 @@ export function extractToolCallsTrace(
         // The LLM-side already truncates long tool results to ~6KB inside
         // `runSubAgent`; we apply a tighter cap here so a row of 50 tool
         // calls with multi-KB results doesn't bloat the workflow step.
-        entry.result =
-          result.length > maxResultChars
-            ? result.slice(0, maxResultChars) + `... (truncated, was ${result.length} chars)`
-            : result;
-        // The sub-agent runner formats authority denials + tool errors as
-        // `[AUTHORITY DENIED]` / `Error executing X:` strings inside the
-        // result. Surface them as `error` so the workflow step can branch on
-        // it. Heuristic match -- the runner is the only source of these
-        // prefixes.
-        if (result.startsWith("[AUTHORITY DENIED]") || result.startsWith("Error executing ")) {
-          entry.error = result;
-        }
+        //
+        // Bounded through `boundedReceiptText` rather than sliced (#609). A
+        // sub-agent can call a tool that frames its own return
+        // (`actions/tools/manage-workflow.ts`), and a frame costs ~270-330
+        // characters of preamble and delimiters, so at this cap ANY framed
+        // payload past roughly 700 characters was cut between the open
+        // delimiter and the close -- a block that never terminates, disclaiming
+        // whatever is rendered after it. Tighter than the two approval receipts,
+        // so it fired more often, and the destination is worse: this trace is
+        // the delegation step's output, which a successful run merges into the
+        // version's `sample_data` and replays as step INPUT.
+        entry.result = boundedTraceText(result, maxResultChars);
+        // The runner marks which calls failed, were denied or refused; the
+        // text of a result is never read for it.
+        //
+        // The SAME value as `result`, which it was not: it stored the result
+        // UNTRUNCATED, so it was the one field where a whole framed block landed
+        // in a step's output intact, nonce and all -- and an operator reading a
+        // failed step's trace got a silently uncut copy beside a cut one. Now
+        // they agree, and the truncation note says the text was cut.
+        if (failed.has(call.id)) entry.error = entry.result;
       }
       trace.push(entry);
     }

@@ -1,9 +1,16 @@
 import React, { useEffect, useState } from "react";
+import { RotateCcw } from "lucide-react";
 import type {
   STTProvider,
   SettingsHook,
   TTSProvider,
 } from "../useSettingsData";
+import { allowedFieldText, parseDiscordIds, parseTelegramIds } from "./channel-ids";
+import { recipientNotice } from "./channel-recipient";
+
+// OpenAI-style voices the hosted Usejarvis TTS accepts (see createTTSProvider:
+// Edge neural names are rejected there, so this list is the whole picker).
+const UJ_VOICES = ["alloy", "echo", "fable", "nova", "onyx", "shimmer"];
 
 const EDGE_VOICES = [
   { id: "en-US-AriaNeural", label: "Aria (US Female)" },
@@ -40,6 +47,44 @@ const SARVAM_SPEAKERS = [
   "arya",
   "hitesh",
 ];
+
+// #811, #852: an empty allow-list means different things, so say them. The
+// daemon refuses approve/deny replies from a channel whose list is empty, and
+// sends approval requests and notifications only to a listed user. #884: each
+// sender has their own conversation, but the agent still answers them with
+// the owner's tools and profile, which an owner leaving the list empty should
+// know.
+export const ALLOW_LIST_HINT =
+  "Leave empty to let anyone who can message the bot chat with Jarvis. Each person gets their own conversation, but Jarvis answers them with your tools and what it knows about you. Approval requests and notifications are sent, and can be approved or denied, only for an ID listed here, and are sent to your last direct message with the bot, never a group.";
+
+/**
+ * Entries of the saved allow-list the daemon ignores, and why (#883). A
+ * hand-edited value that names nobody otherwise shows only as a bot that never
+ * answers.
+ */
+function AllowListProblems({ problems }: { problems?: string[] }) {
+  if (!problems || problems.length === 0) return null;
+  return (
+    <div className="v2-set__hint v2-set__hint--warn" role="status">
+      Some saved IDs are ignored:
+      <ul>
+        {problems.map((p) => (
+          <li key={p}>{p}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** A connected channel with nowhere to send approval requests (#890). */
+function RecipientNotice({ text }: { text: string | null }) {
+  if (!text) return null;
+  return (
+    <div className="v2-set__hint v2-set__hint--warn" role="status">
+      {text}
+    </div>
+  );
+}
 
 interface ElevenLabsVoice {
   voice_id: string;
@@ -81,8 +126,8 @@ export function ChannelsTab({
   // reference on every 10s settings poll, so depending on the object would
   // re-seed (and clobber in-progress typing) on each poll. Value deps only
   // re-fire when the server value actually changes (e.g. after a save).
-  const tgAllowedServer = channelCfg?.telegram.allowed_users.join(", ") ?? "";
-  const dcAllowedServer = channelCfg?.discord.allowed_users.join(", ") ?? "";
+  const tgAllowedServer = allowedFieldText(channelCfg?.telegram);
+  const dcAllowedServer = allowedFieldText(channelCfg?.discord);
   const dcGuildServer = channelCfg?.discord.guild_id ?? "";
 
   useEffect(() => {
@@ -117,7 +162,7 @@ export function ChannelsTab({
           <div>
             <h3 className="v2-set__section-title">Telegram</h3>
             <div className="v2-set__section-sub">
-              Bot via @BotFather. Restart-required after token changes.
+              Bot via @BotFather. Changes apply when saved.
             </div>
           </div>
           <span className={"v2-set__chip " + (channelStatus?.channels.telegram ? "v2-set__chip--ok" : "")}>
@@ -165,21 +210,23 @@ export function ChannelsTab({
             value={tgAllowed}
             onChange={(e) => setTgAllowed(e.target.value)}
           />
+          <div className="v2-set__hint">{ALLOW_LIST_HINT}</div>
+          <AllowListProblems problems={channelCfg?.telegram.allowed_users_problems} />
+          <RecipientNotice text={recipientNotice("Telegram", channelStatus?.recipients?.telegram)} />
         </div>
         <div style={{ display: "flex", justifyContent: "flex-end" }}>
           <button
             type="button"
             className="v2-set__btn v2-set__btn--primary"
             onClick={async () => {
-              const allowed = tgAllowed
-                .split(",")
-                .map((s) => s.trim())
-                .filter(Boolean)
-                .map(Number)
-                .filter((n) => Number.isFinite(n));
+              const allowed = parseTelegramIds(tgAllowed);
+              if (!allowed.ok) {
+                onToast(allowed.message, "warn");
+                return;
+              }
               const r = await data.setTelegram({
                 bot_token: tgToken || undefined,
-                allowed_users: allowed,
+                allowed_users: allowed.ids,
               });
               if (r.ok) setTgToken("");
               onToast(r.message, r.ok ? "ok" : "warn");
@@ -196,7 +243,7 @@ export function ChannelsTab({
           <div>
             <h3 className="v2-set__section-title">Discord</h3>
             <div className="v2-set__section-sub">
-              Bot via discord.com/developers. Enable Message Content Intent. Restart-required.
+              Bot via discord.com/developers. Enable Message Content Intent. Changes apply when saved.
             </div>
           </div>
           <span className={"v2-set__chip " + (channelStatus?.channels.discord ? "v2-set__chip--ok" : "")}>
@@ -244,6 +291,9 @@ export function ChannelsTab({
             value={dcAllowed}
             onChange={(e) => setDcAllowed(e.target.value)}
           />
+          <div className="v2-set__hint">{ALLOW_LIST_HINT}</div>
+          <AllowListProblems problems={channelCfg?.discord.allowed_users_problems} />
+          <RecipientNotice text={recipientNotice("Discord", channelStatus?.recipients?.discord)} />
         </div>
         <div className="v2-set__field">
           <label className="v2-set__field-label">Guild ID (optional, restrict to one server)</label>
@@ -259,13 +309,14 @@ export function ChannelsTab({
             type="button"
             className="v2-set__btn v2-set__btn--primary"
             onClick={async () => {
-              const allowed = dcAllowed
-                .split(",")
-                .map((s) => s.trim())
-                .filter(Boolean);
+              const allowed = parseDiscordIds(dcAllowed);
+              if (!allowed.ok) {
+                onToast(allowed.message, "warn");
+                return;
+              }
               const r = await data.setDiscord({
                 bot_token: dcToken || undefined,
-                allowed_users: allowed,
+                allowed_users: allowed.ids,
                 guild_id: dcGuild || undefined,
               });
               if (r.ok) setDcToken("");
@@ -283,27 +334,81 @@ export function ChannelsTab({
           <div>
             <h3 className="v2-set__section-title">Voice Transcription (STT)</h3>
             <div className="v2-set__section-sub">
-              Enables voice messages on Telegram and Discord. Restart-required.
+              Enables voice messages on Telegram and Discord.
             </div>
           </div>
         </div>
 
         <div className="v2-set__field">
           <label className="v2-set__field-label">Provider</label>
-          <select
-            className="v2-set__select"
-            value={sttCfg?.provider ?? "openai"}
-            onChange={async (e) => {
-              const r = await data.setSTTProvider(e.target.value as STTProvider);
-              onToast(r.message, r.ok ? "ok" : "warn");
-            }}
-          >
-            <option value="openai">OpenAI Whisper</option>
-            <option value="groq">Groq Whisper</option>
-            <option value="sarvam">Sarvam AI</option>
-            <option value="local">Local Whisper (whisper.cpp)</option>
-          </select>
+          <div style={{ display: "flex", gap: "var(--s-2)", alignItems: "center" }}>
+            <select
+              className="v2-set__select"
+              value={sttCfg?.provider ?? "openai"}
+              onChange={async (e) => {
+                const r = await data.setSTTProvider(e.target.value as STTProvider);
+                onToast(r.message, r.ok ? "ok" : "warn");
+              }}
+            >
+              {sttCfg?.usejarvis_available && (
+                <option value="usejarvis">Usejarvis AI (included)</option>
+              )}
+              <option value="openai">OpenAI Whisper</option>
+              <option value="groq">Groq Whisper</option>
+              <option value="sarvam">Sarvam AI</option>
+              <option value="local">Local Whisper (whisper.cpp)</option>
+            </select>
+            {sttCfg?.usejarvis_available && sttCfg?.provider !== "usejarvis" && (
+              <button
+                type="button"
+                className="v2-set__btn v2-set__btn--icon"
+                title="Reset to your plan's included voice"
+                aria-label="Reset to your plan's included voice"
+                onClick={async () => {
+                  const r = await data.resetVoiceProvider("stt");
+                  onToast(r.message, r.ok ? "ok" : "warn");
+                }}
+              >
+                <RotateCcw size={14} aria-hidden="true" />
+              </button>
+            )}
+          </div>
         </div>
+
+        {sttCfg?.provider !== "sarvam" && (
+          <div className="v2-set__field">
+            <label className="v2-set__field-label">Spoken language</label>
+            <select
+              className="v2-set__select"
+              value={sttCfg?.language ?? ""}
+              onChange={async (e) => {
+                const r = await data.setSTTLanguage(e.target.value);
+                onToast(r.message, r.ok ? "ok" : "warn");
+              }}
+            >
+              <option value="">Auto-detect</option>
+              <option value="en">English</option>
+              <option value="it">Italiano</option>
+              <option value="es">Español</option>
+              <option value="fr">Français</option>
+              <option value="de">Deutsch</option>
+              <option value="pt">Português</option>
+              <option value="nl">Nederlands</option>
+              <option value="pl">Polski</option>
+              <option value="tr">Türkçe</option>
+              <option value="ru">Русский</option>
+              <option value="ar">العربية</option>
+              <option value="hi">हिन्दी</option>
+              <option value="ja">日本語</option>
+              <option value="ko">한국어</option>
+              <option value="zh">中文</option>
+            </select>
+            <p className="v2-set__hint">
+              Auto-detect works well; pick a language only if transcripts come
+              out wrong.
+            </p>
+          </div>
+        )}
 
         {(sttCfg?.provider === "openai" ||
           sttCfg?.provider === "groq" ||
@@ -413,19 +518,82 @@ export function ChannelsTab({
 
         <div className="v2-set__field">
           <label className="v2-set__field-label">Provider</label>
-          <select
-            className="v2-set__select"
-            value={ttsCfg?.provider ?? "edge"}
-            onChange={async (e) => {
-              const r = await data.setTTS({ provider: e.target.value as TTSProvider });
-              onToast(r.message, r.ok ? "ok" : "warn");
-            }}
-          >
-            <option value="edge">Edge TTS (free)</option>
-            <option value="elevenlabs">ElevenLabs (API key)</option>
-            <option value="sarvam">Sarvam AI (Indian languages)</option>
-          </select>
+          <div style={{ display: "flex", gap: "var(--s-2)", alignItems: "center" }}>
+            <select
+              className="v2-set__select"
+              value={ttsCfg?.provider ?? "edge"}
+              onChange={async (e) => {
+                const r = await data.setTTS({ provider: e.target.value as TTSProvider });
+                onToast(r.message, r.ok ? "ok" : "warn");
+              }}
+            >
+              {ttsCfg?.usejarvis_available && (
+                <option value="usejarvis">Usejarvis AI (included)</option>
+              )}
+              <option value="edge">Edge TTS (free)</option>
+              <option value="elevenlabs">ElevenLabs (API key)</option>
+              <option value="sarvam">Sarvam AI (Indian languages)</option>
+            </select>
+            {ttsCfg?.usejarvis_available && ttsCfg?.provider !== "usejarvis" && (
+              <button
+                type="button"
+                className="v2-set__btn v2-set__btn--icon"
+                title="Reset to your plan's included voice"
+                aria-label="Reset to your plan's included voice"
+                onClick={async () => {
+                  const r = await data.resetVoiceProvider("tts");
+                  onToast(r.message, r.ok ? "ok" : "warn");
+                }}
+              >
+                <RotateCcw size={14} aria-hidden="true" />
+              </button>
+            )}
+          </div>
         </div>
+
+        {ttsCfg?.provider === "usejarvis" && (
+          <div className="v2-set__field">
+            <label className="v2-set__field-label">Voice</label>
+            <select
+              className="v2-set__select"
+              value={UJ_VOICES.includes(ttsCfg?.voice ?? "") ? (ttsCfg?.voice as string) : "alloy"}
+              onChange={async (e) => {
+                const r = await data.setTTS({ voice: e.target.value });
+                onToast(r.message, r.ok ? "ok" : "warn");
+              }}
+            >
+              {UJ_VOICES.map((v) => (
+                <option key={v} value={v}>
+                  {v.charAt(0).toUpperCase() + v.slice(1)}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="v2-set__btn"
+              onClick={async () => {
+                const voice = UJ_VOICES.includes(ttsCfg?.voice ?? "") ? ttsCfg?.voice : "alloy";
+                const res = await fetch("/api/tts/preview", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ provider: "usejarvis", voice }),
+                });
+                if (!res.ok) {
+                  const body = await res.json().catch(() => ({ error: "Preview failed" }));
+                  onToast((body as { error?: string }).error ?? "Preview failed", "warn");
+                  return;
+                }
+                const buf = await res.arrayBuffer();
+                const url = URL.createObjectURL(new Blob([buf], { type: "audio/mpeg" }));
+                const a = new Audio(url);
+                a.onended = () => URL.revokeObjectURL(url);
+                await a.play().catch(() => URL.revokeObjectURL(url));
+              }}
+            >
+              Listen
+            </button>
+          </div>
+        )}
 
         {ttsCfg?.provider === "edge" && (
           <>

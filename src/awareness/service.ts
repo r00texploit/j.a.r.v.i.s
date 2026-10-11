@@ -14,6 +14,7 @@ import type { LLMManager } from '../llm/manager.ts';
 import type { AwarenessEvent, LiveContext, DailyReport, Suggestion, SessionSummary, WeeklyReport, BehavioralInsight } from './types.ts';
 import type { SuggestionType, SuggestionRow } from './types.ts';
 import type { SidecarEvent } from '../sidecar/protocol.ts';
+import type { AwarenessActivityEvent } from './activity-events.ts';
 
 import { ContextTracker } from './context-tracker.ts';
 import { AwarenessIntelligence } from './intelligence.ts';
@@ -31,10 +32,13 @@ import {
   markSuggestionDismissed,
   markSuggestionActedOn,
   getRecentSuggestions,
+  captureGapCapFor,
 } from '../vault/awareness.ts';
 import { createObservation } from '../vault/observations.ts';
 import { getUpcoming } from '../vault/commitments.ts';
 import { generateId } from '../vault/schema.ts';
+import { pruneOpportunityObservations } from '../vault/opportunity-observations.ts';
+import { OpportunityDelivery, type DeliverOpportunity } from './opportunity-delivery.ts';
 export class AwarenessService implements Service {
   name = 'awareness';
   private _status: ServiceStatus = 'stopped';
@@ -51,6 +55,10 @@ export class AwarenessService implements Service {
   private cleanupSidecarCaptures: ((cutoffMs: number) => Promise<void>) | null;
   private enabled: boolean;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private opportunityDelivery: OpportunityDelivery | null;
+  private runRequested = false;
+  private lifecycle: Promise<void> = Promise.resolve();
+  private sessionSummariesInFlight = new Set<string>();
 
   constructor(
     jarvisConfig: JarvisConfig,
@@ -58,7 +66,8 @@ export class AwarenessService implements Service {
     eventCallback?: (event: AwarenessEvent) => void,
     googleAuth?: { isAuthenticated(): boolean; getAccessToken(): Promise<string> } | null,
     fetchCapture?: (sidecarId: string, path: string) => Promise<Buffer | null>,
-    cleanupSidecarCaptures?: (cutoffMs: number) => Promise<void>
+    cleanupSidecarCaptures?: (cutoffMs: number) => Promise<void>,
+    deliverOpportunity?: DeliverOpportunity,
   ) {
     const cfg = jarvisConfig.awareness!;
     this.config = cfg;
@@ -67,25 +76,52 @@ export class AwarenessService implements Service {
     this.fetchCapture = fetchCapture ?? null;
     this.cleanupSidecarCaptures = cleanupSidecarCaptures ?? null;
     this.enabled = cfg.enabled;
+    this.opportunityDelivery = deliverOpportunity ? new OpportunityDelivery(deliverOpportunity) : null;
+
+    // How much elapsed time a single gap between captures may account for.
+    // Derived from the sampling interval so a slowly-sampling install does not
+    // silently report a fraction of the time the user actually spent.
+    const maxGapMs = captureGapCapFor(cfg.capture_interval_ms);
 
     this.contextTracker = new ContextTracker(cfg);
     this.intelligence = new AwarenessIntelligence(
       llm,
-      cfg.cloud_vision_enabled ? cfg.cloud_vision_cooldown_ms : Infinity
+      cfg.cloud_vision_enabled ? cfg.cloud_vision_cooldown_ms : Infinity,
+      cfg.cloud_vision_enabled ? cfg.cloud_vision_ambient_cooldown_ms : Infinity
     );
     this.suggestionEngine = new SuggestionEngine(cfg.suggestion_rate_limit_ms, {
       googleAuth: googleAuth ?? null,
-      getUpcomingCommitments: () => getUpcoming(10).map(c => ({
+      getUpcomingCommitments: () => getUpcoming(10, { excludeWorkItems: true }).map(c => ({
         what: c.what,
         when_due: c.when_due,
         priority: c.priority,
       })),
-    });
+    }, maxGapMs);
     this.contextGraph = new ContextGraph();
-    this.analytics = new BehaviorAnalytics(llm);
+    this.analytics = new BehaviorAnalytics(llm, maxGapMs);
   }
 
-  async start(): Promise<void> {
+  start(): Promise<void> {
+    this.runRequested = this.enabled;
+    return this.reconcileLifecycle();
+  }
+
+  stop(): Promise<void> {
+    this.runRequested = false;
+    return this.reconcileLifecycle();
+  }
+
+  private reconcileLifecycle(): Promise<void> {
+    // Each request gets a turn after any in-flight shutdown. Read the latest
+    // intent then, so a later disable or explicit daemon stop cancels a resume.
+    const transition = this.lifecycle.then(() => this.runRequested ? this.startNow() : this.stopNow());
+    // A failed transition must not poison later requests; its caller still sees the error.
+    this.lifecycle = transition.catch(() => {});
+    return transition;
+  }
+
+  private async startNow(): Promise<void> {
+    if (this._status === 'running') return;
     if (!this.enabled) {
       console.log('[Awareness] Disabled by config');
       this._status = 'stopped';
@@ -100,6 +136,7 @@ export class AwarenessService implements Service {
       this.cleanupTimer = setInterval(() => this.cleanupRetention(), 10 * 60 * 1000);
 
       this._status = 'running';
+      this.opportunityDelivery?.start();
       console.log('[Awareness] Service started — listening for sidecar events (sidecar-side OCR + context tracking)');
     } catch (err) {
       this._status = 'error';
@@ -108,10 +145,18 @@ export class AwarenessService implements Service {
     }
   }
 
-  async stop(): Promise<void> {
+  private async stopNow(): Promise<void> {
+    if (this._status === 'stopped') return;
     this._status = 'stopping';
+    await this.opportunityDelivery?.stop();
 
-    this.contextTracker.endCurrentSession();
+    const ended = this.contextTracker.endCurrentSession();
+    // Report the final session once, without starting model work during stop.
+    if (ended) this.handleSessionEnd(ended, false);
+
+    // Blinding awareness must not freeze the ledger at whatever it held: this
+    // is the last prune until awareness runs again.
+    try { pruneOpportunityObservations(); } catch { /* DB may already be closed */ }
 
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
@@ -157,7 +202,9 @@ export class AwarenessService implements Service {
       capturesPerHour,
       estimatedVisionCallsPerHour,
       estimatedTokensPerHour: estimatedVisionCallsPerHour * 1400,
-      note: 'Estimate is a worst-case approximation based on your capture rate and cloud-vision cooldown.',
+      note: 'Worst case, assuming every cooldown window carries a locally detected error, stuck or struggle signal. ' +
+        'With no such signal, vision only fires on an app switch at most once per ' +
+        `${Math.round(this.config.cloud_vision_ambient_cooldown_ms / 60000)} minutes, and runs on the low tier.`,
     };
   }
 
@@ -195,15 +242,9 @@ export class AwarenessService implements Service {
 
   toggle(enabled: boolean): void {
     this.enabled = enabled;
-    if (!enabled && this._status === 'running') {
-      this.stop().catch(err =>
-        console.error('[Awareness] Error stopping:', err)
-      );
-    } else if (enabled && this._status === 'stopped') {
-      this.start().catch(err =>
-        console.error('[Awareness] Error starting:', err)
-      );
-    }
+    (enabled ? this.start() : this.stop()).catch(err =>
+      console.error('[Awareness] Error changing enabled state:', err)
+    );
   }
 
   isEnabled(): boolean {
@@ -213,7 +254,7 @@ export class AwarenessService implements Service {
   // ── Sidecar Event Handler ──
 
   async handleSidecarEvent(sidecarId: string, event: SidecarEvent): Promise<void> {
-    if (this._status !== 'running') return;
+    if (!this.runRequested || this._status !== 'running') return;
 
     try {
       switch (event.event_type) {
@@ -247,10 +288,6 @@ export class AwarenessService implements Service {
       return;
     }
 
-    if (appName || windowTitle) {
-      this.contextTracker.updateWindowInfo(appName, windowTitle);
-    }
-
     await this.processCaptureEvent({
       sidecarId,
       captureId,
@@ -258,18 +295,19 @@ export class AwarenessService implements Service {
       pixelChangePct,
       imagePath,
       ocrText,
+      appName,
       windowTitle,
     });
   }
 
-  private handleContextChanged(_sidecarId: string, event: SidecarEvent): void {
+  private handleContextChanged(sidecarId: string, event: SidecarEvent): void {
     const payload = event.payload as Record<string, unknown>;
     const toApp = String(payload.to_app ?? '');
     const toWindow = String(payload.to_window ?? '');
 
-    // Feed context change to tracker (simulates what processCapture does for window changes)
+    // Metadata hint only. processCapture is the sole awareness transition producer.
     if (toApp || toWindow) {
-      this.contextTracker.updateWindowInfo(toApp, toWindow);
+      this.contextTracker.updateWindowInfo(toApp, toWindow, event.timestamp, sidecarId);
     }
   }
 
@@ -298,6 +336,10 @@ export class AwarenessService implements Service {
       try {
         fullDeleted = deleteCapturesBefore(fullCutoff, 'full');
         keyDeleted = deleteCapturesBefore(keyMomentCutoff, 'key_moment');
+        // The derived opportunity ledger outlives the capture tiers on purpose,
+        // but only for its own 14-day window. Prune it here rather than leaving
+        // it to suggestion evaluation, which stops the moment awareness does.
+        pruneOpportunityObservations(now);
       } catch { /* DB may not be initialized in tests */ }
 
       if (fullDeleted > 0 || keyDeleted > 0) {
@@ -325,22 +367,26 @@ export class AwarenessService implements Service {
     pixelChangePct: number;
     imagePath: string;
     ocrText: string;
+    appName: string;
     windowTitle?: string;
   }): Promise<void> {
     try {
       const ocrText = data.ocrText;
 
-      const windowTitle = data.windowTitle || this.contextTracker.getLastWindowTitle();
-
-      const { context, events } = this.contextTracker.processCapture(
+      // Retain this capture's predecessor even if another capture arrives while
+      // the image fetch or model call is pending.
+      const previousContext = this.contextTracker.getCurrentContext();
+      const { context, events, isRedundant } = this.contextTracker.processCapture(
         data.captureId,
         ocrText,
-        windowTitle,
-        data.capturedAt
+        data.windowTitle,
+        data.capturedAt,
+        { appName: data.appName, sidecarId: data.sidecarId }
       );
 
-      this.contextGraph.linkCaptureToEntities(context);
-
+      // The capture row itself is the activity ledger analytics measures time
+      // from, so it is written unconditionally. Everything derived from it is
+      // skipped when the capture carried no new information.
       createCapture({
         timestamp: context.timestamp,
         sessionId: context.sessionId,
@@ -354,36 +400,57 @@ export class AwarenessService implements Service {
         filePath: context.filePath ?? undefined,
       });
 
-      const keyMomentEventTypes = ['error_detected', 'stuck_detected', 'context_changed'];
-      if (events.some(e => keyMomentEventTypes.includes(e.type))) {
-        try { updateCaptureRetention(data.captureId, 'key_moment'); } catch { /* best-effort */ }
+      // Deliver the ended snapshot before any
+      // asynchronous enrichment can fail, lag behind another capture or stop.
+      for (const event of events) {
+        if (event.type === 'session_ended') this.handleSessionEnd(event);
       }
 
-      try {
-        createObservation('screen_capture', {
-          captureId: data.captureId,
-          appName: context.appName,
-          windowTitle: context.windowTitle,
-          ocrPreview: ocrText.slice(0, 200),
-        });
-      } catch { /* observation storage is best-effort */ }
+      // Per-capture bookkeeping derived from the capture's *content*. A
+      // redundant capture repeats content we already indexed and logged, and
+      // this is what dominates awareness's write volume, so it is skipped.
+      // Note this deliberately does not skip the rest of the pipeline:
+      // suggestions include time-based nudges (a commitment coming due, a
+      // calendar event, a break) that have nothing to do with whether the
+      // screen changed — a user reading a static page must still get them.
+      if (!isRedundant) {
+        this.contextGraph.linkCaptureToEntities(context);
+
+        const keyMomentEventTypes = ['error_detected', 'stuck_detected', 'context_changed'];
+        if (events.some(e => keyMomentEventTypes.includes(e.type))) {
+          try { updateCaptureRetention(data.captureId, 'key_moment'); } catch { /* best-effort */ }
+        }
+
+        try {
+          createObservation('screen_capture', {
+            captureId: data.captureId,
+            appName: context.appName,
+            windowTitle: context.windowTitle,
+            ocrPreview: ocrText.slice(0, 200),
+          });
+        } catch { /* observation storage is best-effort */ }
+      }
 
       let cloudAnalysis: string | undefined;
-      if (
-        this.config.cloud_vision_enabled &&
-        this.fetchCapture &&
-        this.intelligence.shouldEscalateToCloud(context, events)
-      ) {
-        const imageBuffer = await this.fetchCapture(data.sidecarId, data.imagePath).catch(err => {
+      const escalation = this.config.cloud_vision_enabled && this.fetchCapture
+        ? this.intelligence.claimEscalation(context, events)
+        : null;
+
+      if (escalation) {
+        const imageBuffer = await this.fetchCapture!(data.sidecarId, data.imagePath).catch(err => {
           console.error('[Awareness] fetch_capture failed:', err instanceof Error ? err.message : err);
           return null;
         });
 
-        if (imageBuffer) {
+        if (!imageBuffer) {
+          // Nothing was billed, so hand the cooldown back rather than letting
+          // a missing file swallow the next real signal.
+          this.intelligence.releaseEscalation(escalation.token);
+        } else {
           const base64 = imageBuffer.toString('base64');
-
           const struggleEvent = events.find(e => e.type === 'struggle_detected');
-          if (struggleEvent) {
+
+          if (escalation.kind === 'struggle' && struggleEvent) {
             cloudAnalysis = await this.intelligence.analyzeStruggle(
               base64,
               context,
@@ -391,11 +458,11 @@ export class AwarenessService implements Service {
               (struggleEvent.data.signals as Array<{ name: string; score: number; detail: string }>) ?? [],
               String(struggleEvent.data.ocrPreview ?? context.ocrText.slice(0, 500))
             );
-          } else if (context.isSignificantChange) {
+          } else if (escalation.kind === 'delta') {
             cloudAnalysis = await this.intelligence.analyzeDelta(
               base64,
               context,
-              this.contextTracker.getPreviousContext()
+              previousContext
             );
           } else {
             cloudAnalysis = await this.intelligence.analyzeGeneral(base64, context);
@@ -406,7 +473,9 @@ export class AwarenessService implements Service {
       // 7. Suggestion evaluation
       const suggestion = await this.suggestionEngine.evaluate(context, events, cloudAnalysis);
       if (suggestion) {
-        try { markSuggestionDelivered(suggestion.id, 'websocket'); } catch { /* ignore */ }
+        if (!suggestion.context?.opportunity) {
+          try { markSuggestionDelivered(suggestion.id, 'websocket'); } catch { /* ignore */ }
+        }
 
         const suggestionEvent: AwarenessEvent = {
           type: 'suggestion_ready',
@@ -415,42 +484,46 @@ export class AwarenessService implements Service {
             type: suggestion.type,
             title: suggestion.title,
             body: suggestion.body,
+            ...(suggestion.context?.opportunity ? { opportunityId: suggestion.id } : {}),
           },
           timestamp: Date.now(),
         };
         events.push(suggestionEvent);
       }
 
-      // 8. Emit all events
+      // 8. Emit the remaining events (session end was delivered above)
       for (const event of events) {
-        this.eventCallback?.(event);
+        if (event.type !== 'session_ended') this.eventCallback?.(event);
       }
-
-      // 9. Session topic inference (async, non-blocking)
-      const sessionEnd = events.find(e => e.type === 'session_ended');
-      if (sessionEnd) {
-        this.inferSessionTopic(sessionEnd.data as { sessionId: string; apps: string[] }).catch(err =>
-          console.error('[Awareness] Session topic inference failed:', err instanceof Error ? err.message : err)
-        );
-      }
+      if (suggestion?.context?.opportunity) void this.opportunityDelivery?.flush();
     } catch (err) {
       console.error('[Awareness] Pipeline error:', err instanceof Error ? err.message : err);
     }
   }
 
+  private handleSessionEnd(event: AwarenessActivityEvent<'session_ended'>, summarize = true): void {
+    try { this.eventCallback?.(event); }
+    catch (err) {
+      console.error('[Awareness] Session-end listener failed:', err instanceof Error ? err.message : err);
+    }
+    if (summarize) void this.inferSessionTopic(event.data);
+  }
+
   /**
    * Asynchronously infer topic and summary for a completed session via LLM.
    */
-  private async inferSessionTopic(data: { sessionId: string; apps: string[] }): Promise<void> {
+  private async inferSessionTopic(data: { sessionId: string | null; apps: readonly string[] }): Promise<void> {
     const { sessionId, apps } = data;
-    if (!sessionId) return;
-
+    if (!sessionId || this.sessionSummariesInFlight.has(sessionId)) return;
+    // Claim before the first await. Persisted summaries also suppress a replay
+    // after service recreation; a failed attempt releases its in-flight claim.
+    this.sessionSummariesInFlight.add(sessionId);
     try {
       const session = getSession(sessionId);
-      if (!session) return;
+      if (!session || session.ended_at === null || session.summary !== null) return;
 
       const startedAt = session.started_at;
-      const endedAt = session.ended_at ?? Date.now();
+      const endedAt = session.ended_at;
       const durationMinutes = Math.round((endedAt - startedAt) / 60000);
 
       if (durationMinutes < 2) return;
@@ -464,16 +537,20 @@ export class AwarenessService implements Service {
       if (sampleOcrTexts.length === 0) return;
 
       const { topic, summary } = await this.intelligence.summarizeSession(
-        apps,
+        [...apps],
         session.capture_count,
         durationMinutes,
         sampleOcrTexts
       );
 
+      // A later writer may have supplied a summary while the model was busy.
+      if (getSession(sessionId)?.summary !== null) return;
       updateSession(sessionId, { topic, summary });
       console.log(`[Awareness] Session topic: "${topic}" (${durationMinutes}min, ${apps.join(', ')})`);
     } catch (err) {
       console.error('[Awareness] Topic inference error:', err instanceof Error ? err.message : err);
+    } finally {
+      this.sessionSummariesInFlight.delete(sessionId);
     }
   }
 }

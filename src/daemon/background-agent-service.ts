@@ -13,12 +13,17 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { Service, ServiceStatus } from './services.ts';
 import type { IAgentService } from './agent-service-interface.ts';
+import { activeTurns } from './active-turns.ts';
 import type { JarvisConfig } from '../config/types.ts';
 import type { RoleDefinition } from '../roles/types.ts';
 import type { LLMManager } from '../llm/manager.ts';
 import type { ResearchQueue } from './research-queue.ts';
 
 import { AgentOrchestrator } from '../agents/orchestrator.ts';
+import type { AuthorityEngine, AuthorityProfile } from '../authority/engine.ts';
+import type { ApprovalManager, ApprovalRequest } from '../authority/approval.ts';
+import type { AuditTrail } from '../authority/audit.ts';
+import type { EmergencyController } from '../authority/emergency.ts';
 import { loadRole } from '../roles/loader.ts';
 import { ToolRegistry } from '../actions/tools/registry.ts';
 import { NON_BROWSER_TOOLS, createBrowserTools } from '../actions/tools/builtin.ts';
@@ -28,8 +33,9 @@ import { commitmentsTool } from '../actions/tools/commitments.ts';
 import { researchQueueTool } from '../actions/tools/research.ts';
 import { buildSystemPromptParts, type PromptContext, type SystemPromptParts } from '../roles/prompt-builder.ts';
 import { getDueCommitments, getUpcoming } from '../vault/commitments.ts';
-import { getRecentObservations } from '../vault/observations.ts';
+import { getRecentObservations, describeObservationForPrompt } from '../vault/observations.ts';
 import { findContent } from '../vault/content-pipeline.ts';
+import { runWithOrigin } from '../llm/origin.ts';
 
 const BG_CDP_PORT = 9223;
 const BG_PROFILE_DIR = join(homedir(), '.jarvis', 'browser', 'bg-profile');
@@ -43,17 +49,86 @@ export class BackgroundAgentService implements Service, IAgentService {
   private bgBrowser: BrowserController;
   private role: RoleDefinition | null = null;
   private researchQueue: ResearchQueue | null = null;
+  private authorityEngine: AuthorityEngine | null = null;
+  private authorityProfile: AuthorityProfile | null = null;
+  /** Approval requests created by the turn in flight / the last finished turn. */
+  private currentTurn: { approvalIds: string[] } = { approvalIds: [] };
+  private lastTurn: { approvalIds: string[] } = { approvalIds: [] };
+  /** Turns run strictly one after another on this chain. */
+  private turnChain: Promise<void> = Promise.resolve();
   private busy = false;
 
   constructor(config: JarvisConfig, llmManager: LLMManager) {
     this.config = config;
     this.llmManager = llmManager;
     this.orchestrator = new AgentOrchestrator();
+    // Provider kinds for the tool-relevance filter's eligibility gate, the
+    // same entries the main orchestrator gets. Without them this second
+    // orchestrator reads each provider's NAME as its kind -- fail-safe, but
+    // it disagrees with the main one. Re-handed on an `llm` hot reload by
+    // the daemon's applier.
+    this.orchestrator.setToolFilterProviders(config.llm?.providers);
     this.bgBrowser = new BrowserController(BG_CDP_PORT, BG_PROFILE_DIR);
   }
 
   setResearchQueue(queue: ResearchQueue): void {
     this.researchQueue = queue;
+  }
+
+  /**
+   * Wire the SAME authority engine, approval manager, audit trail and
+   * emergency controller the main agent uses, plus a profile that tightens
+   * decisions for this agent only. Without this the orchestrator executes
+   * every tool call ungated and unaudited.
+   *
+   * No deferred executor is wired on purpose: approvals from the background
+   * agent are created in deferred mode, so the turn returns AWAITING_APPROVAL
+   * immediately. UI requests retain this orchestrator's registry, so the
+   * daemon's DeferredExecutor uses the originating browser when approved.
+   */
+  setAuthority(opts: {
+    engine: AuthorityEngine;
+    profile: AuthorityProfile;
+    approvalManager: ApprovalManager;
+    auditTrail: AuditTrail;
+    emergencyController: EmergencyController;
+    onApprovalNeeded: (request: ApprovalRequest) => void;
+  }): void {
+    this.authorityEngine = opts.engine;
+    this.authorityProfile = opts.profile;
+    this.orchestrator.setAuthorityEngine(opts.engine);
+    this.orchestrator.setAuthorityProfile(opts.profile);
+    this.orchestrator.setApprovalManager(opts.approvalManager);
+    this.orchestrator.setAuditTrail(opts.auditTrail);
+    this.orchestrator.setEmergencyController(opts.emergencyController);
+    this.orchestrator.setApprovalCallback((request) => {
+      this.currentTurn.approvalIds.push(request.id);
+      opts.onApprovalNeeded(request);
+    });
+  }
+
+  /**
+   * Approval requests the most recently FINISHED turn created. Read by the
+   * commitment executor and the awareness handlers right after their
+   * handleMessage resolves; a following queued turn cannot overwrite this
+   * before then because it only publishes when it finishes.
+   */
+  lastTurnRequestedApproval(): boolean {
+    return this.lastTurn.approvalIds.length > 0;
+  }
+
+  lastTurnApprovalIds(): string[] {
+    return [...this.lastTurn.approvalIds];
+  }
+
+  /** Replace the profile after a settings reload. */
+  setAuthorityProfile(profile: AuthorityProfile): void {
+    this.authorityProfile = profile;
+    this.orchestrator.setAuthorityProfile(profile);
+  }
+
+  getOrchestrator(): AgentOrchestrator {
+    return this.orchestrator;
   }
 
   async start(): Promise<void> {
@@ -85,6 +160,9 @@ export class BackgroundAgentService implements Service, IAgentService {
 
       toolRegistry.register(commitmentsTool);
       toolRegistry.register(researchQueueTool);
+      // No request_approval here on purpose: the authority profile already
+      // stops governed tool calls for approval, and an intent gate on top
+      // would ask the user twice for the same action.
 
       this.orchestrator.setToolRegistry(toolRegistry);
 
@@ -106,6 +184,9 @@ export class BackgroundAgentService implements Service, IAgentService {
       this.orchestrator.terminateAgent(primary.id);
     }
 
+    // Pending UI approvals must not launch/reuse this browser after stop.
+    this.orchestrator.getToolRegistry()?.clear();
+
     if (this.bgBrowser.connected) {
       await this.bgBrowser.disconnect();
     }
@@ -126,21 +207,38 @@ export class BackgroundAgentService implements Service, IAgentService {
    * Handle a reactive event message (from EventReactor / CommitmentExecutor).
    */
   async handleMessage(text: string, channel: string = 'system'): Promise<string> {
-    // Wait if busy — event reactor already has its own queue, so this is a safety net
-    const waitStart = Date.now();
-    while (this.busy && Date.now() - waitStart < 60_000) {
-      await new Promise(r => setTimeout(r, 1000));
-    }
+    // Don't START a background reaction once draining; count it in-flight
+    // otherwise so the graceful drain awaits it too (same as the primary turns).
+    if (activeTurns.isDraining) return 'skipped: draining';
+    const endTurn = activeTurns.begin();
 
-    this.busy = true;
+    // Strictly serialized: the primary agent has one message history, and a
+    // gated turn can now sit on an approval for a while, so two turns must
+    // never interleave on it. Each caller waits for the turns queued before
+    // it instead of a bounded busy-wait that gave up and ran concurrently.
+    const run = async (): Promise<string> => {
+      this.busy = true;
+      this.currentTurn = { approvalIds: [] };
+      try {
+        const systemPrompt = this.buildSystemPromptParts(channel);
+        // Inside `run`, not around handleMessage: turns are chained, and a
+        // queued turn runs in whichever context resolved the one before it.
+        return await runWithOrigin('background', () => this.orchestrator.processMessage(systemPrompt, text));
+      } catch (err) {
+        console.error('[BackgroundAgent] Message error:', err);
+        return `Error: ${err instanceof Error ? err.message : String(err)}`;
+      } finally {
+        this.lastTurn = this.currentTurn;
+        this.busy = false;
+      }
+    };
+
+    const result = this.turnChain.then(run, run);
+    this.turnChain = result.then(() => undefined, () => undefined);
     try {
-      const systemPrompt = this.buildSystemPromptParts(channel);
-      return await this.orchestrator.processMessage(systemPrompt, text);
-    } catch (err) {
-      console.error('[BackgroundAgent] Message error:', err);
-      return `Error: ${err instanceof Error ? err.message : String(err)}`;
+      return await result;
     } finally {
-      this.busy = false;
+      endTurn();
     }
   }
 
@@ -157,12 +255,26 @@ export class BackgroundAgentService implements Service, IAgentService {
   private buildPromptContext(): PromptContext {
     const context: PromptContext = {
       currentTime: new Date().toISOString(),
+      // No request_approval tool on this agent; the profile gate stops
+      // governed calls by itself. The prompt must describe that, not a tool
+      // the model does not have.
+      approvalMode: 'automatic_gate',
     };
+
+    // Tell the model which actions will stop for approval, so it plans a
+    // "research, then propose" turn instead of discovering the gate mid-task.
+    if (this.authorityEngine && this.role) {
+      context.authorityRules = this.authorityEngine.describeRulesForAgent(
+        this.role.authority_level,
+        this.role.id,
+        this.authorityProfile,
+      );
+    }
 
     // Get due commitments
     try {
-      const due = getDueCommitments();
-      const upcoming = getUpcoming(5);
+      const due = getDueCommitments({ excludeWorkItems: true });
+      const upcoming = getUpcoming(5, { excludeWorkItems: true });
       const allCommitments = [...due, ...upcoming];
 
       if (allCommitments.length > 0) {
@@ -198,7 +310,8 @@ export class BackgroundAgentService implements Service, IAgentService {
       if (observations.length > 0) {
         context.recentObservations = observations.map((o) => {
           const time = new Date(o.created_at).toLocaleTimeString();
-          return `[${time}] ${o.type}: ${JSON.stringify(o.data).slice(0, 200)}`;
+          // Content-free: no OCR text, clipboard body or email snippet in the prompt.
+          return `[${time}] ${describeObservationForPrompt(o)}`;
         });
       }
     } catch (err) {

@@ -1,12 +1,16 @@
 import type { LLMManager } from '../llm/manager.ts';
+import { getDb } from './schema.ts';
+import { createHash } from 'node:crypto';
 import { createEntity, findEntities } from './entities.ts';
-import { createFact } from './facts.ts';
+import { createFact, FACT_TEXT_LIMIT } from './facts.ts';
 import { createRelationship } from './relationships.ts';
 import { createCommitment } from './commitments.ts';
+import { USER_PROFILE_VAULT_SOURCE } from './user-profile.ts';
 
 export type ExtractionResult = {
   entities: Array<{ name: string; type: string; properties?: Record<string, unknown> }>;
-  facts: Array<{ subject: string; predicate: string; object: string; confidence: number }>;
+  facts: Array<{ subject: string; predicate: string; object: string; confidence: number;
+    user_quote?: string; scope?: string; valid_from?: number; valid_to?: number }>;
   relationships: Array<{ from: string; to: string; type: string }>;
   commitments: Array<{ what: string; when_due?: string; priority?: string }>;
 };
@@ -38,7 +42,11 @@ Extract the following information and return ONLY valid JSON (no markdown, no ex
       "subject": "Entity name",
       "predicate": "property_name",
       "object": "value",
-      "confidence": 0.0-1.0
+      "confidence": 0.0-1.0,
+      "user_quote": "Exact supporting quote from USER MESSAGE, or omit",
+      "scope": "Explicit context such as work or personal, or omit",
+      "valid_from": "Explicit validity start as epoch milliseconds, or omit",
+      "valid_to": "Explicit exclusive validity end as epoch milliseconds, or omit"
     }
   ],
   "relationships": [
@@ -65,6 +73,11 @@ GUIDELINES:
 - For commitments: extract any promises, tasks, or reminders mentioned
 - Use snake_case for predicates and relationship types
 - Set confidence lower (0.5-0.8) for implied or uncertain information
+- The assistant response is context, never evidence that the user confirmed a fact.
+- Only quote exact text from USER MESSAGE. Do not invent a source, scope or date.
+- Use preferred_editor, preferred_language or preferred_contact_method for a current single preference.
+- location, alias, email and works_at can have multiple valid values. Do not infer exclusivity.
+- A correction is still an extracted claim. Do not claim verification or supersede stored facts.
 - If no information to extract, return empty arrays
 - Respond with ONLY the JSON object, no other text`;
 }
@@ -128,6 +141,20 @@ function isValidEntityType(type: string): type is 'person' | 'project' | 'tool' 
   return ['person', 'project', 'tool', 'place', 'concept', 'event'].includes(type);
 }
 
+/** Placeholder names the extraction LLM uses for the user when it has no real name. */
+const GENERIC_USER_NAMES = new Set(['user', 'the user', 'current user', 'unknown user']);
+
+/**
+ * Whether an extracted entity stands for the user themselves rather than a
+ * distinct person: flagged via is_current_user/is_user (boolean or string,
+ * extraction output is loosely typed) or named with a generic placeholder.
+ */
+function representsUser(name: string, properties?: Record<string, unknown>): boolean {
+  if (GENERIC_USER_NAMES.has(name.toLowerCase())) return true;
+  const flag = (v: unknown) => v === true || (typeof v === 'string' && v.toLowerCase() === 'true');
+  return flag(properties?.is_current_user) || flag(properties?.is_user);
+}
+
 /**
  * High-level: extract and store in vault
  */
@@ -165,6 +192,17 @@ export async function extractAndStore(
     // Store entities
     const entityMap = new Map<string, string>(); // name -> id
 
+    // Look up the existing user profile entities (if any) so extraction doesn't
+    // create a duplicate "User" entity that shadows the real profile. The user
+    // profile is set via the onboarding wizard with source='user_profile' and
+    // always takes precedence over any LLM extraction about "the user".
+    const profileEntities = findEntities({ source: USER_PROFILE_VAULT_SOURCE });
+    // Reversed so on a name collision the newest entity (first in the
+    // updated_at DESC result) wins, matching the profileEntities[0] fallback.
+    const profileIdByName = new Map(
+      [...profileEntities].reverse().map(e => [e.name.toLowerCase(), e.id] as const)
+    );
+
     for (const entityData of extraction.entities) {
       const { name, type, properties } = entityData;
 
@@ -174,8 +212,35 @@ export async function extractAndStore(
         continue;
       }
 
-      // Check if entity already exists
-      const existing = findEntities({ name, type });
+      // Skip extraction entities that shadow the user's own profile identity.
+      // This prevents the "User" ghost entity problem where the LLM extracts
+      // "name_is_unknown: true" facts about a generic "User" entity when it
+      // can't answer profile questions, creating confusion in the vault.
+      const nameLower = name.toLowerCase();
+      const profileId = profileIdByName.get(nameLower);
+      if (profileId) {
+        // Re-use the profile entity ID instead of creating a duplicate
+        entityMap.set(name, profileId);
+        continue;
+      }
+
+      // Also catch entities that represent the user without sharing the
+      // profile name: extraction sometimes sets is_current_user/is_user
+      // (as boolean or string) or falls back to a generic placeholder name.
+      if (representsUser(name, properties)) {
+        if (profileEntities.length > 0) {
+          // Map to the real profile entity instead of creating a duplicate
+          entityMap.set(name, profileEntities[0]!.id);
+        } else {
+          // No profile to map to (wizard skipped): don't create a ghost
+          // entity. Its facts are dropped by the subject-lookup below.
+          console.warn(`Skipping user-representing entity "${name}": no user profile exists`);
+        }
+        continue;
+      }
+
+      // Check if entity already exists. Goal completion records are not conversation subjects.
+      const existing = findEntities({ name, type }).filter(entity => entity.source !== 'goal_completion');
 
       if (existing.length > 0) {
         // Use existing entity ID
@@ -192,8 +257,12 @@ export async function extractAndStore(
       }
     }
 
+    // Stable reference for replay deduplication. Exact quotes are reported, not confirmed.
+    const sourceRef = `conversation:${createHash('sha256').update(JSON.stringify([userMessage, assistantResponse])).digest('hex')}`;
     // Store facts
     for (const factData of extraction.facts) {
+      if (!factData || typeof factData.subject !== 'string' || typeof factData.predicate !== 'string'
+          || typeof factData.object !== 'string' || !factData.object.trim()) continue;
       const { subject, predicate, object, confidence } = factData;
 
       // Get subject entity ID
@@ -203,10 +272,15 @@ export async function extractAndStore(
         continue;
       }
 
-      createFact(subjectId, predicate, object, {
-        confidence: confidence ?? 1.0,
-        source: 'llm_extraction',
-      });
+      const quote = typeof factData.user_quote === 'string' && factData.user_quote.trim()
+        && userMessage.includes(factData.user_quote) ? factData.user_quote : undefined;
+      try {
+        createFact(subjectId, predicate, object, {
+          confidence: Number.isFinite(confidence) && confidence >= 0 && confidence <= 1 ? confidence : 0.5,
+          source: 'llm_extraction', sourceRef, quote, basis: quote ? 'reported' : 'inferred',
+          scope: factData.scope, validFrom: factData.valid_from, validTo: factData.valid_to,
+        });
+      } catch (error) { console.warn('[Extractor] Skipping invalid fact:', error); }
     }
 
     // Store relationships
@@ -269,78 +343,84 @@ export function extractGoalCompletion(goal: {
   created_at: number;
   completed_at: number | null;
   tags: string[];
-}): void {
-  try {
-    // Create or find entity for this goal
-    const existing = findEntities({ name: goal.title, type: 'concept' });
-    let entityId: string;
+}, completionEventId?: string): void {
+  // One event entity per completion episode. A distinct name and type keep it out of
+  // conversation entity resolution and name-based fact lookups for the goal's concept.
+  const existing = getDb().query(`SELECT id FROM entities WHERE source = 'goal_completion'
+    AND json_extract(properties, '$.goal_id') = ?
+    AND json_extract(properties, '$.completion_event_id') IS ?`).all(goal.id, completionEventId ?? null) as { id: string }[];
+  let entityId: string;
 
-    if (existing.length > 0) {
-      entityId = existing[0]!.id;
-    } else {
-      const entity = createEntity('concept', goal.title, {
-        goal_id: goal.id,
-        goal_level: goal.level,
-      }, 'goal_completion');
-      entityId = entity.id;
-    }
+  if (existing.length > 0) {
+    entityId = existing[0]!.id;
+  } else {
+    const entity = createEntity('event', `Goal ${goal.status}: ${goal.title}`, {
+      goal_id: goal.id,
+      goal_level: goal.level,
+      completion_event_id: completionEventId ?? null,
+    }, 'goal_completion');
+    entityId = entity.id;
+  }
 
-    // Store performance facts
-    createFact(entityId, 'goal_final_score', goal.score.toFixed(2), {
+  // Store performance facts
+  createFact(entityId, 'goal_final_score', goal.score.toFixed(2), {
+    confidence: 1.0,
+    source: 'goal_completion',
+  });
+
+  createFact(entityId, 'goal_outcome', goal.status, {
+    confidence: 1.0,
+    source: 'goal_completion',
+  });
+
+  createFact(entityId, 'goal_level', goal.level, {
+    confidence: 1.0,
+    source: 'goal_completion',
+  });
+
+  if (goal.estimated_hours !== null) {
+    createFact(entityId, 'estimated_hours', goal.estimated_hours.toString(), {
       confidence: 1.0,
       source: 'goal_completion',
     });
+  }
 
-    createFact(entityId, 'goal_outcome', goal.status, {
+  if (goal.actual_hours > 0) {
+    createFact(entityId, 'actual_hours', goal.actual_hours.toFixed(1), {
       confidence: 1.0,
       source: 'goal_completion',
     });
+  }
 
-    createFact(entityId, 'goal_level', goal.level, {
+  // Time to complete
+  if (goal.completed_at) {
+    const durationDays = Math.ceil((goal.completed_at - goal.created_at) / 86400000);
+    createFact(entityId, 'days_to_complete', durationDays.toString(), {
       confidence: 1.0,
       source: 'goal_completion',
     });
+  }
 
-    if (goal.estimated_hours !== null) {
-      createFact(entityId, 'estimated_hours', goal.estimated_hours.toString(), {
+  // Estimation accuracy
+  if (goal.estimated_hours !== null && goal.actual_hours > 0) {
+    const accuracy = (goal.estimated_hours / goal.actual_hours).toFixed(2);
+    createFact(entityId, 'estimation_accuracy', accuracy, {
+      confidence: 1.0,
+      source: 'goal_completion',
+    });
+  }
+
+  // Preserve the compact legacy form when it fits. A valid goal can contain
+  // 100 tags of 512 characters each, so larger lists need individual facts to
+  // avoid rolling back the whole completion projection on the fact text limit.
+  if (goal.tags.length > 0) {
+    const joined = goal.tags.join(', ');
+    const compact = joined.length <= FACT_TEXT_LIMIT;
+    for (const value of compact ? [joined] : goal.tags) {
+      createFact(entityId, compact ? 'goal_tags' : 'goal_tag', value, {
         confidence: 1.0,
         source: 'goal_completion',
       });
     }
-
-    if (goal.actual_hours > 0) {
-      createFact(entityId, 'actual_hours', goal.actual_hours.toFixed(1), {
-        confidence: 1.0,
-        source: 'goal_completion',
-      });
-    }
-
-    // Time to complete
-    if (goal.completed_at) {
-      const durationDays = Math.ceil((goal.completed_at - goal.created_at) / 86400000);
-      createFact(entityId, 'days_to_complete', durationDays.toString(), {
-        confidence: 1.0,
-        source: 'goal_completion',
-      });
-    }
-
-    // Estimation accuracy
-    if (goal.estimated_hours !== null && goal.actual_hours > 0) {
-      const accuracy = (goal.estimated_hours / goal.actual_hours).toFixed(2);
-      createFact(entityId, 'estimation_accuracy', accuracy, {
-        confidence: 1.0,
-        source: 'goal_completion',
-      });
-    }
-
-    // Tags
-    if (goal.tags.length > 0) {
-      createFact(entityId, 'goal_tags', goal.tags.join(', '), {
-        confidence: 1.0,
-        source: 'goal_completion',
-      });
-    }
-  } catch (err) {
-    console.error('[Extractor] Failed to extract goal completion:', err);
   }
 }

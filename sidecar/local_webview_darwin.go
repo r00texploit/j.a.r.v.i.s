@@ -7,6 +7,8 @@ import (
 	"runtime"
 
 	webview "github.com/webview/webview_go"
+
+	"github.com/jarvis/sidecar/internal/winchrome"
 )
 
 // runLocalWebview hosts a small local-HTML webview window (settings, logs) on
@@ -19,8 +21,15 @@ import (
 // until the window closes, then destroy it on the main thread.
 //
 // build receives the webview and should register bindings and set the page
-// (SetHtml/Navigate); it runs on the main thread.
-func runLocalWebview(title string, width, height int, hint webview.Hint, build func(webview.WebView)) {
+// (SetHtml/Navigate); it runs on the main thread. It may return a cleanup
+// (nil if none) that runs after the window closes — the join point for any
+// goroutine a binding spawned. On macOS the engine is leaked, not freed (see
+// below), so a late Dispatch is not a use-after-free; the join still bounds
+// the goroutine's lifetime to the window's.
+//
+// titleBar is accepted for signature parity with the other platforms and
+// ignored: macOS keeps its native title bar (winchrome is Windows-only).
+func runLocalWebview(title string, width, height int, hint webview.Hint, titleBar winchrome.TitleBar, build func(webview.WebView) (cleanup func())) {
 	runtime.LockOSThread()
 	wv := webview.New(false)
 	if wv == nil {
@@ -29,18 +38,33 @@ func runLocalWebview(title string, width, height int, hint webview.Hint, build f
 	}
 
 	closed := make(chan struct{})
-	uiSync(wv, func() {
+	var stopReveal func()
+	var cleanup func()
+	uiSync(wv, func() { // synchronous: stopReveal is assigned before watchWindowClose can fire
 		wv.SetTitle(title)
 		wv.SetSize(width, height, hint)
-		build(wv)
-		watchWindowClose(wv.Window(), func() { close(closed) })
+		stopReveal = revealWebviewOnLoad(wv)
+		cleanup = build(wv)
+		watchWindowClose(wv.Window(), func() {
+			// Stopping HERE (main thread), not after <-closed: AppKit releases
+			// the window on close, and a reveal closure already queued on the
+			// main queue would otherwise run against the freed handle before
+			// our goroutine even wakes. Main-queue ordering makes the stop
+			// flag visible to any closure that drains after this callback.
+			stopReveal()
+			close(closed)
+		})
 	})
 
 	<-closed
+	if cleanup != nil {
+		cleanup()
+	}
 	// Intentionally do NOT wv.Destroy() here. Under the tray's shared loop the
-	// window closes via AppKit, but pending callbacks still reference the engine
-	// — webview's own on_window_will_close -> dispatch(on_window_destroyed) and
-	// revealWebviewOnLoad's reveal-timeout goroutine. Destroying now frees the
-	// engine out from under them -> use-after-free crash. We leak the engine
-	// instead (these windows open rarely). TODO: cancellable teardown to reclaim.
+	// window closes via AppKit, but webview's own on_window_will_close ->
+	// dispatch(on_window_destroyed) callback still references the engine.
+	// Destroying now frees the engine out from under it -> use-after-free
+	// crash. We leak the engine instead (these windows open rarely; the reveal
+	// timer, the other dangling reference this leak used to cover, is joined
+	// above). TODO: cancellable teardown to reclaim.
 }

@@ -7,7 +7,7 @@ import { initDatabase, closeDb, getDb } from '../vault/schema.ts';
 import { setUsageDatabase } from '../llm/usage.ts';
 
 const RESOLVED: ResolvedRealtimeVoice = {
-  apiKey: 'k', model: 'gpt-realtime-2', reasoningEffort: 'low', maxSessionMinutes: 10, blockedCategories: [],
+  apiKey: 'k', provider: 'usejarvis_ai', url: 'wss://proxy.test/v1/realtime', model: 'gpt-realtime-2', reasoningEffort: 'low', maxSessionMinutes: 10, blockedCategories: [],
 };
 
 /** Fake RealtimeSession capturing wired callbacks + outgoing results. */
@@ -17,6 +17,7 @@ class FakeRealtimeSession {
   usageCb: ((u: RealtimeUsage) => void) | null = null;
   errorCb: ((e: string) => void) | null = null;
   closeCb: (() => void) | null = null;
+  turnStartCb: (() => void) | null = null;
   results: Array<{ callId: string; result: unknown }> = [];
   connected = false;
   closed = false;
@@ -27,6 +28,7 @@ class FakeRealtimeSession {
   onError(cb: (e: string) => void) { this.errorCb = cb; }
   onOpen() {}
   onClose(cb: () => void) { this.closeCb = cb; }
+  onUserTurnStart(cb: () => void) { this.turnStartCb = cb; }
   onSpeechStarted() {}
   async connect() { this.connected = true; }
   sendFunctionResult(callId: string, result: unknown) { this.results.push({ callId, result }); }
@@ -39,18 +41,33 @@ function setup(executeToolCall: (n: string, a: Record<string, unknown>) => Promi
   const transport = new BrowserAudioTransport({ sendAudio: () => {}, inputSampleRate: 24000 });
   const transcripts: RealtimeTranscript[] = [];
   let closeCalls = 0;
+  let turnStarts = 0;
   const rv = new RealtimeVoiceSession(RESOLVED, transport, {
     tools: [],
     instructions: 'persona',
     executeToolCall,
+    onUserTurnStart: () => { turnStarts++; },
     onTranscript: (t) => transcripts.push(t),
     onClose: () => { closeCalls++; },
     sessionFactory: () => fake as unknown as RealtimeSession,
   });
-  return { fake, rv, transcripts, getCloseCalls: () => closeCalls };
+  return { fake, rv, transcripts, getCloseCalls: () => closeCalls, getTurnStarts: () => turnStarts };
 }
 
 describe('RealtimeVoiceSession', () => {
+  // The taint-gating turn boundary used to be wired by each caller, out of
+  // band, and the pebble never did it -- so one capture_screen or page read
+  // left every later machine-changing action refused as taint-gated for the
+  // life of the daemon, at any authority level. It is wired here now, so a
+  // surface cannot have a session without one.
+  test('the session registers the deps user-turn handler with the inner session', () => {
+    const { fake, getTurnStarts } = setup(async () => 'ok');
+    expect(fake.turnStartCb).not.toBeNull();
+    fake.turnStartCb!();
+    fake.turnStartCb!();
+    expect(getTurnStarts()).toBe(2);
+  });
+
   test('connect() delegates to the underlying session', async () => {
     const { fake, rv } = setup(async () => 'ok');
     await rv.connect();
@@ -132,11 +149,60 @@ describe('RealtimeVoiceSession usage tracking', () => {
     expect(rows[0]).toEqual({
       tier: 'conversation',
       subsystem: 'realtime_voice',
-      provider: 'openai',
+      provider: 'usejarvis_ai',
       model: 'gpt-realtime-2',
       input_tokens: 100,
       output_tokens: 25,
       latency_ms: 420,
     });
+  });
+});
+
+describe('RealtimeVoiceSession error copy', () => {
+  // The exact event text a tenant saw in the chat on 2026-09-14, when the
+  // platform's upstream OpenAI account ran out of credits.
+  const UPSTREAM =
+    'You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.';
+
+  function withErrors(provider: ResolvedRealtimeVoice['provider']) {
+    const fake = new FakeRealtimeSession();
+    const errors: string[] = [];
+    new RealtimeVoiceSession(
+      { ...RESOLVED, provider },
+      new BrowserAudioTransport({ sendAudio: () => {}, inputSampleRate: 24000 }),
+      {
+        tools: [],
+        instructions: 'persona',
+        executeToolCall: async () => 'ok',
+        onUserTurnStart: () => {},
+        onError: (e) => errors.push(e),
+        sessionFactory: () => fake as unknown as RealtimeSession,
+      },
+    );
+    return { fake, errors };
+  }
+
+  test('a hosted session never passes the upstream provider text to the error sink', () => {
+    const { fake, errors } = withErrors('usejarvis_ai');
+    const warn = console.warn;
+    const logged: string[] = [];
+    console.warn = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      fake.errorCb!(UPSTREAM);
+    } finally {
+      console.warn = warn;
+    }
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).not.toContain('credits');
+    expect(errors[0]).not.toContain('platform.openai.com');
+    expect(errors[0]).toContain('try again');
+    // Operators still get the original, in the daemon log only.
+    expect(logged.some((l) => l.includes('no credits remaining'))).toBe(true);
+  });
+
+  test('a BYO OpenAI session keeps the provider text (the account is the user\'s own)', () => {
+    const { fake, errors } = withErrors('openai');
+    fake.errorCb!(UPSTREAM);
+    expect(errors).toEqual([UPSTREAM]);
   });
 });

@@ -22,6 +22,127 @@ describe('Config Loader', () => {
     await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
   });
 
+  test('usejarvis_ai survives the load intact while llm: is discarded', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      TEST_CONFIG_PATH,
+      [
+        'usejarvis_ai:',
+        '  base_url: https://llm.usejarvis.host',
+        '  api_key: sk-uj-test0123456789abcdef',
+        // The llm block MUST stay ignored — DB is the sole authority there.
+        'llm:',
+        '  default: "openai:gpt-x"',
+        '  providers:',
+        '    evil: { kind: openai, api_key: sneaky }',
+        '',
+      ].join('\n'),
+    );
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.usejarvis_ai).toEqual({
+      base_url: 'https://llm.usejarvis.host',
+      api_key: 'sk-uj-test0123456789abcdef',
+    });
+    // llm from the file contributed NOTHING (existing rule, still true).
+    expect(loaded.llm.default).toBeUndefined();
+    expect(loaded.llm.providers).toEqual({});
+  });
+
+  test('usejarvis_billing survives the load intact', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      TEST_CONFIG_PATH,
+      [
+        'usejarvis_billing:',
+        '  url: https://app.usejarvis.dev/api/billing/instance',
+        '  instance_id: 11111111-2222-3333-4444-555555555555',
+        `  secret: ${'e'.repeat(64)}`,
+        '  page_url: https://app.usejarvis.dev/billing',
+        '',
+      ].join('\n'),
+    );
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    // Unquoted, exactly as the control plane renders it: every value must
+    // still arrive as a string.
+    expect(loaded.usejarvis_billing).toEqual({
+      url: 'https://app.usejarvis.dev/api/billing/instance',
+      instance_id: '11111111-2222-3333-4444-555555555555',
+      secret: 'e'.repeat(64),
+      page_url: 'https://app.usejarvis.dev/billing',
+    });
+  });
+
+  test('reloadUsejarvisBillingBlock: rotation lands, removal clears, corruption keeps the current value', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    const { reloadUsejarvisBillingBlock } = await import('./loader.ts');
+    const block = (secret: string) =>
+      `usejarvis_billing:\n  url: https://cp.example/api/billing/instance\n  instance_id: i-1\n  secret: ${secret}\n  page_url: https://app.example/billing\n`;
+    await writeFile(TEST_CONFIG_PATH, block('a'.repeat(64)));
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.usejarvis_billing?.secret).toBe('a'.repeat(64));
+
+    await writeFile(TEST_CONFIG_PATH, block('b'.repeat(64)));
+    await reloadUsejarvisBillingBlock(config, TEST_CONFIG_PATH);
+    expect(config.usejarvis_billing?.secret).toBe('b'.repeat(64));
+
+    await writeFile(TEST_CONFIG_PATH, 'usejarvis_billing: [unclosed');
+    await reloadUsejarvisBillingBlock(config, TEST_CONFIG_PATH);
+    expect(config.usejarvis_billing?.secret).toBe('b'.repeat(64));
+
+    await writeFile(TEST_CONFIG_PATH, 'daemon:\n  port: 3142\n');
+    await reloadUsejarvisBillingBlock(config, TEST_CONFIG_PATH);
+    expect(config.usejarvis_billing).toBeUndefined();
+  });
+
+  test('reloadUsejarvisAiBlock: rotation lands, removal un-hosts, corruption keeps the current value', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    const { reloadUsejarvisAiBlock } = await import('./loader.ts');
+    await writeFile(
+      TEST_CONFIG_PATH,
+      'usejarvis_ai:\n  base_url: https://llm.usejarvis.host\n  api_key: sk-uj-old\n',
+    );
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.usejarvis_ai?.api_key).toBe('sk-uj-old');
+
+    // Provisioner rotates the key: SIGHUP re-read must pick it up.
+    await writeFile(
+      TEST_CONFIG_PATH,
+      'usejarvis_ai:\n  base_url: https://llm.usejarvis.host\n  api_key: sk-uj-rotated\n',
+    );
+    await reloadUsejarvisAiBlock(config, TEST_CONFIG_PATH);
+    expect(config.usejarvis_ai?.api_key).toBe('sk-uj-rotated');
+
+    // Corrupt file: keep the current value (a write race must not un-host).
+    await writeFile(TEST_CONFIG_PATH, 'usejarvis_ai: [unclosed\n  broken');
+    await reloadUsejarvisAiBlock(config, TEST_CONFIG_PATH);
+    expect(config.usejarvis_ai?.api_key).toBe('sk-uj-rotated');
+
+    // Block removed: the install is no longer hosted.
+    await writeFile(TEST_CONFIG_PATH, 'daemon:\n  port: 8788\n');
+    await reloadUsejarvisAiBlock(config, TEST_CONFIG_PATH);
+    expect(config.usejarvis_ai).toBeUndefined();
+  });
+
+  test('workflows SYSTEM path keys survive the user-section discard; user fields do not', async () => {
+    // A hosted/system config carries only the ready-made artifact paths;
+    // any user-tunable workflow fields in the FILE have no authority (they
+    // live in the DB) — but the paths are file-owned and must survive.
+    const yaml = `
+workflows:
+  enabled: false
+  engine_dir: /opt/jarvis-engine/\${version}
+  pieces_dir: /srv/pieces
+  piece_metadata_cache: /srv/piece-metadata.json
+`;
+    await Bun.write(TEST_CONFIG_PATH, yaml);
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.workflows?.engine_dir).toBe('/opt/jarvis-engine/\${version}');
+    expect(loaded.workflows?.pieces_dir).toBe('/srv/pieces');
+    expect(loaded.workflows?.piece_metadata_cache).toBe('/srv/piece-metadata.json');
+    // The file's `enabled: false` was discarded with the user section.
+    expect(loaded.workflows?.enabled).toBeUndefined();
+  });
+
   test('returns default config when file does not exist', async () => {
     const config = await loadConfig('/tmp/nonexistent-config.yaml');
     // Paths should be tilde-expanded, but all other fields match defaults
@@ -99,6 +220,7 @@ authority:
 daemon:
   port: 9090
   brain_domain: "u1.vps1.usejarvis.host"
+  public_url: "https://jarvis.example.com"
 auth:
   insecure_open_access: true
 google:
@@ -108,10 +230,53 @@ google:
     await Bun.write(TEST_CONFIG_PATH, systemYaml);
     const loaded = await loadConfig(TEST_CONFIG_PATH);
     expect(loaded.daemon.brain_domain).toBe('u1.vps1.usejarvis.host');
+    expect(loaded.daemon.public_url).toBe('https://jarvis.example.com');
     expect(loaded.auth?.insecure_open_access).toBe(true);
     // google is system-owned when the file provides it (hosted: the shared
     // company OAuth client). The DB fallback only applies when absent here.
     expect(loaded.google?.client_id).toBe('company-client.apps.googleusercontent.com');
+  });
+
+  test('log_file_path / log_file_max_bytes survive the user-section discard', async () => {
+    // They live under `daemon:` precisely because of that discard - a
+    // top-level `logging:` block would be dropped on every load (docs/LOGS.md,
+    // "The brain's side").
+    await Bun.write(
+      TEST_CONFIG_PATH,
+      'daemon:\n  log_file_path: /home/u_abc123/.jarvis/logs/jarvis.log\n  log_file_max_bytes: 2097152\n',
+    );
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.daemon.log_file_path).toBe('/home/u_abc123/.jarvis/logs/jarvis.log');
+    expect(loaded.daemon.log_file_max_bytes).toBe(2097152);
+  });
+
+  test('log_file_path is absent by default (no DEFAULT_CONFIG entry, no file written)', async () => {
+    expect(DEFAULT_CONFIG.daemon.log_file_path).toBeUndefined();
+    expect(DEFAULT_CONFIG.daemon.log_file_max_bytes).toBeUndefined();
+    await Bun.write(TEST_CONFIG_PATH, 'daemon:\n  port: 3142\n');
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.daemon.log_file_path).toBeUndefined();
+  });
+
+  test('expands ~ in log_file_path (openSync does not understand it)', async () => {
+    await Bun.write(TEST_CONFIG_PATH, 'daemon:\n  log_file_path: "~/.jarvis/logs/jarvis.log"\n');
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.daemon.log_file_path).not.toContain('~');
+    expect(isAbsolute(loaded.daemon.log_file_path!)).toBe(true);
+    expect(loaded.daemon.log_file_path).toEndWith('/.jarvis/logs/jarvis.log');
+  });
+
+  test('a non-string log_file_path is dropped, not fatal', async () => {
+    // `log_file_path: true` made expandTilde throw "filepath.startsWith is not
+    // a function", and the daemon then exited reporting "Failed to parse config
+    // file" - which is not what was wrong with it.
+    for (const value of ['true', '42', '[a, b]']) {
+      await Bun.write(TEST_CONFIG_PATH, `daemon:\n  log_file_path: ${value}\n`);
+      const loaded = await loadConfig(TEST_CONFIG_PATH);
+      expect(loaded.daemon.log_file_path).toBeUndefined();
+      // And the rest of the config still loads.
+      expect(loaded.daemon.port).toBe(DEFAULT_CONFIG.daemon.port);
+    }
   });
 
   test('loadConfig does not mutate DEFAULT_CONFIG', async () => {
@@ -365,5 +530,252 @@ describe('Path Expansion', () => {
 
     expect(loaded.daemon.data_dir).toBe('/absolute/path');
     expect(loaded.daemon.db_path).toBe('/absolute/db.db');
+  });
+});
+
+/**
+ * The SYSTEM-owned `tools:` section (docs/tool-relevance-filtering.md).
+ *
+ * A comment in types.ts used to claim that any new top-level key is
+ * "silently dropped on every load", which is why `log_file_path` lives under
+ * `daemon:`. That is over-broad: only the sections LISTED in
+ * USER_OWNED_SECTIONS are replaced, and deepMerge copies unknown keys
+ * through. These tests pin the real behaviour, so nobody restores a discard
+ * that does not exist and quietly disables the filter's kill switch.
+ */
+describe('tools: relevance filter config', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
+  afterEach(async () => {
+    delete process.env.JARVIS_TOOL_FILTER;
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+  });
+
+  const write = async (body: string) => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(TEST_CONFIG_PATH, body);
+  };
+
+  test('a tools block survives loadConfig while a user-owned section does not', async () => {
+    await write([
+      'tools:',
+      '  relevance_filter:',
+      '    enabled: true',
+      '    max_params_b: 9',
+      '    models:',
+      '      - "ollama:qwen2.5:7b"',
+      'personality:',
+      '  assistant_name: ShouldBeDiscarded',
+      '',
+    ].join('\n'));
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.tools?.relevance_filter?.enabled).toBe(true);
+    expect(config.tools?.relevance_filter?.max_params_b).toBe(9);
+    expect(config.tools?.relevance_filter?.models).toEqual(['ollama:qwen2.5:7b']);
+    // The contrast that makes the point: `personality` IS user-owned, so the
+    // file has no authority over it and it comes back as the default.
+    expect(config.personality.assistant_name).not.toBe('ShouldBeDiscarded');
+  });
+
+  test('tools is not a user-owned section', () => {
+    expect(USER_OWNED_SECTIONS as readonly string[]).not.toContain('tools');
+  });
+
+  test('absent means off: no tools block leaves it undefined', async () => {
+    await write('daemon:\n  port: 3142\n');
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.tools).toBeUndefined();
+    expect(DEFAULT_CONFIG).not.toHaveProperty('tools');
+  });
+
+  test('JARVIS_TOOL_FILTER=off overrides an enabled file', async () => {
+    await write('tools:\n  relevance_filter:\n    enabled: true\n');
+    process.env.JARVIS_TOOL_FILTER = 'off';
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.tools?.relevance_filter?.enabled).toBe(false);
+  });
+
+  test('JARVIS_TOOL_FILTER=on enables it with no tools block at all', async () => {
+    await write('daemon:\n  port: 3142\n');
+    process.env.JARVIS_TOOL_FILTER = 'on';
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.tools?.relevance_filter?.enabled).toBe(true);
+  });
+
+  test('an unrecognised JARVIS_TOOL_FILTER value is ignored, not guessed at', async () => {
+    await write('tools:\n  relevance_filter:\n    enabled: true\n');
+    process.env.JARVIS_TOOL_FILTER = 'perhaps';
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.tools?.relevance_filter?.enabled).toBe(true);
+  });
+});
+
+// The daemon binds `daemon.port` and the CLI prints/opens a URL resolved in the
+// same precedence (src/cli/lifecycle.ts resolveDashboardTarget). A JARVIS_PORT
+// one of them accepts and the other rejects would put the daemon on one port and
+// every printed URL on another (#544).
+describe('JARVIS_PORT agrees with the port the CLI resolves', () => {
+  let prev: string | undefined;
+
+  beforeEach(async () => {
+    await createTestConfigPath();
+    prev = process.env.JARVIS_PORT;
+  });
+
+  afterEach(async () => {
+    if (prev === undefined) delete process.env.JARVIS_PORT;
+    else process.env.JARVIS_PORT = prev;
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+  });
+
+  const write = async (body: string) => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(TEST_CONFIG_PATH, body);
+  };
+
+  test('a port in range overrides daemon.port', async () => {
+    await write('daemon:\n  port: 5000\n');
+    process.env.JARVIS_PORT = '7000';
+    expect((await loadConfig(TEST_CONFIG_PATH)).daemon.port).toBe(7000);
+  });
+
+  test.each(['0', '70000', '-1', 'not-a-port', ''])('%p is ignored, like validPort ignores it', async (value) => {
+    await write('daemon:\n  port: 5000\n');
+    process.env.JARVIS_PORT = value;
+    expect((await loadConfig(TEST_CONFIG_PATH)).daemon.port).toBe(5000);
+  });
+
+  test('a trailing fraction truncates the same way on both sides', async () => {
+    // parseInt on both sides, so `8080.5` is 8080 here and 8080 in validPort.
+    await write('daemon:\n  port: 5000\n');
+    process.env.JARVIS_PORT = '8080.5';
+    expect((await loadConfig(TEST_CONFIG_PATH)).daemon.port).toBe(8080);
+  });
+});
+
+// The daemon binds whatever `daemon.port` resolves to, and `jarvis stop` reads
+// the same key out of the same file to decide which port to signal
+// (src/cli/lifecycle.ts). A value only one of them understands means the daemon
+// is on one port and the CLI aims SIGTERM then SIGKILL at another - which is not
+// Jarvis (#550). The shared reading lives in src/config/port.ts.
+describe('daemon.port is coerced, or the config is refused', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
+  afterEach(async () => {
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+    delete process.env.JARVIS_PORT;
+  });
+
+  const write = async (body: string) => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(TEST_CONFIG_PATH, body);
+  };
+
+  const portOf = async () => (await loadConfig(TEST_CONFIG_PATH)).daemon.port;
+
+  test('a quoted port loads as the same number as an unquoted one', async () => {
+    await write('daemon:\n  port: "8080"\n');
+    const quoted = await portOf();
+    await write('daemon:\n  port: 8080\n');
+    expect(quoted).toBe(await portOf());
+    // A number, not the string YAML produced: writeLockedPort takes only a
+    // number, and its silent no-op is how the lockfile ended up empty.
+    expect(quoted).toBe(8080);
+    expect(typeof quoted).toBe('number');
+  });
+
+  test('an absent or empty daemon.port is the default, as before', async () => {
+    await write('daemon:\n  data_dir: /tmp/jarvis-test\n');
+    expect(await portOf()).toBe(DEFAULT_CONFIG.daemon.port);
+    // `port:` with nothing after it parses as null.
+    await write('daemon:\n  port:\n');
+    expect(await portOf()).toBe(DEFAULT_CONFIG.daemon.port);
+  });
+
+  test.each(['0', '65536', '-1', '8080.5', '"8080abc"', '""', 'true', '[8080]', '{ nope: true }'])(
+    'refuses daemon.port: %s rather than falling back to a port nobody asked for',
+    async (value) => {
+      await write(`daemon:\n  port: ${value}\n`);
+      await expect(loadConfig(TEST_CONFIG_PATH)).rejects.toThrow(/daemon\.port in .* must be a whole number between 1 and 65535/);
+    },
+  );
+
+  test('the refusal names the file, so the user knows which one to edit', async () => {
+    await write('daemon:\n  port: "8080abc"\n');
+    await expect(loadConfig(TEST_CONFIG_PATH)).rejects.toThrow(TEST_CONFIG_PATH);
+  });
+
+  test('a broken daemon.port is reported even when JARVIS_PORT would have covered it', async () => {
+    // Deliberate: the env var is a convenience a stale shell export can carry,
+    // the file is edited on purpose, and a typo that only surfaces once the
+    // export is gone is the worse of the two.
+    await write('daemon:\n  port: "8080abc"\n');
+    process.env.JARVIS_PORT = '7000';
+    await expect(loadConfig(TEST_CONFIG_PATH)).rejects.toThrow(/daemon\.port in /);
+  });
+
+  test('JARVIS_PORT still wins over a valid quoted port', async () => {
+    await write('daemon:\n  port: "8080"\n');
+    process.env.JARVIS_PORT = '7000';
+    expect(await portOf()).toBe(7000);
+  });
+});
+
+// The escape hatch for #546's prctl(PR_SET_DUMPABLE, 0). The daemon tests the
+// resolved value with `=== true`, so what matters here is that the loader hands
+// it a real BOOLEAN: `allow_process_inspection: yes` is a string in the YAML
+// 1.2 core schema the parser uses, and a string would have left the hatch
+// silently shut for the spelling most people write.
+describe('daemon.allow_process_inspection is coerced to a boolean', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
+  afterEach(async () => {
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+  });
+
+  const write = async (body: string) => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(TEST_CONFIG_PATH, body);
+  };
+
+  const allowOf = async () =>
+    (await loadConfig(TEST_CONFIG_PATH)).daemon.allow_process_inspection;
+
+  test.each(['true', 'yes', '"true"', 'on', '1'])('%s opens the hatch as a real boolean', async (value) => {
+    await write(`daemon:\n  allow_process_inspection: ${value}\n`);
+    expect(await allowOf()).toBe(true);
+  });
+
+  test.each(['false', 'no', 'off', '0', '"false"'])('%s leaves the daemon hardened', async (value) => {
+    await write(`daemon:\n  allow_process_inspection: ${value}\n`);
+    expect(await allowOf()).toBe(false);
+  });
+
+  test('absent is false, so the default is hardened', async () => {
+    await write('daemon:\n  port: 3142\n');
+    expect(await allowOf()).toBe(false);
+    // The key with no value parses as null.
+    await write('daemon:\n  allow_process_inspection:\n');
+    expect(await allowOf()).toBe(false);
+  });
+
+  test('a value nobody can read fails CLOSED instead of refusing the config', async () => {
+    // Unlike daemon.port this does NOT throw: one reader, and a safe reading.
+    // Half the CLI going down over a typo in a defense-in-depth knob costs
+    // more than it buys, so it warns and hardens.
+    for (const value of ['maybe', '[true]', '{ allow: true }', '2', '"enabled"']) {
+      await write(`daemon:\n  allow_process_inspection: ${value}\n`);
+      expect(await allowOf()).toBe(false);
+    }
+  });
+
+  test('a missing config file leaves it hardened too', async () => {
+    expect((await loadConfig(join(TEST_CONFIG_DIR, 'nope.yaml'))).daemon.allow_process_inspection).toBe(false);
   });
 });

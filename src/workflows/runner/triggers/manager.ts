@@ -45,8 +45,11 @@ import {
   type EngineScheduleOptions,
   type FlowVersion,
 } from "../../db/repos/flow-version";
-import { createFlowRun } from "../../db/repos/flow-run";
-import { enqueue } from "../../db/repos/job-queue";
+import { getWorkflowDb } from '../../db';
+import { assertVersionReady, WorkflowReadinessError } from '../../db/repos/flow-readiness';
+import { ungrantedCodeSteps } from "../../db/repos/flow-code-steps";
+import { createFlowRun, updateRun } from "../../db/repos/flow-run";
+import { enqueue, countQueued } from "../../db/repos/job-queue";
 import { RUN_FLOW } from "../handler";
 import { DEFAULT_IDS } from "../../db/schema";
 import type { EngineRuntime } from "../engine-runtime/engine-runtime";
@@ -61,6 +64,12 @@ interface TriggerNode {
     input?: Record<string, unknown>;
   };
 }
+
+/**
+ * Queued jobs beyond which webhook ingress is refused (503, Retry-After) and
+ * any webhook fire that slipped past the probe is dropped with a log line.
+ */
+export const MAX_QUEUED_WEBHOOK_RUNS = 500;
 
 type SubscriptionKind = "cron" | "webhook" | "event" | "engine";
 type ActiveSub = {
@@ -95,8 +104,16 @@ export interface TriggerManagerDeps {
    * event-bus subscription.
    */
   engineRuntime?: EngineRuntime;
+  /** Startup/refresh refusal: notify the owner after its failed run is durable. */
+  onRegistrationBlocked?: (notice: { flowId: string; runId: string; message: string }) => void;
   /** Optional logger; defaults to console. */
   log?: (line: string) => void;
+  /**
+   * Backoff schedule for retrying a failed engine ON_ENABLE, in ms. One entry
+   * per retry; the flow is given up on after the last one. Tests override it
+   * to keep the clock out of the assertions.
+   */
+  enableRetryDelaysMs?: number[];
 }
 
 export class TriggerManager {
@@ -120,13 +137,43 @@ export class TriggerManager {
    * otherwise stack overlapping engine spawns).
    */
   private readonly pollingInFlight: Set<string> = new Set();
+  /**
+   * Pending ON_ENABLE retries, keyed by flow id. An engine acquire can fail
+   * for reasons that have nothing to do with the flow (loaded host, engine
+   * mid-restart), and without a retry the flow stays silently unregistered
+   * until someone toggles it or the daemon restarts -- the failure looks
+   * exactly like "my trigger never fires".
+   */
+  private readonly enableRetries: Map<
+    string,
+    { attempt: number; timer: ReturnType<typeof setTimeout> }
+  > = new Map();
+  private readonly enableRetryDelaysMs: number[];
+  private readonly onRegistrationBlocked: TriggerManagerDeps['onRegistrationBlocked'];
+  private readonly registrationFailures = new Map<string, string>();
 
   constructor(deps: TriggerManagerDeps) {
     this.bus = deps.eventBus;
+    this.onRegistrationBlocked = deps.onRegistrationBlocked;
     this.cron = deps.cronScheduler ?? new CronScheduler();
     this.webhooks = deps.webhookManager ?? new WebhookManager();
+    // Public ingress answers 503 while the queue is backed up, so senders
+    // retry instead of being told "ok" about a run that was never queued.
+    this.webhooks.setCapacityCheck(() => {
+      try {
+        return countQueued() < MAX_QUEUED_WEBHOOK_RUNS;
+      } catch {
+        return true; // a probe failure must not close the ingress
+      }
+    });
     this.engineRuntime = deps.engineRuntime;
     this.log = deps.log ?? ((line) => console.log(`[trigger-manager] ${line}`));
+    // 5s / 15s / 1m / 5m / 15m -- covers a brief engine hiccup within seconds
+    // and a longer host-level problem (swap storm, restart loop) over ~21min
+    // without spawning engines in a tight loop.
+    this.enableRetryDelaysMs = deps.enableRetryDelaysMs ?? [
+      5_000, 15_000, 60_000, 300_000, 900_000,
+    ];
 
     this.webhooks.setTriggerCallback((flowId, payload) => {
       void this.fire(flowId, payload, "webhook");
@@ -149,6 +196,9 @@ export class TriggerManager {
 
   /** Tear down all subscriptions. */
   async stop(): Promise<void> {
+    for (const flowId of Array.from(this.enableRetries.keys())) {
+      this.clearEnableRetry(flowId);
+    }
     for (const sub of this.subs.values()) {
       try {
         await sub.teardown();
@@ -157,6 +207,7 @@ export class TriggerManager {
       }
     }
     this.subs.clear();
+    this.registrationFailures.clear();
     this.cron.cancelAll();
     this.log("stopped");
   }
@@ -232,6 +283,27 @@ export class TriggerManager {
     const trigger = version.trigger as unknown as TriggerNode | null;
     if (!trigger || typeof trigger !== "object") return;
 
+    // CODE gate backstop. Registration is the last point at which a version
+    // becomes autonomously runnable, and it is not per execution, so declining
+    // here is not the run-time refusal that got #459's allowlist pulled. It
+    // catches the one thing the publish and enable gates cannot see: which
+    // DRAFT is "latest" moves with any write that bumps a draft's `updated`,
+    // so a CODE draft that was not live when the flow was enabled can become
+    // live later. A published flow always carries the grant, so this can only
+    // decline a flow that was never publishable in the first place.
+    const ungranted = ungrantedCodeSteps(flow, version.trigger);
+    if (ungranted) {
+      this.log(
+        `flow ${flow.id}: not registering a trigger -- version ${versionId} has CODE step(s) ` +
+          `${ungranted.map((name) => `"${name}"`).join(", ")} and code steps are not enabled for this flow ` +
+          `(POST /api/workflows/${flow.id}/code-steps {"enabled": true})`,
+      );
+      return;
+    }
+
+    if (!this.checkReadiness(flow.id, versionId, 'registration')) return;
+    this.registrationFailures.delete(flow.id);
+
     if (trigger.type === "EMPTY") return; // manual-run only
 
     if (trigger.type === "PIECE_TRIGGER") {
@@ -266,6 +338,11 @@ export class TriggerManager {
   }
 
   private async unregister(flowId: string): Promise<void> {
+    // Cancel any pending ON_ENABLE retry first: a flow being disabled (or
+    // republished) must not be resurrected by a timer armed for the old
+    // version.
+    this.clearEnableRetry(flowId);
+    this.registrationFailures.delete(flowId);
     const sub = this.subs.get(flowId);
     if (!sub) return;
     try {
@@ -355,6 +432,10 @@ export class TriggerManager {
    * a prior enable), we skip the engine round-trip and just rewire the cron.
    * On_disable refreshes always go through the engine to give the trigger a
    * chance to clean up upstream state.
+   *
+   * A failed ON_ENABLE is retried on a backoff (`scheduleEnableRetry`) rather
+   * than dropped: the engine round-trip can fail for host-level reasons, and
+   * an unregistered flow gives the user no signal beyond "it never fires".
    */
   private async registerEngineTrigger(
     flow: FlowRow,
@@ -391,9 +472,7 @@ export class TriggerManager {
           await handle.release();
         }
       } catch (e) {
-        this.log(
-          `flow ${flow.id}: engine ON_ENABLE failed: ${(e as Error).message} -- skipping registration this cycle; next refresh will retry`,
-        );
+        this.scheduleEnableRetry(flow.id, (e as Error).message);
         return;
       }
     }
@@ -441,6 +520,51 @@ export class TriggerManager {
       teardown: () => this.teardownEngineTrigger(flow.id, version.id, cronTearDown, webhookTearDown),
     };
     this.subs.set(flow.id, sub);
+    this.clearEnableRetry(flow.id);
+  }
+
+  /**
+   * Arm the next ON_ENABLE retry for a flow whose engine round-trip failed.
+   * The retry goes through `refresh()`, so it re-reads the flow first and
+   * quietly does nothing if the user disabled or republished it meanwhile.
+   *
+   * Attempts escalate along `enableRetryDelaysMs` and reset once the flow
+   * registers, so a flow that fails, recovers, and fails again next week gets
+   * the full schedule again rather than the tail of the old one.
+   */
+  private scheduleEnableRetry(flowId: string, reason: string, source = 'engine ON_ENABLE'): void {
+    const prior = this.enableRetries.get(flowId);
+    if (prior) clearTimeout(prior.timer);
+    const attempt = prior ? prior.attempt + 1 : 0;
+    const total = this.enableRetryDelaysMs.length;
+    const delay = this.enableRetryDelaysMs[attempt];
+    if (delay === undefined) {
+      this.enableRetries.delete(flowId);
+      this.log(
+        `flow ${flowId}: ${source} failed: ${reason} -- giving up after ${total} ` +
+          `retries; the flow is NOT firing. Re-enable it (or restart the daemon) once the engine is healthy`,
+      );
+      return;
+    }
+    const timer = setTimeout(() => {
+      void this.refresh(flowId).catch((e) => {
+        this.log(`flow ${flowId}: ON_ENABLE retry failed: ${(e as Error).message}`);
+      });
+    }, delay);
+    // Don't hold the daemon open just for a pending retry.
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.enableRetries.set(flowId, { attempt, timer });
+    this.log(
+      `flow ${flowId}: ${source} failed: ${reason} -- retrying in ${Math.round(delay / 1000)}s ` +
+        `(attempt ${attempt + 1}/${total}); the flow will not fire until it registers`,
+    );
+  }
+
+  private clearEnableRetry(flowId: string): void {
+    const pending = this.enableRetries.get(flowId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.enableRetries.delete(flowId);
   }
 
   private async teardownEngineTrigger(
@@ -484,6 +608,38 @@ export class TriggerManager {
     }
   }
 
+  /** Persist refusals and any already-received input without creating runnable work. */
+  private checkReadiness(flowId: string, versionId: string, kind: SubscriptionKind | 'registration', recovery?: { payload: Record<string, unknown>; executeTrigger: boolean }): boolean {
+    try { assertVersionReady(flowId, versionId); return true; }
+    catch (error) {
+      if (!(error instanceof WorkflowReadinessError)) throw error;
+      const signature = JSON.stringify([versionId, error.readiness]);
+      if (kind !== 'registration' || this.registrationFailures.get(flowId) !== signature) {
+        const run = getWorkflowDb().transaction(() => {
+          const now = Date.now();
+          const created = createFlowRun({ flowId, flowVersionId: versionId,
+            triggeredBy: `trigger:${kind}`,
+            status: 'FAILED', startTime: now, tags: ['workflow-readiness'] });
+          return updateRun(created.id, { finishTime: now, stepsCount: 0,
+            failedStep: { name: '<readiness>', displayName: 'Workflow readiness', errorMessage: error.message },
+            steps: { '<readiness>': { status: 'FAILED', output: { code: error.code, phase: kind, readiness: error.readiness,
+              // Polling may already have advanced its cursor while readiness
+              // changed. Keep every returned item, but never replay it silently.
+              ...(recovery ? { recovery: { ...recovery, requiresDecision: true } } : {}),
+            } } } });
+        })();
+        if (kind === 'registration') {
+          this.registrationFailures.set(flowId, signature);
+          try { this.onRegistrationBlocked?.({ flowId, runId: run.id, message: error.message }); }
+          catch (notifyError) { this.log(`flow ${flowId}: readiness notification failed: ${String(notifyError)}`); }
+        }
+      }
+      this.log(`flow ${flowId}: readiness refused ${kind}: ${error.message}`);
+      if (kind === 'registration') this.scheduleEnableRetry(flowId, error.message, 'readiness');
+      return false;
+    }
+  }
+
   /**
    * Enqueue a RUN_FLOW. Used by every trigger fire path so `triggeredBy`
    * follows one convention -- `trigger:<kind>` -- across cron, webhook,
@@ -496,6 +652,7 @@ export class TriggerManager {
     payload?: Record<string, unknown>;
     executeTrigger?: boolean;
   }): void {
+    if (!this.checkReadiness(opts.flowId, opts.versionId, opts.kind, { payload: opts.payload ?? {}, executeTrigger: opts.executeTrigger ?? false })) return;
     const run = createFlowRun({
       flowId: opts.flowId,
       flowVersionId: opts.versionId,
@@ -550,6 +707,7 @@ export class TriggerManager {
       return;
     }
 
+    if (!this.checkReadiness(flowId, versionId, 'engine')) return;
     this.pollingInFlight.add(flowId);
     let items: unknown[];
     try {
@@ -609,6 +767,21 @@ export class TriggerManager {
     if (!versionId) {
       this.log(`flow ${flowId} (${kind}) fire skipped: no active subscription`);
       return;
+    }
+    // Backlog cap for the public ingress: the webhook route is rate limited
+    // per minute, but a worker that is slow or down would still let the
+    // queue grow without bound. Owner-driven kinds are not dropped.
+    if (kind === "webhook") {
+      let queued = 0;
+      try {
+        queued = countQueued();
+      } catch (e) {
+        this.log(`flow ${flowId} (webhook) backlog check failed: ${(e as Error).message}`);
+      }
+      if (queued >= MAX_QUEUED_WEBHOOK_RUNS) {
+        this.log(`flow ${flowId} (webhook) fire dropped: ${queued} jobs already queued`);
+        return;
+      }
     }
     try {
       this.enqueueFlowRun({

@@ -12,6 +12,7 @@ import { spawn, type Subprocess } from 'bun';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { modelExecEnv } from '../../util/model-exec-env.ts';
 
 export type BrowserKind = 'chrome' | 'brave' | 'edge' | 'chromium';
 
@@ -145,8 +146,15 @@ function findWindowsCandidates(): BrowserExecutable[] {
 /**
  * Launch Chrome with CDP enabled and an isolated user profile.
  * Returns when the CDP port is reachable.
+ *
+ * `exeOverride` is a test seam (src/model-exec-env-sites.test.ts); callers
+ * leave it to detection.
  */
-export async function launchChrome(port: number = 9222, profileDir?: string): Promise<RunningBrowser> {
+export async function launchChrome(
+  port: number = 9222,
+  profileDir?: string,
+  exeOverride?: BrowserExecutable,
+): Promise<RunningBrowser> {
   // Single choke point for browser.local: false (hosted instances). EVERY
   // local-browser path funnels through here lazily (builtin browser tools,
   // the background agent's bg browser), so no CDP port can ever open when
@@ -156,7 +164,7 @@ export async function launchChrome(port: number = 9222, profileDir?: string): Pr
     throw new Error('The local browser is disabled on this machine (browser.local: false). Use a sidecar browser instead.');
   }
 
-  const exe = findBrowserExecutable();
+  const exe = exeOverride ?? findBrowserExecutable();
   if (!exe) {
     throw new Error(
       'No Chrome/Brave/Edge/Chromium found on this system.\n' +
@@ -186,7 +194,16 @@ export async function launchChrome(port: number = 9222, profileDir?: string): Pr
   // Linux-specific (also applies to WSL2)
   if (process.platform === 'linux') {
     args.push('--disable-dev-shm-usage');
-    args.push('--no-sandbox'); // Required for Chromium in containers/WSL2
+    // Chrome's sandbox stays on unless it provably cannot start here (root,
+    // or no user namespaces and no setuid helper). See chrome-sandbox.ts.
+    // Only a browser this launcher detected is probed; see linuxSandboxDecision.
+    const { linuxSandboxDecision } = await import('./chrome-sandbox.ts');
+    const detected = findBrowserExecutable()?.path === exe.path;
+    const sandbox = await linuxSandboxDecision(exe.path, { probe: detected });
+    if (!sandbox.sandbox) {
+      console.warn(`[ChromeLauncher] Launching WITHOUT Chrome's sandbox: ${sandbox.reason}`);
+      args.push('--no-sandbox');
+    }
     args.push('--window-size=1280,900');
     args.push('--window-position=100,100');
 
@@ -214,6 +231,12 @@ export async function launchChrome(port: number = 9222, profileDir?: string): Pr
   const proc = spawn([exe.path, ...args], {
     stdout: 'ignore',
     stderr: 'ignore',
+    // A desktop app the model drives over CDP: it needs the desktop session,
+    // and its env reaches whatever it spawns or opens (helpers, downloads
+    // handed to other apps; since #521 not file:///proc/self/environ). So the
+    // session, without the daemon's secrets (#514). Hygiene, not isolation:
+    // see util/model-exec-env.ts.
+    env: modelExecEnv(),
   });
 
   const startedAt = Date.now();
@@ -238,10 +261,20 @@ export async function launchChrome(port: number = 9222, profileDir?: string): Pr
   }
 
   if (!reachable) {
+    const exitCode = proc.exitCode;
     proc.kill();
+    // One way a sandboxed Linux launch dies at startup is a sandbox that
+    // fails where the probe's did not (#521). Chrome's stderr is not captured
+    // here, so name the way out rather than leave "not reachable" to guess at.
+    const sandboxHint = process.platform === 'linux' && !args.includes('--no-sandbox')
+      && !exe.path.toLowerCase().endsWith('.exe')
+      ? '\nChrome ran with its sandbox on. If it cannot start sandboxed on this host (a container, ' +
+        'or no user namespaces), set JARVIS_BROWSER_NO_SANDBOX=1 and restart Jarvis.'
+      : '';
     throw new Error(
-      `Chrome started but CDP not reachable on port ${port} after 15s.\n` +
-      `Binary: ${exe.path}`
+      `Chrome started but CDP not reachable on port ${port} after 15s` +
+      `${exitCode !== null ? ` (Chrome exited with code ${exitCode})` : ''}.\n` +
+      `Binary: ${exe.path}` + sandboxHint
     );
   }
 

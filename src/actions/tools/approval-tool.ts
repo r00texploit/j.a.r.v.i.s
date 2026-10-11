@@ -19,7 +19,7 @@
  */
 
 import type { ActionCategory } from '../../roles/authority.ts';
-import type { ApprovalDelivery } from '../../authority/approval-delivery.ts';
+import { APPROVAL_LABEL_DELIVERY_MAX_CHARS, approvalLabelAlteration, type ApprovalDelivery } from '../../authority/approval-delivery.ts';
 import type { ApprovalManager } from '../../authority/approval.ts';
 import { AUTHORITY_REQUIREMENTS } from '../../roles/authority.ts';
 import type { ToolDefinition } from './registry.ts';
@@ -44,43 +44,38 @@ export function createRequestApprovalTool(deps: RequestApprovalDeps): ToolDefini
     name: 'request_approval',
     category: 'authority',
     description:
-      `Request the user's explicit approval BEFORE performing a gated action.\n\n` +
-      `You MUST call this tool first whenever you are about to:\n` +
-      `  - send_email: send an email to anyone\n` +
-      `  - send_message: send a message to anyone (Slack, Telegram, Discord, SMS, etc.)\n` +
-      `  - make_payment: any financial transaction, purchase, subscription\n` +
-      `  - install_software: install, upgrade, or remove any package or app\n` +
-      `  - modify_settings: change system or account settings\n` +
-      `  - delete_data: delete files, records, or any persistent state\n` +
-      `  - execute_command: run shell commands that mutate state (git push, rm, npm install, etc.)\n` +
-      `  - terminate_agent: stop a running agent\n\n` +
+      `Request the user's explicit approval BEFORE performing a gated action.\n` +
+      `You MUST call this FIRST, not after (see action_category for the list). Blocks until they decide.\n\n` +
       `This applies REGARDLESS of which low-level tools you plan to use. ` +
       `If you plan to click the Send button in a Gmail compose window via browser_click, ` +
       `call request_approval with action_category='send_email' FIRST. ` +
-      `Do NOT write "APPROVAL REQUIRED" messages yourself — always use this tool.\n\n` +
-      `The tool returns one of:\n` +
-      `  [APPROVED] — user granted permission. Proceed with the action now.\n` +
-      `  [DENIED]   — user refused. STOP. Tell the user the action was blocked.\n` +
-      `  [EXPIRED]  — user did not respond in time. Ask them directly before proceeding.\n\n` +
-      `Do not call this tool for read-only actions (reading files, browsing info pages, running ls, etc.).`,
+      `Do NOT write "APPROVAL REQUIRED" messages yourself - always use this tool.\n\n` +
+      `Returns one of:\n` +
+      `  [APPROVED] proceed with the action now.\n` +
+      `  [DENIED]   STOP. Tell the user the action was blocked.\n` +
+      `  [EXPIRED]  no answer in time. Ask them directly before proceeding.\n\n` +
+      `Not for read-only actions (reading files, browsing info pages, running ls).`,
     parameters: {
       action_category: {
         type: 'string',
         description:
-          "One of: send_email, send_message, make_payment, install_software, " +
-          "modify_settings, delete_data, execute_command, terminate_agent",
+          'One of: send_email, send_message (any channel: Slack, Telegram, Discord, SMS), ' +
+          'make_payment (any purchase or subscription), install_software (install, upgrade ' +
+          'or removal), modify_settings (system or account settings), delete_data (files, ' +
+          'records, any persistent state), execute_command (a shell command that MUTATES ' +
+          'state: git push, rm, npm install), terminate_agent (stop a running agent).',
         required: true,
       },
       intent: {
         type: 'string',
         description:
-          'Short imperative sentence (1 line) describing exactly what you will do. ' +
-          'Example: "Send email to alice@example.com with subject \'Weekly Update\'"',
+          `One imperative line (no line breaks, at most ${APPROVAL_LABEL_DELIVERY_MAX_CHARS} characters) saying exactly what you will do, e.g. ` +
+          '"Send email to alice@example.com with subject \'Weekly Update\'".',
         required: true,
       },
       context: {
         type: 'string',
-        description: 'Optional 1–2 sentence explanation of why you want to do it.',
+        description: 'Optional: why, in 1-2 sentences.',
         required: false,
       },
     },
@@ -91,6 +86,27 @@ export function createRequestApprovalTool(deps: RequestApprovalDeps): ToolDefini
 
       if (!intent) {
         return `[ERROR] request_approval requires a non-empty intent sentence.`;
+      }
+      // Refused at the source rather than shortened at each surface (#724).
+      // `intent` is the card: the dashboard shows it whole, but the Telegram/
+      // Discord card and the desktop toast -- both with an Approve action --
+      // reduce it to one line and cut it at the delivery ceiling, so a longer
+      // or multi-line intent was approved there with part of it unseen. An
+      // intent that passes reaches every surface's text exactly as written.
+      // What a surface's renderer then does with that text is outside this
+      // check. Since #718 the channel card is sent as literal text, so no
+      // channel renders its markup; since #791 a toast too long to show whole
+      // is review-only, and an over-long card offers only deny. Nothing is created
+      // or delivered for a refused intent; the model rewrites it. The message
+      // keeps the material detail IN the intent: `context` reaches no surface
+      // with an Approve action, so detail moved there would go unseen.
+      const alteration = approvalLabelAlteration(intent);
+      if (alteration) {
+        return `[ERROR] request_approval needs the intent as one plain line the approval card can show exactly as written, `
+          + `and ${alteration}. No approval was requested. Rewrite it as one imperative line `
+          + `(at most ${APPROVAL_LABEL_DELIVERY_MAX_CHARS} characters, no line breaks or invisible characters) and call request_approval again. `
+          + `Keep everything the person needs to decide -- the recipient, target, amount, what is sent or deleted -- in the intent; `
+          + `context is only for why, and the approval card on a phone or a notification does not show it.`;
       }
       if (!VALID_CATEGORIES.has(category)) {
         return (

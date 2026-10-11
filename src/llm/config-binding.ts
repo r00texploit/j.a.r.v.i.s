@@ -16,6 +16,7 @@
 import type { LLMConfig, LLMProviderEntry, LLMProviderKind } from '../config/types.ts';
 import type { LLMManager } from './manager.ts';
 import type { LLMProvider } from './provider.ts';
+import type { HostedRestriction } from '../util/hosted-error.ts';
 import { type Tier, type TierMap, parseModelRef } from './tiers.ts';
 import { AnthropicProvider } from './anthropic.ts';
 import { OpenAIProvider } from './openai.ts';
@@ -26,6 +27,8 @@ import { OpenRouterProvider } from './openrouter.ts';
 import { NVIDIAProvider } from './nvidia.ts';
 import { OpenAICompatibleProvider } from './openai-compatible.ts';
 import { LiteLLMProvider } from './litellm.ts';
+import { OmniRouteProvider } from './omniroute.ts';
+import { UsejarvisAIProvider } from './usejarvis.ts';
 
 /**
  * Instantiate a provider class from a single entry. Returns null when the
@@ -41,6 +44,14 @@ import { LiteLLMProvider } from './litellm.ts';
 export type ProviderGlobals = {
   /** Provider-side prompt caching (Anthropic cache_control). Default true. */
   promptCache?: boolean;
+  /**
+   * Whether hosted AI is restricted on this account, read from the hosted
+   * usage meter. The proxy answers a restricted key exactly like an unpaid one,
+   * so the hosted provider asks this before telling the user which it is.
+   * A function, not a value: it must reflect the meter at the time of the
+   * error, not at provider build time.
+   */
+  hostedRestriction?: () => Promise<HostedRestriction | null>;
 };
 
 export function instantiateProvider(
@@ -55,6 +66,8 @@ export function instantiateProvider(
       if (!entry.api_key) return null;
       provider = new AnthropicProvider(entry.api_key, undefined, {
         promptCache: globals?.promptCache !== false,
+        baseUrl: entry.base_url,
+        authHeader: entry.auth_header,
       });
       break;
     case 'openai':
@@ -85,11 +98,29 @@ export function instantiateProvider(
       break;
     case 'openai_compatible':
       if (!entry.base_url) return null;
-      provider = new OpenAICompatibleProvider(entry.base_url, undefined, entry.api_key);
+      provider = new OpenAICompatibleProvider(entry.base_url, undefined, entry.api_key, entry.auth_header);
       break;
     case 'litellm':
       if (!entry.base_url) return null;
-      provider = new LiteLLMProvider(entry.base_url, undefined, entry.api_key);
+      provider = new LiteLLMProvider(entry.base_url, undefined, entry.api_key, entry.auth_header);
+      break;
+    case 'omniroute':
+      provider = new OmniRouteProvider(entry.base_url?.trim() || undefined, undefined, entry.api_key, entry.auth_header);
+      break;
+    case 'usejarvis_ai':
+      // Hosted platform proxy: both values come from the system-owned
+      // config.yaml block (daemon/usejarvis-ai.ts) - nothing to guess.
+      if (!entry.base_url?.trim() || !entry.api_key?.trim()) return null;
+      provider = new UsejarvisAIProvider(entry.base_url.trim(), entry.api_key.trim(), {
+        // Anthropic prompt caching. OPT-IN via the system block (the uj-*
+        // aliases are vendor-opaque, so only the provisioner can assert the
+        // proxy strips markers for non-Anthropic upstreams — see
+        // usejarvis_ai.prompt_cache in config/types.ts), AND still subject
+        // to the user-level switch the anthropic/openrouter cases honour.
+        promptCache: entry.prompt_cache === true && globals?.promptCache !== false,
+        // Tells a policy-restricted account apart from an unpaid one on a 401.
+        restriction: globals?.hostedRestriction,
+      });
       break;
     default:
       console.warn(`[LLM] Unknown provider kind '${kind}' for '${name}' - skipping.`);

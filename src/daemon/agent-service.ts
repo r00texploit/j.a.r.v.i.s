@@ -9,16 +9,33 @@
 import { join } from 'node:path';
 import type { Service, ServiceStatus } from './services.ts';
 import type { JarvisConfig } from '../config/types.ts';
-import type { LLMStreamEvent, LLMMessage } from '../llm/provider.ts';
+import type { LLMStreamEvent, LLMMessage, LLMErrorCode } from '../llm/provider.ts';
 import type { RoleDefinition } from '../roles/types.ts';
 import type { PersonalityModel } from '../personality/model.ts';
 
 import { LLMManager } from '../llm/manager.ts';
+import { activeTurns, DrainingError } from './active-turns.ts';
 import { registerLLMProviders, configureLLMTiers } from '../llm/config-binding.ts';
+import { hostedRestrictionLookup } from './hosted-usage.ts';
+import { effectiveLlmForBinding } from './usejarvis-ai.ts';
+
+/** Wrap a turn's stream so the in-flight count is released when it settles
+ *  (exhausted, errored, or the consumer breaks). `endTurn` is idempotent. */
+async function* trackTurnStream(
+  inner: AsyncIterable<LLMStreamEvent>,
+  endTurn: () => void,
+): AsyncGenerator<LLMStreamEvent> {
+  try {
+    yield* inner;
+  } finally {
+    endTurn();
+  }
+}
 import { getDb } from '../vault/schema.ts';
 import { AgentOrchestrator } from '../agents/orchestrator.ts';
 import { loadRole } from '../roles/loader.ts';
 import { ToolRegistry } from '../actions/tools/registry.ts';
+import { scopeSystemNote, type TurnToolScope } from '../actions/tools/tool-scope.ts';
 import { BUILTIN_TOOLS, browser } from '../actions/tools/builtin.ts';
 import { createDelegateTool, type DelegateToolDeps } from '../actions/tools/delegate.ts';
 import { createManageAgentsTool, type AgentToolDeps } from '../actions/tools/agents.ts';
@@ -29,6 +46,8 @@ import { documentTool } from '../actions/tools/documents.ts';
 import { AgentTaskManager } from '../agents/task-manager.ts';
 import { discoverSpecialists, formatSpecialistList } from '../agents/role-discovery.ts';
 import { buildSystemPromptParts, type PromptContext, type SystemPromptParts } from '../roles/prompt-builder.ts';
+import { piecesManagedByHost } from '../workflows/pieces-library/shared.ts';
+import { resolveSharedRuntimePaths } from '../workflows/runtime/shared-runtime-paths.ts';
 import type { ProgressCallback } from '../agents/sub-agent-runner.ts';
 import {
   getPersonality,
@@ -45,22 +64,25 @@ import {
 } from '../personality/learner.ts';
 import { getDueCommitments, getUpcoming } from '../vault/commitments.ts';
 import { findContent } from '../vault/content-pipeline.ts';
-import { getRecentObservations } from '../vault/observations.ts';
+import { getRecentObservations, describeObservationForPrompt } from '../vault/observations.ts';
 import { extractAndStore } from '../vault/extractor.ts';
 import { getKnowledgeForMessage } from '../vault/retrieval.ts';
 import { formatUserProfileForPrompt } from '../user/profile.ts';
 import { getUserProfile } from '../vault/user-profile.ts';
-import { getWebappInstructionsForMessage } from '../vault/webapp-templates.ts';
+import { buildSkillIndex } from '../actions/tools/skills.ts';
 import type { ResearchQueue } from './research-queue.ts';
 import type { IAgentService } from './agent-service-interface.ts';
 import type { AuthorityEngine } from '../authority/engine.ts';
-import { getSidecarManager } from '../actions/tools/sidecar-route.ts';
+import { familyLabel, osFamily } from '../util/execution-environment.ts';
+import { collectExecutionTargets } from '../actions/tools/sidecar-route.ts';
+import type { ToolGuideMachine } from '../roles/tool-guide.ts';
 import { ConvOrchestrator } from '../agents/conv/conv-orchestrator.ts';
 import { TaskRegistry } from '../agents/conv/task-registry.ts';
 import { TaskDispatcher } from '../agents/conv/task-dispatcher.ts';
 import { DialogueCompactor } from '../agents/conv/dialogue-compactor.ts';
 import type { ConvTaskEvent } from '../agents/conv/conv-orchestrator.ts';
 import { getRecentConversation, getMessages } from '../vault/conversations.ts';
+import { runWithOrigin } from '../llm/origin.ts';
 
 export class AgentService implements Service, IAgentService {
   name = 'agent';
@@ -267,20 +289,60 @@ export class AgentService implements Service, IAgentService {
    * result in a single text + done event so the WebSocket UI keeps working.
    * Token-level streaming through the conv path is a Phase 6 follow-up.
    */
-  streamMessage(text: string, channel: string = 'websocket', siteContext?: string): {
+  streamMessage(
+    text: string,
+    channel: string = 'websocket',
+    siteContext?: string,
+    scope?: TurnToolScope | null,
+    // Which chat this is, for matching a paused task back to it (#571).
+    contextKey?: string,
+  ): {
+    stream: AsyncIterable<LLMStreamEvent>;
+    onComplete: (fullText: string) => Promise<void>;
+  } {
+    // Refuse new turns once draining; otherwise count this one in-flight so a
+    // graceful drain can await it (released when the tracked stream settles).
+    if (activeTurns.isDraining) throw new DrainingError();
+    const endTurn = activeTurns.begin();
+    try {
+      const inner = this.streamMessageInner(text, channel, siteContext, scope, contextKey);
+      return { stream: trackTurnStream(inner.stream, endTurn), onComplete: inner.onComplete };
+    } catch (err) {
+      endTurn();
+      throw err;
+    }
+  }
+
+  private streamMessageInner(
+    text: string,
+    channel: string = 'websocket',
+    siteContext?: string,
+    scope?: TurnToolScope | null,
+    contextKey?: string,
+  ): {
     stream: AsyncIterable<LLMStreamEvent>;
     onComplete: (fullText: string) => Promise<void>;
   } {
     if (this.convOrchestrator) {
-      return this.streamMessageConv(text, channel);
+      // Both halves travel now (#571). This branch used to drop `siteContext`
+      // AND `scope`, which made a project-scoped chat on every hosted install
+      // the pre-#561 state exactly: the generic file and shell tools present,
+      // and not even the prompt line that used to be their only restraint.
+      return this.streamMessageConv(text, channel, siteContext, scope, contextKey);
     }
 
     const systemPrompt = this.buildFullSystemPromptParts(channel, text);
     if (siteContext) {
       systemPrompt.dynamic += '\n\n' + siteContext;
     }
+    // The same correction the conv runner adds, so the two paths present the
+    // model with the same turn: the cached tool guide in the static half
+    // documents the withheld tools, and this says they are not here (#571).
+    if (scope) {
+      systemPrompt.dynamic += '\n\n' + scopeSystemNote(scope);
+    }
 
-    const stream = this.orchestrator.streamMessage(systemPrompt, text);
+    const stream = this.orchestrator.streamMessage(systemPrompt, text, undefined, undefined, undefined, scope);
 
     const onComplete = async (fullText: string): Promise<void> => {
       // Note: orchestrator already adds assistant response to history
@@ -305,7 +367,13 @@ export class AgentService implements Service, IAgentService {
    * runs (during which we surface task lifecycle events via the listener),
    * then the final verbalization text appears.
    */
-  private streamMessageConv(text: string, channel: string): {
+  private streamMessageConv(
+    text: string,
+    channel: string,
+    siteContext?: string,
+    scope?: TurnToolScope | null,
+    contextKey?: string,
+  ): {
     stream: AsyncIterable<LLMStreamEvent>;
     onComplete: (fullText: string) => Promise<void>;
   } {
@@ -318,6 +386,7 @@ export class AgentService implements Service, IAgentService {
       let fullText = '';
       try {
         const identity = self.buildUserIdentityBlock();
+        const userProfile = self.buildUserProfileBlock();
         const recentDialogue = await self.loadRecentDialogue(channel);
         const ambient = self.buildAmbientFactsBlock(text);
 
@@ -328,15 +397,23 @@ export class AgentService implements Service, IAgentService {
 
         for await (const event of self.convOrchestrator.streamTurn(text, {
           userIdentity: identity,
+          userProfile,
           recentDialogue,
           ambientFacts: ambient,
+        }, {
+          scope: scope ?? null,
+          ...(contextKey ? { contextKey } : {}),
+          ...(siteContext ? { siteContext } : {}),
         }, taskListener)) {
           if (event.type === 'text') {
             // Insert a separator so the acknowledgment text doesn't blur into
             // the later verbalization on the client side.
-            const chunk = (fullText && !fullText.endsWith('\n') ? '\n\n' : '') + event.text;
+            const separator = event.newSegment && fullText && !fullText.endsWith('\n') ? '\n\n' : '';
+            const chunk = separator + event.text;
             fullText += chunk;
-            yield { type: 'text', text: chunk };
+            // A segmentEnd-only event has no text; forward the signal so TTS
+            // can speak the finished acknowledgment without waiting.
+            yield { type: 'text', text: chunk, segmentEnd: event.segmentEnd };
           }
           // 'done' is implicit - the generator ends.
         }
@@ -353,8 +430,11 @@ export class AgentService implements Service, IAgentService {
         };
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
+        const code = err && typeof err === 'object'
+          ? (err as { code?: LLMErrorCode }).code
+          : undefined;
         console.error('[AgentService] Conv stream error:', errorMsg);
-        yield { type: 'error', error: errorMsg };
+        yield { type: 'error', error: errorMsg, code };
       }
     })();
 
@@ -392,31 +472,63 @@ export class AgentService implements Service, IAgentService {
     mediaType: string,
     channel: string = 'websocket',
     siteContext?: string,
+    // Takes a scope for the same reason it takes a siteContext: no caller
+    // passes a project-scoped one today (the pebble is its only caller and
+    // carries no projectId), but the day one does, the scope has to ride
+    // with the site block rather than be remembered separately (#571).
+    scope?: TurnToolScope | null,
   ): {
     stream: AsyncIterable<LLMStreamEvent>;
     onComplete: (fullText: string) => Promise<void>;
   } {
-    const systemPrompt = this.buildFullSystemPromptParts(channel, text);
-    if (siteContext) systemPrompt.dynamic += '\n\n' + siteContext;
+    // Same drain gate + in-flight tracking as streamMessage (the pebble image
+    // turn is a real turn — must not start mid-drain or run uncounted).
+    if (activeTurns.isDraining) throw new DrainingError();
+    const endTurn = activeTurns.begin();
+    try {
+      const systemPrompt = this.buildFullSystemPromptParts(channel, text);
+      if (siteContext) systemPrompt.dynamic += '\n\n' + siteContext;
+      if (scope) systemPrompt.dynamic += '\n\n' + scopeSystemNote(scope);
 
-    const content: import('../llm/provider.ts').ContentBlock[] = [
-      { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
-      { type: 'text', text },
-    ];
-    const stream = this.orchestrator.streamMessage(systemPrompt, content);
+      const content: import('../llm/provider.ts').ContentBlock[] = [
+        { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
+        { type: 'text', text },
+      ];
+      // This is the one dialogue path that cannot go through the conv
+      // orchestrator — it has no image route — so it runs the classic
+      // orchestrator directly. Without this, a router-first install pays the
+      // task-tier model for every pebble image turn even though the user is
+      // just talking. Route it at the conv tier when one is configured; in
+      // classic mode there is none and 'medium' stays correct. Nothing records
+      // whether a model accepts images and the conv tier has no fallback
+      // chain, so a text-only conv model falls back to the task tier rather
+      // than dead-ending the turn.
+      const useConvTier = this.llmManager.hasConversationTier();
+      const stream = this.orchestrator.streamMessage(
+        systemPrompt,
+        content,
+        useConvTier ? 'conversation' : 'medium',
+        'chat_orchestrator_image',
+        useConvTier ? 'medium' : undefined,
+        scope ?? null,
+      );
 
-    const onComplete = async (fullText: string): Promise<void> => {
-      await Promise.allSettled([
-        this.extractKnowledge(text, fullText).catch((err) =>
-          console.error('[AgentService] Extraction error:', err instanceof Error ? err.message : err)
-        ),
-        this.learnFromInteraction(text, fullText, channel).catch((err) =>
-          console.error('[AgentService] Learning error:', err instanceof Error ? err.message : err)
-        ),
-      ]);
-    };
+      const onComplete = async (fullText: string): Promise<void> => {
+        await Promise.allSettled([
+          this.extractKnowledge(text, fullText).catch((err) =>
+            console.error('[AgentService] Extraction error:', err instanceof Error ? err.message : err)
+          ),
+          this.learnFromInteraction(text, fullText, channel).catch((err) =>
+            console.error('[AgentService] Learning error:', err instanceof Error ? err.message : err)
+          ),
+        ]);
+      };
 
-    return { stream, onComplete };
+      return { stream: trackTurnStream(stream, endTurn), onComplete };
+    } catch (err) {
+      endTurn();
+      throw err;
+    }
   }
 
   /**
@@ -429,27 +541,109 @@ export class AgentService implements Service, IAgentService {
    *   - Otherwise the classic orchestrator runs (full role prompt, all tools,
    *     ReAct loop on the medium tier).
    */
-  async handleMessage(text: string, channel: string = 'websocket'): Promise<string> {
-    let response: string;
+  async handleMessage(
+    text: string,
+    channel: string = 'websocket',
+    scope?: TurnToolScope | null,
+    // Travels WITH `scope`, always. A scoped turn without it withholds the
+    // generic file tools and then tells the model to "use the site_* tools with
+    // the project's project_id" without ever saying which project -- the
+    // starved turn, reached from the other direction (#571). No caller passes
+    // either today; the pair exists so the first one that does cannot pass one
+    // half.
+    siteContext?: string,
+  ): Promise<string> {
+    // Non-streaming turn entry (external channels, etc). Background reactions go
+    // through BackgroundAgentService.handleMessage, which is gated separately.
+    if (activeTurns.isDraining) throw new DrainingError();
+    const endTurn = activeTurns.begin();
+    try {
+      let response: string;
 
-    if (this.convOrchestrator) {
-      response = await this.handleMessageConv(text, channel);
-    } else {
-      const systemPrompt = this.buildFullSystemPromptParts(channel, text);
-      response = await this.orchestrator.processMessage(systemPrompt, text);
+      if (this.convOrchestrator) {
+        response = await this.handleMessageConv(text, channel, scope, siteContext);
+      } else {
+        const systemPrompt = this.buildFullSystemPromptParts(channel, text);
+        if (siteContext) systemPrompt.dynamic += '\n\n' + siteContext;
+        if (scope) systemPrompt.dynamic += '\n\n' + scopeSystemNote(scope);
+        response = await this.orchestrator.processMessage(systemPrompt, text, undefined, undefined, scope ?? null);
+      }
+
+      // Run extraction and learning in parallel (non-blocking but tracked)
+      Promise.allSettled([
+        this.extractKnowledge(text, response).catch((err) =>
+          console.error('[AgentService] Extraction error:', err instanceof Error ? err.message : err)
+        ),
+        this.learnFromInteraction(text, response, channel).catch((err) =>
+          console.error('[AgentService] Learning error:', err instanceof Error ? err.message : err)
+        ),
+      ]);
+
+      return response;
+    } finally {
+      endTurn();
     }
+  }
 
-    // Run extraction and learning in parallel (non-blocking but tracked)
-    Promise.allSettled([
-      this.extractKnowledge(text, response).catch((err) =>
-        console.error('[AgentService] Extraction error:', err instanceof Error ? err.message : err)
-      ),
-      this.learnFromInteraction(text, response, channel).catch((err) =>
-        console.error('[AgentService] Learning error:', err instanceof Error ? err.message : err)
-      ),
-    ]);
+  /**
+   * A turn in one conversation of its own, for an external channel (#884).
+   *
+   * `handleMessage` reads the channel's history: the conv tier the channel's
+   * most recent conversation, the classic orchestrator the primary agent's
+   * history, which is the one the dashboard chat writes. So every sender on a
+   * channel anyone may message shared the owner's context, and in classic
+   * mode (the default, with no conversation tier) a stranger read the owner's
+   * dashboard conversation. Here the history is exactly `conversationId`'s,
+   * on both paths, and nothing is written to the primary history.
+   *
+   * `contextKey` is the thread's on the conv tier too (#884 review). Tasks
+   * the conv model delegates are matched to the chat that created them by it,
+   * and every caller that passed none was the dashboard's main chat: a
+   * stranger's turn listed the owner's recent task intents and results, and
+   * could resume or cancel the owner's tasks, and the owner's router read the
+   * stranger's results. Required, so a thread cannot fall back to the main
+   * chat's key.
+   *
+   * `learn: false` also skips knowledge extraction and personality learning.
+   * Those write into what EVERY later turn's prompt is built from, so a
+   * stranger's turn would leak into the owner's context and into other
+   * strangers', which separate conversations are meant to prevent.
+   *
+   * The caller has already stored `text` in the conversation; it is passed as
+   * this turn's message and dropped from the history, so it is not sent twice.
+   */
+  async handleThreadMessage(
+    text: string,
+    channel: string,
+    thread: { conversationId: string; contextKey: string; learn: boolean },
+  ): Promise<string> {
+    if (activeTurns.isDraining) throw new DrainingError();
+    const endTurn = activeTurns.begin();
+    try {
+      const history = withoutTrailingTurn(await this.loadDialogue(thread.conversationId), text);
+      let response: string;
+      if (this.convOrchestrator) {
+        response = await this.handleMessageConv(text, channel, null, undefined, history, thread.contextKey);
+      } else {
+        const systemPrompt = this.buildFullSystemPromptParts(channel, text);
+        response = await this.orchestrator.processMessage(systemPrompt, text, undefined, undefined, null, { history });
+      }
 
-    return response;
+      if (thread.learn) {
+        Promise.allSettled([
+          this.extractKnowledge(text, response).catch((err) =>
+            console.error('[AgentService] Extraction error:', err instanceof Error ? err.message : err)
+          ),
+          this.learnFromInteraction(text, response, channel).catch((err) =>
+            console.error('[AgentService] Learning error:', err instanceof Error ? err.message : err)
+          ),
+        ]);
+      }
+
+      return response;
+    } finally {
+      endTurn();
+    }
   }
 
   /**
@@ -457,20 +651,31 @@ export class AgentService implements Service, IAgentService {
    * identity + recent dialogue) and lets the conv LLM decide whether to
    * delegate or answer directly.
    */
-  private async handleMessageConv(text: string, channel: string = 'websocket'): Promise<string> {
+  private async handleMessageConv(
+    text: string,
+    channel: string = 'websocket',
+    scope?: TurnToolScope | null,
+    siteContext?: string,
+    // A conversation's own history (#884); absent reads the channel's.
+    dialogue?: LLMMessage[],
+    // Which chat this is, for matching tasks to it; absent is the main chat.
+    contextKey?: string,
+  ): Promise<string> {
     if (!this.convOrchestrator) {
       // Should be unreachable - caller checks this.convOrchestrator first.
       throw new Error('Conv orchestrator not initialized');
     }
     const identity = this.buildUserIdentityBlock();
-    const recentDialogue = await this.loadRecentDialogue(channel);
+    const recentDialogue = dialogue ?? await this.loadRecentDialogue(channel);
     const result = await this.convOrchestrator.processTurn(
       text,
       {
         userIdentity: identity,
+        userProfile: this.buildUserProfileBlock(),
         recentDialogue,
         ambientFacts: this.buildAmbientFactsBlock(text),
       },
+      { scope: scope ?? null, ...(contextKey ? { contextKey } : {}), ...(siteContext ? { siteContext } : {}) },
       this.convTaskEventListener ?? undefined,
     );
     return result.text;
@@ -483,14 +688,26 @@ export class AgentService implements Service, IAgentService {
    * keeps the conv-tier context budget tight without losing continuity.
    */
   private async loadRecentDialogue(channel: string): Promise<LLMMessage[]> {
+    let conversationId: string;
     try {
       const recent = getRecentConversation(channel);
       if (!recent) return [];
+      conversationId = recent.conversation.id;
+    } catch (err) {
+      console.warn('[AgentService] Failed to load recent dialogue:', err);
+      return [];
+    }
+    return this.loadDialogue(conversationId);
+  }
+
+  /** One conversation's recent dialogue, compacted as `loadRecentDialogue` does. */
+  private async loadDialogue(conversationId: string): Promise<LLMMessage[]> {
+    try {
       // Pull a wider window than we'll inject so the compactor has material
       // to summarize when the conversation is long. The compactor caps the
       // final list size (last 20 verbatim by default; older bucketed into a
       // background-built summary when conversation exceeds 40 messages).
-      const messages = getMessages(recent.conversation.id, { limit: 80 });
+      const messages = getMessages(conversationId, { limit: 80 });
       const dialogue: LLMMessage[] = messages
         .filter(m => m.role === 'user' || m.role === 'assistant')
         .map(m => ({
@@ -499,7 +716,7 @@ export class AgentService implements Service, IAgentService {
         }));
 
       if (!this.dialogueCompactor) return dialogue.slice(-10);
-      return await this.dialogueCompactor.compact(recent.conversation.id, dialogue);
+      return await this.dialogueCompactor.compact(conversationId, dialogue);
     } catch (err) {
       console.warn('[AgentService] Failed to load recent dialogue:', err);
       return [];
@@ -513,6 +730,25 @@ export class AgentService implements Service, IAgentService {
     if (name) parts.push(`Name: ${name}`);
     parts.push(`Local time: ${new Date().toLocaleString()}`);
     return parts.join('. ');
+  }
+
+  /**
+   * Full user profile (wizard answers + interview facts) for the conv LLM,
+   * giving it the same rich context about the user that the classic path
+   * injects via buildPromptContext -> formatUserProfileForPrompt. Rendered
+   * as its own cache-marked system block, so it stays out of the volatile
+   * identity line - keep anything that changes per turn out of here.
+   */
+  private buildUserProfileBlock(): string | undefined {
+    try {
+      const profile = getUserProfile();
+      const profileContext = formatUserProfileForPrompt(profile);
+      if (!profileContext) return undefined;
+      return `# User Profile\n${profileContext}`;
+    } catch (err) {
+      console.warn('[AgentService] Error loading user profile for conv prompt:', err);
+      return undefined;
+    }
   }
 
   /**
@@ -554,9 +790,13 @@ export class AgentService implements Service, IAgentService {
   // --- Private methods ---
 
   private registerProviders(): void {
-    const { llm } = this.config;
+    // Bind through the effective view: hosted tier defaults live only in this
+    // per-bind copy (explicit ref → llm.default → plan alias), never in
+    // config.llm, so they can never leak into a persistence path.
+    const llm = effectiveLlmForBinding(this.config);
     const hasProvider = registerLLMProviders(this.llmManager, llm.providers ?? {}, {
       promptCache: llm.prompt_cache !== false,
+      hostedRestriction: hostedRestrictionLookup(this.config),
     });
 
     if (!hasProvider) {
@@ -592,6 +832,8 @@ export class AgentService implements Service, IAgentService {
         originalMessage,
         signal,
         history,
+        scope,
+        siteContext,
       }) => {
         const baseSystem = this.buildFullSystemPromptParts('conv', originalMessage);
         const templateNote = TaskDispatcher.templatePromptFor(template);
@@ -599,9 +841,24 @@ export class AgentService implements Service, IAgentService {
         // tier sees both the user's verbatim ask AND the conv's framing -
         // but the user's words are the primary signal. Both are per-task
         // volatile, so they ride on the dynamic half of the prompt.
+        //
+        // The site block and the scope notice ride there too, and only here:
+        // this is the tier that holds the tool registry, so it is the one
+        // that needs to be told which project it is working in and which
+        // tools this kind of turn does not have (#571). Keeping both out of
+        // the STATIC half matters - that half is the provider's cache prefix,
+        // and a per-chat variation in it would miss the cache on every
+        // hosted turn.
+        const dynamicParts = [
+          baseSystem.dynamic,
+          templateNote,
+          `Conversation routing note: ${intent}`,
+          ...(siteContext ? [siteContext] : []),
+          ...(scope ? [scopeSystemNote(scope)] : []),
+        ];
         const systemPrompt: SystemPromptParts = {
           static: baseSystem.static,
-          dynamic: `${baseSystem.dynamic}\n\n${templateNote}\n\nConversation routing note: ${intent}`,
+          dynamic: dynamicParts.join('\n\n'),
         };
         const result = await this.orchestrator.processTaskCall({
           systemPrompt,
@@ -610,6 +867,12 @@ export class AgentService implements Service, IAgentService {
           subsystem,
           history: history as import('../llm/provider.ts').LLMMessage[] | undefined,
           signal,
+          scope,
+          // Every template but `write` exists to DO something, so a final
+          // answer that ran no tools is a model that announced its plan and
+          // stopped - push back once rather than storing the announcement as
+          // the result. `write` drafts prose and legitimately needs no tools.
+          requireToolUse: template !== 'write',
         });
         return result;
       };
@@ -755,16 +1018,51 @@ export class AgentService implements Service, IAgentService {
     };
   }
 
+  /**
+   * Whether a host owns the pieces catalog. Resolved from config the daemon
+   * read at boot and memoized: the tool guide it feeds lands in the
+   * prompt-cached static section, so a value that moved between turns would
+   * silently break that cache for no reason.
+   */
+  private piecesManagedCache: boolean | null = null;
+  private piecesManaged(): boolean {
+    this.piecesManagedCache ??= piecesManagedByHost(
+      resolveSharedRuntimePaths(this.config).piecesDir,
+    );
+    return this.piecesManagedCache;
+  }
+
   private buildPromptContext(userMessage?: string, opts?: { slim?: boolean }): PromptContext {
     // Slim mode: voice channels skip the heavyweight context blocks
     // (observations, content pipeline, commitments) so the LLM has
     // hundreds fewer prompt tokens to chew through before first response.
     const slim = opts?.slim === true;
-    // Check if any sidecars are enrolled (cheap DB query, controls tool guide content)
+    // Check if any sidecars are enrolled (cheap DB query, controls tool guide
+    // content) and build the machine inventory the tool guide renders: which
+    // machines exist and what OS each runs. Same source the workflow composer
+    // uses, so chat and composed workflows agree on the target OS instead of
+    // both defaulting to the model's priors. Live connection state is
+    // deliberately left out -- this lands in the prompt-CACHED static section,
+    // and `list_sidecars` is what reports who is online right now.
     let hasSidecars = false;
+    let machines: ToolGuideMachine[] | undefined;
     try {
-      const mgr = getSidecarManager();
-      if (mgr) hasSidecars = mgr.listSidecars().length > 0;
+      // One registry read for both: `collectExecutionTargets` already lists the
+      // enrolled sidecars, and it appends the brain host, so anything that is
+      // not the host answers "are there sidecars".
+      const targets = collectExecutionTargets();
+      hasSidecars = targets.some((t) => !t.isHost);
+      if (targets.length > 0) {
+        machines = targets.map((t) => {
+          const fam = osFamily(t.os);
+          return {
+            name: t.name,
+            os: fam ? familyLabel(fam) : t.os,
+            ...(t.arch ? { arch: t.arch } : {}),
+            ...(t.isHost ? { isHost: true } : {}),
+          };
+        });
+      }
     } catch { /* ignore */ }
 
     const context: PromptContext = {
@@ -772,6 +1070,10 @@ export class AgentService implements Service, IAgentService {
       currentTime: new Date().toISOString(),
       availableSpecialists: this.specialistListText || undefined,
       hasSidecars,
+      ...(machines ? { machines } : {}),
+      // Derived from config, so it is stable turn over turn and safe to sit
+      // in the prompt-CACHED static section alongside hasSidecars.
+      piecesManaged: this.piecesManaged(),
     };
 
     try {
@@ -800,22 +1102,25 @@ export class AgentService implements Service, IAgentService {
         console.error('[AgentService] Error retrieving knowledge:', err);
       }
 
-      // Retrieve webapp-specific browser instructions if message mentions a known app
+      // Inject the compact skill index, skills matching this message first.
+      // Webapp templates are delivered by browsed URL at browse time
+      // (webapp-template-injection.ts), so skills are the only message-time
+      // playbook injection.
       try {
-        const webappInstructions = getWebappInstructionsForMessage(userMessage);
-        if (webappInstructions) {
-          context.webappInstructions = webappInstructions;
+        const skillIndex = buildSkillIndex(userMessage);
+        if (skillIndex) {
+          context.skillIndex = skillIndex;
         }
       } catch (err) {
-        console.error('[AgentService] Error retrieving webapp instructions:', err);
+        console.error('[AgentService] Error building skill index:', err);
       }
     }
 
     // Get due commitments — skipped in slim/voice mode.
     if (!slim) {
       try {
-        const due = getDueCommitments();
-        const upcoming = getUpcoming(5);
+        const due = getDueCommitments({ excludeWorkItems: true });
+        const upcoming = getUpcoming(5, { excludeWorkItems: true });
         const allCommitments = [...due, ...upcoming];
 
         if (allCommitments.length > 0) {
@@ -852,7 +1157,8 @@ export class AgentService implements Service, IAgentService {
       if (observations.length > 0) {
         context.recentObservations = observations.map((o) => {
           const time = new Date(o.created_at).toLocaleTimeString();
-          return `[${time}] ${o.type}: ${JSON.stringify(o.data).slice(0, 200)}`;
+          // Content-free: no OCR text, clipboard body or email snippet in the prompt.
+          return `[${time}] ${describeObservationForPrompt(o)}`;
         });
       }
     } catch (err) {
@@ -888,6 +1194,13 @@ export class AgentService implements Service, IAgentService {
   }
 
   private async extractKnowledge(userMessage: string, assistantResponse: string): Promise<void> {
+    // Follow-up work, not a new turn: it re-sends text the turn already sent,
+    // and tagging it as the person's own would count those words twice
+    // (src/llm/origin.ts).
+    return runWithOrigin('background', () => this.extractKnowledgeFromTurn(userMessage, assistantResponse));
+  }
+
+  private async extractKnowledgeFromTurn(userMessage: string, assistantResponse: string): Promise<void> {
     // The extractor uses the `low` tier internally - it's structured
     // extraction work that doesn't need the conversation model's smarts.
     await extractAndStore(userMessage, assistantResponse, this.llmManager);
@@ -915,4 +1228,14 @@ export class AgentService implements Service, IAgentService {
     savePersonality(personality);
     this.personality = personality;
   }
+}
+
+/**
+ * The dialogue without its last entry when that entry is this turn's own
+ * message, already stored by the caller: both orchestrators append the turn's
+ * message themselves (#884).
+ */
+export function withoutTrailingTurn(dialogue: LLMMessage[], text: string): LLMMessage[] {
+  const last = dialogue[dialogue.length - 1];
+  return last && last.role === 'user' && last.content === text ? dialogue.slice(0, -1) : dialogue;
 }

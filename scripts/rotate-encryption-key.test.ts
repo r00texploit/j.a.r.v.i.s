@@ -7,6 +7,8 @@
  *   - The keychain file is replaced atomically (no leftover `.new`).
  *   - Refuses to run when JARVIS_WORKFLOW_ENCRYPTION_KEY is set.
  *   - Refuses to run when a `.new` sidecar exists (crash-recovery branch).
+ *   - A row-bound `enc1a:` row stays row-bound under the new key: rotation
+ *     must never quietly re-wrap it as unbound `enc1:`.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -23,9 +25,13 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { decryptJson, encryptJson, setEncryptionKey } from "../src/workflows/db/encryption";
+import {
+  decryptBoundJson, decryptJson, encryptBoundJson, encryptJson, isRowBound, setEncryptionKey,
+  type CredentialRowBinding,
+} from "../src/workflows/db/encryption";
 import { initWorkflowDb, closeWorkflowDb } from "../src/workflows/db/index";
 import { createSchema } from "../src/workflows/db/schema";
+import { workflowKeyCheck } from "../src/util/model-exec-marker";
 
 const SCRIPT = resolve(import.meta.dir, "rotate-encryption-key.ts");
 
@@ -33,6 +39,22 @@ let dataDir: string;
 let keyFile: string;
 let dbPath: string;
 let originalKey: Buffer;
+
+/** Identity of the seeded row-bound connection. */
+const BOUND: CredentialRowBinding = {
+  id: "conn_c", projectId: "jrv_proj_default", pieceName: "piece", externalId: "conn_c",
+};
+
+// Explicit budget: this hook builds a real schema'd SQLite DB and writes two
+// encrypted rows. That is ~140ms on a dev box, but it timed out CI against
+// bun's 5s default on a loaded shared runner. The work is fast; it just needs
+// headroom when the runner is throttled.
+const HOOK_TIMEOUT_MS = 30_000;
+
+// Same reasoning for the tests themselves: every one of them shells out to
+// `bun run scripts/rotate-encryption-key.ts`, and a cold subprocess start plus
+// a full rotation does not reliably fit in bun's 5s default on a loaded runner.
+const TEST_TIMEOUT_MS = 30_000;
 
 beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), "jarvis-rotate-"));
@@ -52,9 +74,11 @@ beforeEach(() => {
   const db = getWorkflowDb();
   const now = Date.now();
   // Minimal columns -- everything required by NOT NULL + the value column we'll rotate.
-  for (const { id, value } of [
-    { id: "conn_a", value: { access_token: "secret-a", refresh_token: "rt-a" } },
-    { id: "conn_b", value: { api_key: "secret-b" } },
+  for (const { id, value, stored } of [
+    { id: "conn_a", value: { access_token: "secret-a", refresh_token: "rt-a" }, stored: encryptJson },
+    { id: "conn_b", value: { api_key: "secret-b" }, stored: encryptJson },
+    // Row-bound, i.e. what every row looks like after the binding conversion.
+    { id: BOUND.id, value: { api_key: "secret-c" }, stored: (v: unknown) => encryptBoundJson(v, BOUND) },
   ]) {
     db.run(
       `INSERT INTO app_connection (
@@ -62,19 +86,19 @@ beforeEach(() => {
         project_id, owner_id, value, metadata, pre_select_for_new_projects, created, updated
       ) VALUES (?, ?, ?, ?, 'PROJECT', 'ACTIVE', 'piece', '0.0.0',
         'jrv_proj_default', NULL, ?, NULL, 0, ?, ?)`,
-      [id, id, `name-${id}`, "OAUTH2", encryptJson(value), now, now],
+      [id, id, `name-${id}`, "OAUTH2", stored(value), now, now],
     );
   }
   closeWorkflowDb();
   // Reset in-memory key state so the spawned script doesn't inherit it.
   setEncryptionKey(null);
-});
+}, HOOK_TIMEOUT_MS);
 
 afterEach(() => {
   closeWorkflowDb();
   setEncryptionKey(null);
   rmSync(dataDir, { recursive: true, force: true });
-});
+}, HOOK_TIMEOUT_MS);
 
 function runScript(opts: {
   env?: Record<string, string | undefined>;
@@ -95,6 +119,10 @@ function runScript(opts: {
   // unless the test explicitly wants it set.
   if (!opts.env || !("JARVIS_WORKFLOW_ENCRYPTION_KEY" in opts.env)) {
     delete env["JARVIS_WORKFLOW_ENCRYPTION_KEY"];
+  }
+  // Likewise #514's flag, which a suite run from the assistant's shell inherits.
+  if (!opts.env || !("JARVIS_MODEL_EXEC_ENV_KEY" in opts.env)) {
+    delete env["JARVIS_MODEL_EXEC_ENV_KEY"];
   }
   const allowDaemon = opts.allowDaemon ?? false;
   const args = ["run", SCRIPT, "--data-dir", dataDir, "--key-file", keyFile, "--db", dbPath];
@@ -138,7 +166,7 @@ describe("rotate-encryption-key", () => {
       .get() as { value: string };
     expect(() => decryptJson(row.value, "conn_a")).toThrow();
     db2.close();
-  });
+  }, TEST_TIMEOUT_MS);
 
   test("refuses to run when a daemon currently holds the pid lock for the same data dir", async () => {
     // Acquire a flock at the *test data dir's* pid path -- that's what the
@@ -158,7 +186,7 @@ describe("rotate-encryption-key", () => {
     } finally {
       handle.release();
     }
-  });
+  }, TEST_TIMEOUT_MS);
 
   test("--allow-running-daemon bypasses the lock check", async () => {
     const { acquireLockAt, lockPathFor } = await import("../src/daemon/pid");
@@ -171,7 +199,7 @@ describe("rotate-encryption-key", () => {
     } finally {
       handle.release();
     }
-  });
+  }, TEST_TIMEOUT_MS);
 
   test("ignores a daemon holding the default lock when --data-dir points elsewhere", async () => {
     // Regression: previously the script called isLocked() without honoring
@@ -184,7 +212,7 @@ describe("rotate-encryption-key", () => {
     const res = runScript({ allowDaemon: false });
     expect(res.status).toBe(0);
     expect(res.stderr).not.toMatch(/Daemon is running/);
-  });
+  }, TEST_TIMEOUT_MS);
 
   test("refuses to run when JARVIS_WORKFLOW_ENCRYPTION_KEY is set", () => {
     const res = runScript({
@@ -194,7 +222,20 @@ describe("rotate-encryption-key", () => {
     expect(res.stderr).toMatch(/JARVIS_WORKFLOW_ENCRYPTION_KEY/);
     // Keychain unchanged.
     expect(readFileSync(keyFile, "utf8").trim()).toBe(originalKey.toString("hex"));
-  });
+  }, TEST_TIMEOUT_MS);
+
+  // #514: from the assistant's shell the env key is stripped, but the flag
+  // says the daemon had one. Rotating the file key there would re-encrypt
+  // every row under a key the user's own daemon does not use.
+  test("refuses to run from the assistant's shell of an env-key daemon", () => {
+    const res = runScript({
+      env: { JARVIS_MODEL_EXEC_ENV_KEY: workflowKeyCheck(originalKey.toString("hex")) },
+      allowDaemon: true,
+    });
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/JARVIS_MODEL_EXEC_ENV_KEY is set/);
+    expect(readFileSync(keyFile, "utf8").trim()).toBe(originalKey.toString("hex"));
+  }, TEST_TIMEOUT_MS);
 
   test("refuses to run when a `.new` sidecar already exists", () => {
     writeFileSync(`${keyFile}.new`, randomBytes(32).toString("hex") + "\n");
@@ -203,12 +244,33 @@ describe("rotate-encryption-key", () => {
     expect(res.stderr).toMatch(/sidecar/i);
     // Keychain unchanged.
     expect(readFileSync(keyFile, "utf8").trim()).toBe(originalKey.toString("hex"));
-  });
+  }, TEST_TIMEOUT_MS);
 
   test("noop when no keychain exists", () => {
     rmSync(keyFile);
     const res = runScript();
     expect(res.status).toBe(0);
     expect(res.stderr).toMatch(/nothing to rotate/i);
-  });
+  }, TEST_TIMEOUT_MS);
+
+  test("rotation preserves each row's envelope instead of dropping the row binding", () => {
+    expect(runScript().status).toBe(0);
+    const newKey = Buffer.from(readFileSync(keyFile, "utf8").trim(), "hex");
+    setEncryptionKey(newKey);
+    const db = new Database(dbPath);
+    try {
+      const rows = db.prepare("SELECT id, value FROM app_connection ORDER BY id").all() as Array<{
+        id: string; value: string;
+      }>;
+      // enc1: rows stay enc1:, the enc1a: row stays enc1a:.
+      expect(rows.map(row => isRowBound(row.value))).toEqual([false, false, true]);
+      const bound = rows[2]!.value;
+      expect(decryptBoundJson(bound, BOUND)).toEqual({ api_key: "secret-c" });
+      // Still refuses to open under any other row identity, which is the
+      // property a re-wrap as enc1: would have silently destroyed.
+      expect(() => decryptBoundJson(bound, { ...BOUND, id: "conn_a" })).toThrow(/auth verification failed/);
+    } finally {
+      db.close();
+    }
+  }, TEST_TIMEOUT_MS);
 });

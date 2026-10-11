@@ -25,13 +25,26 @@ const (
 )
 
 // AwarenessConfig controls screen and window observer behavior.
+//
+// The tunables carry `omitempty` so SaveConfig can leave a value out of the
+// file entirely when it still matches the built-in default — see
+// sparseForSave in config.go for why that matters. In memory these fields are
+// always the effective values; only the on-disk form is sparse.
+//
+// OCREnabled is deliberately NOT omitempty: it defaults to true, and a false
+// with omitempty is indistinguishable from an absent key, so "OCR off" would
+// silently turn itself back on at the next load.
 type AwarenessConfig struct {
-	ScreenIntervalMs   int     `yaml:"screen_interval_ms"`
-	WindowIntervalMs   int     `yaml:"window_interval_ms"`
-	MinChangeThreshold float64 `yaml:"min_change_threshold"`
-	StuckThresholdMs   int     `yaml:"stuck_threshold_ms"`
+	ScreenIntervalMs   int     `yaml:"screen_interval_ms,omitempty"`
+	WindowIntervalMs   int     `yaml:"window_interval_ms,omitempty"`
+	MinChangeThreshold float64 `yaml:"min_change_threshold,omitempty"`
+	StuckThresholdMs   int     `yaml:"stuck_threshold_ms,omitempty"`
 	OCREnabled         bool    `yaml:"ocr_enabled"`
-	CaptureDir         string  `yaml:"capture_dir"`
+	CaptureDir         string  `yaml:"capture_dir,omitempty"`
+	// CaptureTTLHours is how long screenshots stay on this machine before the
+	// sidecar deletes them itself. The brain also cleans when connected; this
+	// is the floor that applies when it is not. Negative disables the sweep.
+	CaptureTTLHours int `yaml:"capture_ttl_hours,omitempty"`
 }
 
 // SidecarTokenClaims is the JWT payload from the brain.
@@ -100,7 +113,10 @@ type SidecarRegistration struct {
 	// Version is the sidecar's own semver (sidecarVersion, "dev" for unstamped
 	// local builds). The brain classifies it against its MIN/RECOMMENDED floors
 	// to accept / suggest-update / hard-block on register.
-	Version                 string                  `json:"version"`
+	Version string `json:"version"`
+	// Features lists optional protocol features this sidecar supports
+	// (update_prompt, update_apply; see updater.go). Older brains ignore it.
+	Features                []string                `json:"features,omitempty"`
 	Capabilities            []SidecarCapability     `json:"capabilities"`
 	UnavailableCapabilities []UnavailableCapability `json:"unavailable_capabilities,omitempty"`
 	// Timezone is the machine's IANA zone (e.g. "Europe/Rome"), best-effort
@@ -119,8 +135,12 @@ type SidecarCapabilitiesUpdate struct {
 
 // SidecarConfig is the YAML config file structure.
 type SidecarConfig struct {
-	Token string `yaml:"token"`
-	Brain string `yaml:"brain"`
+	// ConfigVersion records which one-time migrations this file has already
+	// been through (see supersededDefaults in config.go). Absent means the
+	// file predates versioning and every migration still applies to it.
+	ConfigVersion int    `yaml:"config_version,omitempty"`
+	Token         string `yaml:"token"`
+	Brain         string `yaml:"brain"`
 	// HostedBaseURL overrides the usejarvis connect origin for the first-run
 	// handshake. Honored ONLY in `-tags jarvisdebug` builds (see hosted.go);
 	// release binaries always use the production origin.
@@ -132,6 +152,15 @@ type SidecarConfig struct {
 	Awareness     AwarenessConfig     `yaml:"awareness"`
 	Preferences   PreferencesConfig   `yaml:"preferences"`
 	Telemetry     TelemetryConfig     `yaml:"telemetry"`
+	Update        UpdateConfig        `yaml:"update,omitempty"`
+}
+
+// UpdateConfig holds the self-update choices the user made.
+type UpdateConfig struct {
+	// SkippedVersion is the update the user chose "Skip this version" for: the
+	// startup prompt stays quiet about it (the tray and dashboard still offer
+	// it). A newer version prompts again.
+	SkippedVersion string `yaml:"skipped_version,omitempty"`
 }
 
 // TelemetryConfig controls anonymous sidecar usage metrics. Independent of the
@@ -150,6 +179,12 @@ type TelemetryConfig struct {
 type PreferencesConfig struct {
 	// General
 	StartAtStartup bool `yaml:"start_at_startup"` // register the sidecar to launch on login
+	// OpenDashboardAtStartup opens the dashboard window on every sidecar
+	// startup (once the brain connection is up, since the panel needs a
+	// minted access token). Off by default: normally only the pebble appears.
+	// A plain bool is right here — false IS the default, so a config file
+	// written before this key existed reads correctly as off.
+	OpenDashboardAtStartup bool `yaml:"open_dashboard_at_startup"`
 	// Style
 	EtherealPebble      bool `yaml:"ethereal_pebble"`       // fade the pebble out while idle, pop it back on activity
 	EtherealIdleSeconds int  `yaml:"ethereal_idle_seconds"` // idle time before the pebble fades out (default 5)
@@ -158,18 +193,24 @@ type PreferencesConfig struct {
 type TerminalConfig struct {
 	BlockedCommands []string `yaml:"blocked_commands"`
 	DefaultShell    string   `yaml:"default_shell"`
-	TimeoutMs       int      `yaml:"timeout_ms"`
+	TimeoutMs       int      `yaml:"timeout_ms,omitempty"`
 }
 
 type FilesystemConfig struct {
 	BlockedPaths  []string `yaml:"blocked_paths"`
-	MaxFileSizeKB int      `yaml:"max_file_size_kb"`
+	MaxFileSizeKB int      `yaml:"max_file_size_kb,omitempty"`
 }
 
 type BrowserConfig struct {
 	// ExecutablePath optionally pins the Chromium-based browser to drive. When
-	// empty the sidecar auto-detects one (the OS default browser if it is
-	// Chromium-based, otherwise a known install: Chrome, Edge, Brave, ...).
+	// empty the sidecar auto-detects one: on Linux and Windows the OS default
+	// browser if it is Chromium-based, then a known install on every platform
+	// (Chrome, Chromium, Edge, Brave, Vivaldi, plus Opera on Linux/Windows and
+	// Arc as a last resort on macOS). macOS has no default-browser stage.
+	//
+	// Set this for anything not on that list, or to override the pick: it is
+	// tried first and accepts any Chromium build that speaks
+	// --remote-debugging-pipe.
 	ExecutablePath string `yaml:"executable_path"`
 	// ProfileDir is the dedicated user-data dir for Jarvis's automation browser
 	// (kept separate from the user's own profile). Defaults to a temp dir.
@@ -177,7 +218,7 @@ type BrowserConfig struct {
 	// CDPPort is retained for backward-compatible config files but is no longer
 	// used: the sidecar drives the browser over an inherited CDP pipe
 	// (--remote-debugging-pipe), not a TCP port.
-	CDPPort int `yaml:"cdp_port"`
+	CDPPort int `yaml:"cdp_port,omitempty"`
 }
 
 // RPCResult is returned by handlers.

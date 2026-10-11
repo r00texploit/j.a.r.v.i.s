@@ -21,8 +21,8 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { resolve } from "node:path";
-import type { EngineContract } from "../../sandbox-api/contracts";
+import { isAbsolute, resolve } from "node:path";
+import type { EngineContract, EngineResponse } from "../../sandbox-api/contracts";
 import type { SandboxApi } from "../../sandbox-api/server";
 import { SandboxRegistry } from "../../sandbox-api/sandbox-registry";
 import { workflowLogsBase } from "../../sandbox-api/config";
@@ -30,9 +30,11 @@ import { spawnEngine, type SpawnedEngine, type SpawnEngineOptions } from "./spaw
 import { ENGINE_BUILD_PATHS } from "./build";
 import { materializeCodeActions } from "./code-materialize";
 import {
+  ackTimeoutMsForOperation,
   buildExecuteFlowOperation,
   buildExecuteTriggerHookOperation,
   buildExtractPieceMetadataOperation,
+  type EngineOperationEnvelope,
   type ExecuteFlowOptions,
   type ExecuteTriggerHookOptions,
   type TriggerHookType,
@@ -48,6 +50,14 @@ export interface EngineRuntimeOptions {
   api: SandboxApi;
   /** Absolute path to the built engine bundle (`main.js`). */
   bundlePath: string;
+  /**
+   * sha256 the bundle's bytes must still have at every spawn -- the
+   * `EngineBundle.digest` the lookup or build returned -- or `null` when
+   * nothing verified them (an adopted per-user bundle, a test fixture).
+   * REQUIRED so that dropping it is a type error: a verified bundle reaching
+   * spawn without its digest would be spawned unchecked (#762).
+   */
+  expectedDigest: string | null;
   /**
    * When true, `release()` returns the engine to a single-slot warm pool
    * instead of killing it. The next `acquire()` reuses the same process,
@@ -77,7 +87,19 @@ export interface EngineRuntimeOptions {
   customPiecesPaths?: string[];
   /** CSV of dev-piece names exposed via AP_DEV_PIECES. Default: jarvis pieces. */
   devPieces?: string[];
-  /** Engine WS handshake deadline. Default 10s. */
+  /**
+   * Engine WS handshake deadline. Default 30s, overridable per-deployment
+   * via `JARVIS_ENGINE_HANDSHAKE_TIMEOUT_MS`.
+   *
+   * The handshake is ~200ms on an idle machine, but the budget has to cover
+   * the worst case, not the median: a small/loaded VPS that is swapping while
+   * the daemon streams audio and runs LLM calls can take several seconds just
+   * to exec Bun and parse the ~2MB bundle. Blowing the deadline is not a
+   * degraded run -- the acquire throws, so ON_ENABLE never registers the
+   * trigger and RUN_FLOW jobs fail outright. A too-generous deadline only
+   * costs latency on a genuinely broken engine, and that case now fails fast
+   * on process exit anyway (see `spawnFresh`).
+   */
   handshakeTimeoutMs?: number;
   /** Graceful kill deadline before SIGKILL. Default 2s. */
   killGraceMs?: number;
@@ -89,10 +111,16 @@ export interface EngineRuntimeOptions {
    * Bun subprocess. Pass 0 (or undefined with pool=false) to disable.
    */
   poolIdleTtlMs?: number;
-  /** Override extra env for the spawned engine -- mostly for tests. */
-  spawnEnvOverride?: Record<string, string | undefined>;
   /** Override the runtime binary (default: process.execPath). */
   runtime?: string;
+  /**
+   * BUILD TIME ONLY: let a pinned engine write the transpiler cache that
+   * BUN_RUNTIME_TRANSPILER_CACHE_PATH names, though it is not a root-owned read-only directory.
+   * For scripts/build-shared-runtime.ts, which warms the cache a host then
+   * serves read-only. A tenant-facing runtime never sets it (#835; see
+   * `engineTranspilerCache` in spawn.ts).
+   */
+  warmTranspilerCache?: boolean;
 }
 
 export interface AcquireOptions {
@@ -140,6 +168,23 @@ export class EngineHandle {
    */
   private readonly releaseImpl: () => Promise<void>;
 
+  /**
+   * Number of `executeOperation` calls currently awaiting an engine reply.
+   * A handle with work in flight must never be parked in the warm pool --
+   * the next acquire would rebind the sandbox to a different run while the
+   * engine is still executing the previous one.
+   */
+  private inFlight = 0;
+  /**
+   * Set when an `executeOperation` call fails at the transport level (ack
+   * timeout, socket error). At that point the engine's state is unknown:
+   * there is no cancel message in EngineContract, so it is most likely
+   * still executing the abandoned operation. Such an engine is destroyed on
+   * release rather than reused.
+   */
+  private abandoned = false;
+  private terminating: Promise<void> | undefined;
+
   constructor(
     public readonly sandboxId: string,
     public readonly runId: string,
@@ -170,6 +215,75 @@ export class EngineHandle {
   }
 
   /**
+   * True once an operation on this handle failed at the transport level.
+   * Exposed for tests and for callers that want to log why an engine was
+   * destroyed instead of pooled.
+   */
+  get isAbandoned(): boolean {
+    return this.abandoned;
+  }
+
+  /**
+   * The RPC client for THIS sandbox as of right now, rather than the one
+   * captured when the handle was built.
+   *
+   * `engineClient` is bound to a single socket.io connection. If that
+   * connection drops, worker-rpc deletes it and a reconnecting engine gets a
+   * NEW client stored under the same sandbox id -- which a handle holding the
+   * old one never sees. It would then emit into a dead socket and wait out the
+   * full ack deadline on every subsequent operation, while the engine sat
+   * there healthy and idle. Measured before this existed: after a forced
+   * disconnect the handle simply never got another reply.
+   *
+   * Re-resolving per send makes a reconnect self-healing for the NEXT
+   * operation, and makes an absent connection fail in milliseconds instead of
+   * ninety seconds. It cannot rescue an operation already in flight when the
+   * socket dropped: socket.io leaves that ack pending, so it still waits out
+   * its own deadline.
+   */
+  private liveEngineClient(): EngineContract {
+    try {
+      return this.api.workerRpc.engineClient(this.sandboxId);
+    } catch {
+      // No live connection. Throwing here rather than emitting into a dead
+      // socket is the whole point; `send()`'s catch marks the handle abandoned,
+      // so `release()` destroys the engine instead of parking it for the next
+      // caller. Note this covers "disconnected" AND "has not finished
+      // reconnecting", which are indistinguishable from here -- the operation
+      // was never sent either way.
+      throw new Error(
+        `no live connection for sandbox ${this.sandboxId}; the engine disconnected and has not reconnected`,
+      );
+    }
+  }
+
+  /**
+   * Send one operation to the engine, bounding the wait by the budget we
+   * told the engine to honour rather than by the RPC client's default.
+   *
+   * The engine does not enforce `timeoutInSeconds` itself (upstream relies
+   * on its worker killing the sandbox), so this deadline is the only thing
+   * bounding a hung piece -- which is exactly why exceeding it marks the
+   * engine abandoned and gets it destroyed on release.
+   */
+  private async send(operation: EngineOperationEnvelope): Promise<EngineResponse<unknown>> {
+    if (this.terminating) throw new Error(`sandbox ${this.sandboxId} is terminating`);
+    this.inFlight++;
+    try {
+      return await this.liveEngineClient().executeOperation(operation, {
+        timeoutMs: ackTimeoutMsForOperation(operation),
+      });
+    } catch (e) {
+      // Transport-level failure: we stopped waiting, the engine did not stop
+      // working. Never reuse this process.
+      this.abandoned = true;
+      throw e;
+    } finally {
+      this.inFlight--;
+    }
+  }
+
+  /**
    * Run a flow end-to-end through this engine: materialize CODE-action source
    * to disk, send EXECUTE_FLOW, wait for the engine's flow-executor to settle.
    *
@@ -188,7 +302,7 @@ export class EngineHandle {
     const upstream = isUpstreamFlowVersion(opts.flowVersion)
       ? opts.flowVersion
       : toUpstreamFlowVersion(opts.flowVersion);
-    materializeCodeActions(upstream, this.baseCodeDir);
+    await materializeCodeActions(upstream, this.baseCodeDir);
 
     const baseExecuteFlowOptions: ExecuteFlowOptions = {
       flowVersion: upstream,
@@ -217,7 +331,16 @@ export class EngineHandle {
     if (opts.executionState !== undefined) baseExecuteFlowOptions.executionState = opts.executionState;
 
     const operation = buildExecuteFlowOperation(baseExecuteFlowOptions);
-    await this.engineClient.executeOperation(operation);
+    const reply = await this.send(operation);
+    // A non-OK status means the engine bailed out of the operation itself --
+    // it threw before (or instead of) recording the failure on the run. It
+    // never uploads a terminal run log in that case, so swallowing this
+    // status leaves the caller polling a row that will never settle. Upstream
+    // attaches the inspected error; surface it verbatim.
+    if (reply.status !== "OK") {
+      const detail = typeof reply.error === "string" && reply.error.length > 0 ? `: ${reply.error}` : "";
+      throw new Error(`executeFlow(run ${this.runId}) -> ${reply.status}${detail}`);
+    }
 
     const run = getFlowRun(this.runId);
     if (!run) throw new Error(`flow_run ${this.runId} disappeared after executeFlow`);
@@ -275,9 +398,10 @@ export class EngineHandle {
     if (opts.timeoutInSeconds !== undefined) merged.timeoutInSeconds = opts.timeoutInSeconds;
 
     const op = buildExecuteTriggerHookOperation(merged);
-    const reply = await this.engineClient.executeOperation(op);
+    const reply = await this.send(op);
     if (reply.status !== "OK") {
-      throw new Error(`executeTriggerHook(${hookType}) -> ${reply.status}`);
+      const detail = typeof reply.error === "string" && reply.error.length > 0 ? `: ${reply.error}` : "";
+      throw new Error(`executeTriggerHook(${hookType}) -> ${reply.status}${detail}`);
     }
     return reply.response;
   }
@@ -313,10 +437,11 @@ export class EngineHandle {
       baseOpts.timeoutInSeconds = opts.timeoutInSeconds;
     }
     const op = buildExtractPieceMetadataOperation(baseOpts);
-    const reply = await this.engineClient.executeOperation(op);
+    const reply = await this.send(op);
     if (reply.status !== "OK") {
+      const detail = typeof reply.error === "string" && reply.error.length > 0 ? `: ${reply.error}` : "";
       throw new Error(
-        `extractPieceMetadata(${opts.pieceName}@${opts.pieceVersion}) -> ${reply.status}`,
+        `extractPieceMetadata(${opts.pieceName}@${opts.pieceVersion}) -> ${reply.status}${detail}`,
       );
     }
     return reply.response as import("../../runtime/piece-catalog").RawPieceMetadata;
@@ -327,8 +452,20 @@ export class EngineHandle {
    * sandbox in the registry so subsequent calls from a zombie engine are
    * rejected. When the runtime is pooled, the runtime supplies a different
    * strategy that returns the engine to the idle slot.
+   *
+   * The pooled strategy is bypassed when this handle abandoned an operation
+   * or still has one in flight. Parking such an engine is what turns one
+   * slow flow into a cascade: the next acquire rebinds the sandbox to a new
+   * run, so the still-running operation's `uploadRunLog` is dropped by the
+   * runId guard (its run hangs in RUNNING forever) and a retry re-issues the
+   * same flow into a process already executing it -- duplicating whatever
+   * side effects the flow performs.
    */
   async release(): Promise<void> {
+    if (this.terminating) return this.terminating;
+    if (this.abandoned || this.inFlight > 0) {
+      return this.killAndTerminate();
+    }
     return this.releaseImpl();
   }
 
@@ -336,7 +473,17 @@ export class EngineHandle {
    * The default kill-and-terminate strategy, exposed so the runtime's pool
    * code can call it for forced shutdown of an idle engine.
    */
-  async killAndTerminate(): Promise<void> {
+  killAndTerminate(): Promise<void> {
+    // Revoke the sandbox before waiting for process exit. Existing daemon
+    // effect callbacks may still finish and save their receipts.
+    if (!this.terminating) {
+      this.registry.terminate(this.sandboxId);
+      this.terminating = this.terminateProcess();
+    }
+    return this.terminating;
+  }
+
+  private async terminateProcess(): Promise<void> {
     this.proc.kill("SIGTERM");
     const settled = await Promise.race([
       this.proc.exited.then(() => "exited" as const),
@@ -350,7 +497,6 @@ export class EngineHandle {
         new Promise<void>((res) => setTimeout(res, 500)),
       ]);
     }
-    this.registry.terminate(this.sandboxId);
   }
 
   /** Internal: pool reuse needs the spawned engine + RPC client; expose to runtime only. */
@@ -403,14 +549,41 @@ function discoverJarvisDevPieces(): string[] {
   return out;
 }
 
+/** Handshake latency past which we tell the operator the host is the problem. */
+const SLOW_HANDSHAKE_WARN_MS = 5_000;
+
+/** How many engine stderr lines to retain for failure diagnostics. */
+const ENGINE_STDERR_TAIL_LINES = 5;
+
+/**
+ * Per-deployment handshake budget. Hosted installs on small VPSes need a
+ * bigger one than a dev laptop; this is the escape hatch that avoids a
+ * redeploy. Invalid / non-positive values are ignored so a typo can't
+ * silently disable the deadline.
+ */
+function envHandshakeTimeoutMs(): number | undefined {
+  const raw = process.env["JARVIS_ENGINE_HANDSHAKE_TIMEOUT_MS"]?.trim();
+  if (!raw) return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.warn(
+      `[engine-runtime] ignoring invalid JARVIS_ENGINE_HANDSHAKE_TIMEOUT_MS="${raw}"`,
+    );
+    return undefined;
+  }
+  return parsed;
+}
+
 export class EngineRuntime {
   private readonly api: SandboxApi;
   private readonly bundlePath: string;
+  /** Fixed at construction: a later resolution elsewhere cannot change it (#762). */
+  private readonly expectedDigest: string | null;
+  private readonly warmTranspilerCache: boolean;
   private readonly baseCodeDir: string;
   private readonly customPiecesPaths: string[];
   private readonly handshakeTimeoutMs: number;
   private readonly killGraceMs: number;
-  private readonly spawnEnvOverride: Record<string, string | undefined> | undefined;
   private readonly runtime: string | undefined;
   private readonly cwd: string;
   private readonly devPieces: string[];
@@ -429,10 +602,41 @@ export class EngineRuntime {
    * `.unref()`-ed so the timer alone doesn't keep the daemon alive.
    */
   private idleEvictionTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Every engine THIS runtime spawned and has not yet seen exit -- parked,
+   * acquired, or mid-handshake. `shutdown()` reclaims all of them.
+   *
+   * Before this existed, `shutdown()` only reclaimed the ONE engine parked in
+   * the warm slot, so an engine that was still acquired when its owner shut
+   * down (a test whose assertion threw between `acquire()` and `release()`, a
+   * daemon shutting down under a running flow) simply carried on. That is the
+   * "no parent, no consumer" process #491 found still alive 82 minutes later.
+   * Entries drop themselves when the process exits, so this never grows.
+   */
+  private readonly spawned = new Set<{ sandboxId: string; proc: SpawnedEngine }>();
+  /**
+   * Set by `shutdown()`. Without it, an `acquire()` already past its
+   * `await signer.mint()` when shutdown ran would spawn an engine that
+   * shutdown had already decided which processes to kill -- and nothing in
+   * this runtime would ever come back for it. That engine is precisely the
+   * "no parent, no consumer" process #491 is about, so once a runtime is
+   * shut down it spawns nothing and parks nothing.
+   */
+  private closed = false;
 
   constructor(opts: EngineRuntimeOptions) {
     this.api = opts.api;
     this.bundlePath = opts.bundlePath;
+    // Fail at construction, not at the first spawn minutes later: a caller the
+    // type system cannot see that left the digest out is a wiring bug (#762).
+    if (!isAbsolute(opts.bundlePath)) {
+      throw new TypeError("EngineRuntime: bundlePath must be absolute, or the bytes checked are not the bytes run");
+    }
+    if (opts.expectedDigest === undefined) {
+      throw new TypeError("EngineRuntime: expectedDigest is required -- the bundle's verified sha256, or null if nothing verified it");
+    }
+    this.expectedDigest = opts.expectedDigest;
+    this.warmTranspilerCache = opts.warmTranspilerCache === true;
     this.poolEnabled = opts.pool ?? false;
     // 5 minutes by default. The engine cold-spawn is ~3s, so an idle TTL
     // shorter than the gap between cron fires defeats the pool's purpose;
@@ -445,9 +649,9 @@ export class EngineRuntime {
       opts.customPiecesPaths ?? [
         resolve(ENGINE_BUILD_PATHS.VENDOR_PACKAGES, "pieces"),
       ];
-    this.handshakeTimeoutMs = opts.handshakeTimeoutMs ?? 10_000;
+    this.handshakeTimeoutMs =
+      opts.handshakeTimeoutMs ?? envHandshakeTimeoutMs() ?? 30_000;
     this.killGraceMs = opts.killGraceMs ?? 2_000;
-    this.spawnEnvOverride = opts.spawnEnvOverride;
     this.runtime = opts.runtime;
     // Default to the vendored activepieces dir so dev-pieces resolution finds
     // packages/pieces/jarvis/*/dist/package.json without further env setup.
@@ -470,6 +674,12 @@ export class EngineRuntime {
   }
 
   async acquire(opts: AcquireOptions): Promise<EngineHandle> {
+    if (this.closed) {
+      throw new Error(
+        "EngineRuntime.acquire after shutdown(): this runtime no longer reclaims " +
+          "anything it spawns. Build a new EngineRuntime instead.",
+      );
+    }
     // Warm path: reuse the idle engine if pooling is on and one is parked.
     // Mint a fresh engineToken bound to the new (runId, projectId) and
     // rebind the registry sandbox; the engine's own SANDBOX_ID env was
@@ -542,16 +752,44 @@ export class EngineRuntime {
 
     const spawnOptions: SpawnEngineOptions = {
       bundlePath: this.bundlePath,
+      expectedDigest: this.expectedDigest,
       sandboxId,
       sandboxWsPort: this.api.sandboxWsPort,
       baseCodeDir: this.baseCodeDir,
       customPiecesPaths: this.customPiecesPaths,
       devPieces: this.devPieces,
       cwd: this.cwd,
-      env: this.spawnEnvOverride,
+      // Keep the engine's own post-SIGTERM flush window inside the deadline
+      // we SIGKILL it on, so the two can't drift apart (see spawn.ts).
+      ownerKillGraceMs: this.killGraceMs,
     };
     if (this.runtime !== undefined) spawnOptions.runtime = this.runtime;
-    const proc = spawnEngine(spawnOptions);
+    if (this.warmTranspilerCache) spawnOptions.warmTranspilerCache = true;
+    let proc: SpawnedEngine;
+    try {
+      proc = spawnEngine(spawnOptions);
+    } catch (err) {
+      // Nothing was started (a bundle that changed since it was verified is
+      // refused before spawn, #671), so the sandbox registered above would
+      // otherwise stay live with a minted token and no engine behind it.
+      this.api.registry.terminate(sandboxId);
+      throw err;
+    }
+    const owned = { sandboxId, proc };
+    this.spawned.add(owned);
+    void proc.exited.then(() => this.spawned.delete(owned));
+    // Closing the race with `shutdown()`: either it snapshotted after the add
+    // above (so it owns this engine), or it set `closed` before the add, and
+    // we see it here. There is no third interleaving -- the add and this
+    // check are synchronous with the spawn.
+    if (this.closed) {
+      this.spawned.delete(owned);
+      proc.kill("SIGKILL");
+      this.api.registry.terminate(sandboxId);
+      throw new Error(
+        `EngineRuntime shut down while acquiring sandbox ${sandboxId}; engine pid ${proc.pid} killed`,
+      );
+    }
 
     // CRITICAL: drain the engine's stdout + stderr or the engine WILL hang.
     // The bundle is spawned with `stdio: [ignore, pipe, pipe]` and the
@@ -569,18 +807,39 @@ export class EngineRuntime {
     // streams differentiate by prefix; production daemons that want to
     // suppress this can pipe their output through a filter.
     bindEngineStream(proc.stdout, "stdout", sandboxId);
-    bindEngineStream(proc.stderr, "stderr", sandboxId);
+    // Keep the last few stderr lines around: when the handshake fails they
+    // are the only evidence of WHY, and by then the process is gone.
+    const stderrTail: string[] = [];
+    bindEngineStream(proc.stderr, "stderr", sandboxId, stderrTail);
 
-    let earlyExitMessage: string | null = null;
-    const earlyExitWatcher = proc.exited.then(({ code, signal }) => {
-      earlyExitMessage = `engine exited before handshake (code=${code}, signal=${signal})`;
+    // Fail fast when the engine dies instead of sitting out the full
+    // handshake deadline: a bundle that can't load exits in milliseconds, and
+    // its exit reason is far more useful than "did not connect in time".
+    const exitedFirst = proc.exited.then(({ code, signal }): never => {
+      throw new Error(`engine exited before handshake (code=${code}, signal=${signal})`);
     });
+    // Whichever loses the race below is still "handled" by Promise.race, so a
+    // post-handshake exit never surfaces as an unhandled rejection.
+    void exitedFirst.catch(() => {});
 
+    const handshakeStartedAt = Date.now();
     try {
-      const engineClient = await this.api.workerRpc.waitForConnection(
-        sandboxId,
-        this.handshakeTimeoutMs,
-      );
+      const engineClient = await Promise.race([
+        this.api.workerRpc.waitForConnection(sandboxId, this.handshakeTimeoutMs),
+        exitedFirst,
+        // An exec that never got off the ground (EAGAIN / ENOMEM under fork
+        // pressure) reports its errno here instead of masquerading as a
+        // handshake timeout.
+        proc.spawnFailed,
+      ]);
+      const handshakeMs = Date.now() - handshakeStartedAt;
+      if (handshakeMs > SLOW_HANDSHAKE_WARN_MS) {
+        console.warn(
+          `[engine-runtime] engine ${sandboxId.slice(0, 8)} handshake took ${handshakeMs}ms ` +
+            `(budget ${this.handshakeTimeoutMs}ms). The host is slow or loaded; raise ` +
+            `JARVIS_ENGINE_HANDSHAKE_TIMEOUT_MS if acquires start timing out.`,
+        );
+      }
       const warm: WarmEngine = { sandboxId, proc, engineClient };
       const releaseImpl = this.poolEnabled
         ? () => this.returnToPoolOrKill(warm)
@@ -599,17 +858,21 @@ export class EngineRuntime {
         releaseImpl,
       );
     } catch (e) {
-      // Make sure the subprocess is gone before bubbling. If it already exited,
-      // surface that reason; otherwise SIGKILL.
-      if (earlyExitMessage === null) {
-        proc.kill("SIGKILL");
-      }
+      // Make sure the subprocess is gone before bubbling. A timed-out engine
+      // is still running (it just never dialed back), so it needs the kill;
+      // one that already exited does not.
+      const stillRunning = proc.alive();
+      if (stillRunning) proc.kill("SIGKILL");
       this.api.registry.terminate(sandboxId);
-      const reason = earlyExitMessage ?? (e instanceof Error ? e.message : String(e));
-      throw new Error(`EngineRuntime.acquire failed: ${reason}`);
-    } finally {
-      // Don't leak the watcher Promise.
-      void earlyExitWatcher;
+      const reason = e instanceof Error ? e.message : String(e);
+      const context = [
+        stillRunning ? `engine pid ${proc.pid} was still running` : null,
+        stderrTail.length > 0 ? `last engine stderr: ${stderrTail.join(" | ")}` : null,
+      ].filter((s): s is string => s !== null);
+      throw new Error(
+        `EngineRuntime.acquire failed: ${reason}` +
+          (context.length > 0 ? ` (${context.join("; ")})` : ""),
+      );
     }
   }
 
@@ -626,6 +889,20 @@ export class EngineRuntime {
       this.api.registry.terminate(engine.sandboxId);
       return;
     }
+    // A release that lands during or after `shutdown()` must not re-park the
+    // engine: shutdown has already cancelled the eviction timer, so a parked
+    // engine here would sit in the slot with nothing left to evict it.
+    if (this.closed) {
+      engine.proc.kill("SIGTERM");
+      setTimeout(() => {
+      // Only if it is still running: signalling through a handle whose
+      // process has already been reaped is the one thing this module must
+      // never risk on a shared machine.
+      if (engine.proc.alive()) engine.proc.kill("SIGKILL");
+    }, this.killGraceMs).unref();
+      this.api.registry.terminate(engine.sandboxId);
+      return;
+    }
     if (this.idleEngine === null) {
       this.idleEngine = engine;
       this.armIdleEvictionTimer();
@@ -633,7 +910,12 @@ export class EngineRuntime {
     }
     // Slot full -- kill the duplicate.
     engine.proc.kill("SIGTERM");
-    setTimeout(() => engine.proc.kill("SIGKILL"), this.killGraceMs).unref();
+    setTimeout(() => {
+      // Only if it is still running: signalling through a handle whose
+      // process has already been reaped is the one thing this module must
+      // never risk on a shared machine.
+      if (engine.proc.alive()) engine.proc.kill("SIGKILL");
+    }, this.killGraceMs).unref();
     this.api.registry.terminate(engine.sandboxId);
   }
 
@@ -652,7 +934,12 @@ export class EngineRuntime {
       this.idleEngine = null;
       // Same SIGTERM-then-SIGKILL grace pattern as `EngineHandle.killAndTerminate`.
       engine.proc.kill("SIGTERM");
-      setTimeout(() => engine.proc.kill("SIGKILL"), this.killGraceMs).unref();
+      setTimeout(() => {
+      // Only if it is still running: signalling through a handle whose
+      // process has already been reaped is the one thing this module must
+      // never risk on a shared machine.
+      if (engine.proc.alive()) engine.proc.kill("SIGKILL");
+    }, this.killGraceMs).unref();
       this.api.registry.terminate(engine.sandboxId);
     }, this.poolIdleTtlMs);
     // unref so a parked engine alone doesn't keep the daemon's event loop
@@ -668,25 +955,63 @@ export class EngineRuntime {
   }
 
   /**
-   * Tear down the warm pool. Called by the daemon's shutdown path after
-   * the worker has stopped accepting jobs. Safe to call when pooling is
-   * disabled (no-op).
+   * Tear down everything this runtime spawned: the warm pool AND any engine
+   * still acquired. Called by the daemon's shutdown path after the worker has
+   * stopped accepting jobs, and by test teardown. Safe to call when pooling is
+   * disabled, when nothing is running, and more than once.
+   *
+   * Reclaiming the still-acquired engines too is deliberate: after shutdown
+   * nothing can drive them and nothing else will ever kill them, so leaving
+   * them up produces exactly the orphan in #491. A caller that wants an engine
+   * to survive should not be shutting its runtime down.
    */
   async shutdown(): Promise<void> {
     // Cancel the eviction timer first -- otherwise it fires post-shutdown
     // and the kill-then-terminate against an already-gone engine surfaces
     // as noise in logs.
+    this.closed = true;
     this.clearIdleEvictionTimer();
-    if (!this.idleEngine) return;
-    const engine = this.idleEngine;
     this.idleEngine = null;
-    engine.proc.kill("SIGTERM");
-    await Promise.race([
-      engine.proc.exited,
-      new Promise<void>((res) => setTimeout(res, this.killGraceMs)),
-    ]);
-    engine.proc.kill("SIGKILL");
-    this.api.registry.terminate(engine.sandboxId);
+
+    const owned = [...this.spawned];
+    // Revoke every sandbox this runtime ever registered, alive or not: a
+    // record left un-terminated is one a zombie engine could still act
+    // through, and the eviction timer that would have cleaned it up has just
+    // been cancelled. `terminate` is idempotent.
+    for (const e of owned) this.api.registry.terminate(e.sandboxId);
+
+    const victims = owned.filter((e) => e.proc.alive());
+    if (victims.length === 0) return;
+    for (const e of victims) e.proc.kill("SIGTERM");
+    await this.raceExit(victims, this.killGraceMs);
+    // Whatever is left ignored the polite signal (a pre-shim cached bundle, or
+    // an engine wedged in native code). Take it.
+    const stubborn = victims.filter((e) => e.proc.alive());
+    if (stubborn.length === 0) return;
+    for (const e of stubborn) e.proc.kill("SIGKILL");
+    await this.raceExit(stubborn, 500);
+  }
+
+  /**
+   * Wait for all of `engines` to exit, or `timeoutMs`, whichever comes first
+   * -- clearing the timer when they beat it, so a clean shutdown does not
+   * hold the daemon's event loop open for the full grace window.
+   */
+  private async raceExit(
+    engines: Array<{ proc: SpawnedEngine }>,
+    timeoutMs: number,
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.all(engines.map((e) => e.proc.exited)),
+        new Promise<void>((res) => {
+          timer = setTimeout(res, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 }
 
@@ -717,6 +1042,7 @@ function bindEngineStream(
   stream: NodeJS.ReadableStream | null,
   kind: "stdout" | "stderr",
   sandboxId: string,
+  tail?: string[],
 ): void {
   if (!stream) return;
   const prefix = `[engine ${sandboxId.slice(0, 8)} ${kind}]`;
@@ -728,6 +1054,10 @@ function bindEngineStream(
     const text = chunk.toString("utf8").replace(/\n$/, "");
     if (text.length === 0) return;
     sink.write(`${prefix} ${text}\n`);
+    if (tail) {
+      tail.push(text.length > 300 ? text.slice(0, 300) + "..." : text);
+      while (tail.length > ENGINE_STDERR_TAIL_LINES) tail.shift();
+    }
   });
   // Errors on the pipe itself (rare: e.g. the proc exited mid-read) are
   // ignored -- the spawned process is gone, nothing to do about it.

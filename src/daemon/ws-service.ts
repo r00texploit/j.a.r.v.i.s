@@ -8,6 +8,7 @@
 import type { ServerWebSocket } from 'bun';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { checkpointExecution } from '../actions/execution-scope.ts';
 import type { Service, ServiceStatus } from './services.ts';
 import type { AgentService } from './agent-service.ts';
 import type { CommitmentExecutor } from './commitment-executor.ts';
@@ -15,10 +16,11 @@ import type { ChannelService } from './channel-service.ts';
 import type { Commitment } from '../vault/commitments.ts';
 import type { ContentItem } from '../vault/content-pipeline.ts';
 import type { STTProvider, TTSProvider } from '../comms/voice.ts';
-import { setDefaultCwd } from '../actions/tools/builtin.ts';
-import type { ApprovalRequest, ApprovalManager } from '../authority/approval.ts';
+import { PROJECT_SITE_CHAT_SCOPE } from '../actions/tools/tool-scope.ts';
+import { approvalNeedsClick, type ApprovalRequest, type ApprovalManager } from '../authority/approval.ts';
 import type { DeferredExecutor } from '../authority/deferred-executor.ts';
 import type { EmergencyState } from '../authority/emergency.ts';
+import { approvalIntentFields, approvalIntentParts, boundedApprovalLabel, formatApprovalIntent } from '../authority/approval-delivery.ts';
 import type { AuditTrail } from '../authority/audit.ts';
 import { impactFromCategory, gateVoiceApprovalResolution } from '../roles/authority.ts';
 import type { ActionCategory } from '../roles/authority.ts';
@@ -27,7 +29,7 @@ import { getUserProfile } from '../vault/user-profile.ts';
 import { formatUserProfileForPrompt } from '../user/profile.ts';
 import { routeByConfidence, intentToRoomKey, intentIsBackToThread, type Intent, type RoomKey } from '../voice/intent.ts';
 import { matchWindowControl, type WindowControl } from '../voice/window-control.ts';
-import { containsWakePhrase } from '../voice/wake-phrase.ts';
+import { containsStopPhrase, containsWakePhrase } from '../voice/wake-phrase.ts';
 import {
   createInterviewSession,
   runInterviewTurn,
@@ -39,13 +41,19 @@ import { recordAgentActivity } from '../vault/agent-activity.ts';
 import { WebSocketServer, type WSMessage } from '../comms/websocket.ts';
 import { StreamRelay } from '../comms/streaming.ts';
 import { resolveRealtimeVoice, type ResolvedRealtimeVoice } from '../config/realtime.ts';
+import { realtimeEnablement } from './usejarvis-ai.ts';
 import { BrowserAudioTransport } from '../comms/audio-transport.ts';
+import { tagRealtimePcm } from '../comms/realtime-frame.ts';
 import { RealtimeVoiceSession } from './realtime-voice.ts';
 import { REALTIME_NAV_TOOLS, REALTIME_NAV_TOOL_NAMES } from './realtime-nav-tools.ts';
 import { RealtimeBudgetTracker } from './realtime-budget.ts';
+import { hostedRealtimeIncluded } from './realtime-gate.ts';
 import { classifyErrorString } from '../llm/provider.ts';
 import { getOrCreateConversation, addMessage } from '../vault/conversations.ts';
 import { maybeCreateUserProfileFollowupPrompt, recordUserProfileTurn } from '../user/profile-followup.ts';
+import { runWithOrigin } from '../llm/origin.ts';
+import { buildProjectSiteContext, formatProjectList } from '../sites/prompt-context.ts';
+import type { FileEntry } from '../sites/types.ts';
 
 type VoiceSession = {
   requestId: string;
@@ -53,7 +61,144 @@ type VoiceSession = {
   startedAt: number;
   /** Phase 6.7.C — current Room key (or "home") at utterance start. */
   currentRoom?: string;
+  /** The approval the dashboard showed when the person started speaking (#809, `shownApprovalIdFrom`). */
+  shownApprovalId?: string | null;
 };
+
+/**
+ * The approval a voice utterance answers (#809): the id of the newest pending
+ * approval the dashboard was showing when the person started speaking, as the
+ * client sends it on `voice_start` / `voice_text`. `null` means it showed none;
+ * `undefined` means the client did not say (an older dashboard), which is not
+ * the same thing and is refused for a decision, since nothing tells us which
+ * request the person read.
+ */
+export function shownApprovalIdFrom(payload: unknown): string | null | undefined {
+  const value = (payload as { shownApprovalId?: unknown } | null | undefined)?.shownApprovalId;
+  if (value === null) return null;
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+/** How much of an approval's sentence a spoken-approval reply quotes; nothing is decided on this text. */
+const VOICE_APPROVAL_LABEL_MAX_CHARS = 160;
+
+/**
+ * What will happen, as a voice reply names it: the card's sentence, never the
+ * engine's reason (#809). The reply is an assistant message the dashboard
+ * renders as markdown, and the sentence carries values a model or a workflow
+ * chose, so it is quoted as an inline code span (#809 review), where markdown
+ * interprets nothing: `![](https://x/p.png)` must read as those characters,
+ * not load an image beside text Jarvis is saying, `**safe, say yes**` must not
+ * turn bold, and a bare URL must not become a link. Backslash-escaping was
+ * tried first and is not enough: GFM still autolinks an escaped URL. The fence
+ * is one backtick longer than any run inside, and the one space padding each
+ * side is what CommonMark strips, so the span shows the sentence exactly.
+ */
+function voiceApprovalLabel(request: ApprovalRequest): string {
+  const label = boundedApprovalLabel(approvalIntentParts(request).action, VOICE_APPROVAL_LABEL_MAX_CHARS) || request.tool_name;
+  const longestRun = Math.max(0, ...(label.match(/`+/g) ?? []).map((run) => run.length));
+  const fence = '`'.repeat(longestRun + 1);
+  return `${fence} ${label} ${fence}`;
+}
+
+/**
+ * Why a spoken yes or no decided nothing (#809), or null when it may go ahead:
+ * the newest pending approval must be the one the dashboard showed when the
+ * person started speaking. Otherwise a request that arrived while they were
+ * answering would be the one decided -- "yes" bound by position, not by what
+ * they read.
+ *
+ * Every message says that nothing was decided, names what is now newest, and,
+ * where it is still waiting, the one they were answering, so a refusal reads
+ * as "a different request arrived" and not as a failure. None of them says
+ * "say yes again": the dashboard now shows the new request on top, so a second
+ * yes would answer THAT one.
+ */
+export function voiceApprovalMismatch(
+  decision: 'approve' | 'cancel',
+  newest: ApprovalRequest,
+  shownApprovalId: string | null | undefined,
+  shown: ApprovalRequest | null,
+): string | null {
+  if (shownApprovalId === newest.id) return null;
+  const nothing = decision === 'approve' ? "I haven't approved anything" : "I haven't cancelled anything";
+  const latest = voiceApprovalLabel(newest);
+  if (shownApprovalId === undefined) {
+    return `I couldn't tell which request was on your screen when you started speaking, so ${nothing}. Waiting for you: ${latest}. Decide it on its card.`;
+  }
+  if (shownApprovalId === null) {
+    // Nothing on screen: none had arrived yet, or the dashboard was hidden.
+    return `No approval was on your screen when you started speaking, so ${nothing}. Waiting for you: ${latest}. Decide it on its card.`;
+  }
+  if (shown && shown.status === 'pending') {
+    return `A new request arrived while you were answering, so ${nothing}. The one you were looking at is still waiting: ${voiceApprovalLabel(shown)}. The new one: ${latest}. Decide each on its card.`;
+  }
+  return `The request you were looking at has already been decided or has expired, so ${nothing}. Another one is waiting: ${latest}. Decide it on its card.`;
+}
+
+/**
+ * Why voice may not decide this approval at all, though it is the one on
+ * screen (#856): it is destructive, the tool that asked for it requires a
+ * click, or the classifier was not sure the answer was a yes or a no.
+ */
+export type VoiceApprovalGateReason = 'destructive' | 'click_only' | 'low_confidence';
+
+/**
+ * What a gated spoken yes or no gets back (#856), as an assistant message in
+ * the thread like #809's refusals. It used to be a `voice_approval_gated`
+ * notification nothing rendered, so the person said "yes", the daemon
+ * deliberately did nothing, and the dashboard showed nothing either --
+ * indistinguishable from not being heard.
+ *
+ * Each reason says what to do differently, because they differ: a
+ * destructive or click-only request will never take a voice answer, so the
+ * only way is its card; a low-confidence answer was simply unclear, so saying
+ * it again plainly can work.
+ *
+ * That suggestion carries a condition, "while it is still the only request
+ * waiting" (#856 review). A second answer is judged afresh, by what is on
+ * screen when it starts and by the one-pending rule, so it cannot decide a
+ * request the person cannot see; but if this request is decided elsewhere or
+ * expires and another arrives before they speak again, the one on screen --
+ * and so the one a second "yes" answers -- is the new one, not the one this
+ * message names. Every message says nothing was decided and names the
+ * request, quoted like the refusals (`voiceApprovalLabel`).
+ */
+export function voiceApprovalGatedMessage(
+  decision: 'approve' | 'cancel',
+  reason: VoiceApprovalGateReason,
+  request: ApprovalRequest,
+): string {
+  const nothing = decision === 'approve' ? "I haven't approved anything" : "I haven't cancelled anything";
+  const label = voiceApprovalLabel(request);
+  switch (reason) {
+    case 'destructive':
+      return `That request is marked destructive, and destructive requests are decided only with a click, never by voice, so ${nothing}. Waiting for you: ${label}. Approve or deny it on its card.`;
+    case 'click_only':
+      return `That request has to be confirmed with a click, never by voice, so ${nothing}. Waiting for you: ${label}. Approve or deny it on its card.`;
+    case 'low_confidence': {
+      const word = decision === 'approve' ? 'yes' : 'no';
+      return `I wasn't sure that was a clear "${word}", so ${nothing}. Waiting for you: ${label}. Decide it on its card, or, while it is still the only request waiting, say "${word}" again plainly.`;
+    }
+  }
+}
+
+/**
+ * Why a spoken yes or no decided nothing when several approvals are pending
+ * (#855). The rail lists every one of them, so "yes" says which by position
+ * only -- the one on top -- not by which card the person was reading. Voice
+ * therefore decides only while exactly one approval is waiting.
+ *
+ * The message says how many are waiting and that each has to be decided on
+ * its own card, so the refusal reads as "I can't tell which one you mean",
+ * not as a failure. It does not name them: they are all on the rail, and a
+ * list read back as a sentence is no easier to pick from than the cards.
+ */
+export function voiceApprovalAmbiguous(decision: 'approve' | 'cancel', pendingCount: number): string {
+  const word = decision === 'approve' ? 'yes' : 'no';
+  const nothing = decision === 'approve' ? "I haven't approved anything" : "I haven't cancelled anything";
+  return `${pendingCount} requests are waiting for approval, so I can't tell which one your "${word}" is for, and ${nothing}. Approve or deny each one on its card. Voice works again once only one is waiting.`;
+}
 
 /**
  * A voice utterance that's been STT'd but is held pending user confirmation
@@ -99,9 +244,20 @@ export function cleanupPerSocketMaps<W>(
   voiceSessions: Map<W, unknown>,
   interviewSessions: Map<W, unknown>,
   pendingVoiceConfirmations: Map<string, { ws: W }>,
+  realtimeSessions?: Map<W, unknown>,
+  pendingVoiceFrames?: Map<W, unknown>,
 ): { voiceRemoved: boolean; interviewRemoved: boolean; pendingRemoved: number } {
   const voiceRemoved = voiceSessions.delete(ws);
   const interviewRemoved = interviewSessions.delete(ws);
+  // Backstop only: closeRealtimeVoice runs first on disconnect and owns the
+  // real teardown (OpenAI WS + timer). If an entry still exists here, clear
+  // its timer before dropping it so the sweep doesn't leak the timeout.
+  if (realtimeSessions) {
+    const entry = realtimeSessions.get(ws) as { timeout?: ReturnType<typeof setTimeout> } | undefined;
+    if (entry?.timeout !== undefined) clearTimeout(entry.timeout);
+    realtimeSessions.delete(ws);
+  }
+  pendingVoiceFrames?.delete(ws);
   let pendingRemoved = 0;
   for (const [id, pending] of pendingVoiceConfirmations) {
     if (pending.ws === ws) {
@@ -135,6 +291,32 @@ export function sweepExpiredVoiceConfirmations<W>(
   return expired;
 }
 
+/**
+ * Voice-only hard interrupt; never forward these phrases to the LLM.
+ * Twin of `isSpeechStopCommand` in ui/src/hooks/useVoice.ts (browser-STT
+ * path) — keep the phrase lists in sync when editing either one. The bare
+ * "stop" is server-only: daemon STT runs per recorded utterance, so it can't
+ * collide with TTS echo the way the browser's always-on recognizer can.
+ */
+const VOICE_STOP_PHRASES = new Set([
+  'stop',
+  'jarvis stop',
+  'hey jarvis stop',
+  'jarvis be quiet',
+  'hey jarvis be quiet',
+  'jarvis quiet',
+  'hey jarvis quiet',
+]);
+
+export function isVoiceStopCommand(transcript: string): boolean {
+  const normalized = transcript
+    .toLowerCase()
+    .replace(/[.,!?;:]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return VOICE_STOP_PHRASES.has(normalized);
+}
+
 export class WebSocketService implements Service {
   name = 'websocket';
   private _status: ServiceStatus = 'stopped';
@@ -149,6 +331,11 @@ export class WebSocketService implements Service {
   private ttsProvider: TTSProvider | null = null;
   private sttProvider: STTProvider | null = null;
   private voiceSessions = new Map<ServerWebSocket<unknown>, VoiceSession>();
+  /** One foreground chat turn per dashboard socket. A new turn supersedes it. */
+  private activeChats = new Map<
+    ServerWebSocket<unknown>,
+    { requestId: string; controller: AbortController }
+  >();
   private pendingVoiceConfirmations = new Map<string, PendingVoiceConfirmation>();
   /**
    * Premium realtime voice (gpt-realtime-2) sessions, keyed by socket. Present
@@ -158,7 +345,33 @@ export class WebSocketService implements Service {
    */
   private realtimeSessions = new Map<
     ServerWebSocket<unknown>,
-    { session: RealtimeVoiceSession; transport: BrowserAudioTransport; timeout: ReturnType<typeof setTimeout>; startedAt: number }
+    {
+      session: RealtimeVoiceSession;
+      transport: BrowserAudioTransport;
+      timeout: ReturnType<typeof setTimeout>;
+      startedAt: number;
+      /** True when the platform proxy is the billing authority for this
+       * session — see closeRealtimeVoice for why the local ledger is skipped. */
+      hosted: boolean;
+      /** Last mic frame routed into the session (ms epoch, 0 before any). */
+      lastMicAt: number;
+    }
+  >();
+  /** Sockets whose realtime start was refused or whose session the daemon just
+   *  closed. The client stops streaming once it hears; frames already on the
+   *  wire are dropped quietly instead of logging one warning each. Cleared by
+   *  the next voice_start. */
+  private quietVoiceFrames = new WeakSet<ServerWebSocket<unknown>>();
+  /**
+   * Mic frames that arrive while a realtime start is mid-gate (the plan-gate
+   * catalog fetch is the only await before a session exists). Without this
+   * buffer those frames hit handleVoiceAudio's "no active session" branch and
+   * the start of the first utterance is clipped. Bounded (PENDING_FRAMES_MAX_BYTES);
+   * flushed into whichever consumer materializes, dropped on refusal/teardown.
+   */
+  private pendingVoiceFrames = new Map<
+    ServerWebSocket<unknown>,
+    { chunks: Buffer[]; bytes: number; ended?: boolean }
   >();
   /**
    * Lazily-created monthly spend guard for realtime voice. Only used when a
@@ -173,6 +386,10 @@ export class WebSocketService implements Service {
    * persisted via `appendUserProfileFact` inside the agent loop.
    */
   private interviewSessions = new Map<ServerWebSocket<unknown>, InterviewSession>();
+  /** Sockets with an interview turn running — see `handleInterviewMessage`. */
+  private interviewTurnsInFlight = new Set<ServerWebSocket<unknown>>();
+  /** Typed text that landed mid-turn, run as the next turn. */
+  private interviewPendingText = new Map<ServerWebSocket<unknown>, string>();
   /**
    * Periodic sweep handle for `pendingVoiceConfirmations` TTL eviction.
    * Started in `start()`, cleared in `stop()` so the daemon shuts down
@@ -223,6 +440,12 @@ export class WebSocketService implements Service {
     this.deferredExecutor = exec;
   }
 
+  /** Drop pending written turns when the interview wraps or disconnects. */
+  private endInterviewSession(ws: ServerWebSocket<unknown>): void {
+    this.interviewPendingText.delete(ws);
+    this.interviewTurnsInFlight.delete(ws);
+  }
+
   setAuditTrail(audit: AuditTrail): void {
     this.auditTrail = audit;
   }
@@ -242,19 +465,20 @@ export class WebSocketService implements Service {
   }
 
   /**
-   * Set the TTS provider for voice responses.
+   * Set the TTS provider for voice responses. Null clears it (provider
+   * disabled or credentials removed via settings hot reload).
    */
-  setTTSProvider(provider: TTSProvider): void {
+  setTTSProvider(provider: TTSProvider | null): void {
     this.ttsProvider = provider;
-    console.log('[WSService] TTS provider set');
+    console.log(provider ? '[WSService] TTS provider set' : '[WSService] TTS provider cleared');
   }
 
   /**
-   * Set the STT provider for voice input transcription.
+   * Set the STT provider for voice input transcription. Null clears it.
    */
-  setSTTProvider(provider: STTProvider): void {
+  setSTTProvider(provider: STTProvider | null): void {
     this.sttProvider = provider;
-    console.log('[WSService] STT provider set');
+    console.log(provider ? '[WSService] STT provider set' : '[WSService] STT provider cleared');
   }
 
   /**
@@ -320,6 +544,7 @@ export class WebSocketService implements Service {
           console.log('[WSService] Client connected');
         },
         onDisconnect: (ws) => {
+          this.cancelActiveChat(ws, 'disconnect', false);
           // Tear down any realtime voice session (closes the OpenAI WS + timer).
           this.closeRealtimeVoice(ws);
           // Clean up every per-socket map so a long-running daemon doesn't
@@ -331,7 +556,10 @@ export class WebSocketService implements Service {
             this.voiceSessions as unknown as Map<typeof ws, unknown>,
             this.interviewSessions as unknown as Map<typeof ws, unknown>,
             this.pendingVoiceConfirmations as unknown as Map<string, { ws: typeof ws }>,
+            this.realtimeSessions as unknown as Map<typeof ws, unknown>,
+            this.pendingVoiceFrames as unknown as Map<typeof ws, unknown>,
           );
+          this.endInterviewSession(ws);
           console.log('[WSService] Client disconnected');
         },
       });
@@ -420,6 +648,18 @@ export class WebSocketService implements Service {
    * Urgent notifications are also pushed to all external channels.
    */
   broadcastNotification(text: string, priority: 'urgent' | 'normal' | 'low'): void {
+    this.broadcastNotificationToDashboard(text, priority);
+
+    // Legacy proactive notifications intentionally fan out to external channels.
+    if (priority === 'urgent' && this.channelService) {
+      this.channelService.broadcastToAll(`[URGENT] ${text}`).catch(err =>
+        console.error('[WSService] Channel broadcast error:', err)
+      );
+    }
+  }
+
+  /** Dashboard delivery only. Governed callers authorize external recipients separately. */
+  broadcastNotificationToDashboard(text: string, priority: 'urgent' | 'normal' | 'low'): void {
     const message: WSMessage = {
       type: 'chat',
       payload: {
@@ -430,13 +670,6 @@ export class WebSocketService implements Service {
       timestamp: Date.now(),
     };
     this.wsServer.broadcast(message);
-
-    // Push urgent notifications to external channels (Telegram, Discord)
-    if (priority === 'urgent' && this.channelService) {
-      this.channelService.broadcastToAll(`[URGENT] ${text}`).catch(err =>
-        console.error('[WSService] Channel broadcast error:', err)
-      );
-    }
   }
 
   /**
@@ -525,12 +758,12 @@ export class WebSocketService implements Service {
 
   /**
    * Broadcast an approval request to all connected dashboard clients.
-   * Always pushed via WS; urgent requests are also sent to external channels.
+   * External channel delivery is handled by ApprovalDelivery so messages
+   * are never duplicated.
    */
   broadcastApprovalRequest(request: ApprovalRequest): void {
     const shortId = request.id.slice(0, 8);
     const impact = impactFromCategory(request.action_category);
-    const intent = formatApprovalIntent(request);
     const message: WSMessage = {
       type: 'notification',
       payload: {
@@ -538,20 +771,12 @@ export class WebSocketService implements Service {
         request,
         shortId,
         impact,
-        intent,
+        ...approvalIntentFields(request),
       },
       priority: request.urgency === 'urgent' ? 'urgent' : 'normal',
       timestamp: Date.now(),
     };
     this.wsServer.broadcast(message);
-
-    // Push urgent approvals to external channels
-    if (request.urgency === 'urgent' && this.channelService) {
-      const text = `[APPROVAL NEEDED] ${request.agent_name} wants to run ${request.tool_name} (${request.action_category}).\nReason: ${request.reason}\nReply: approve ${shortId} / deny ${shortId}`;
-      this.channelService.broadcastToAll(text).catch(err =>
-        console.error('[WSService] Approval channel broadcast error:', err)
-      );
-    }
   }
 
   /**
@@ -623,10 +848,20 @@ export class WebSocketService implements Service {
       return;
     }
 
+    // A socket mid-turn in its realtime session would get a clip talking over
+    // the model, and the open mic would feed that clip back into the session.
+    // Only the audio is skipped for it; a session merely left open (it lives
+    // for max_session_minutes) still gets proactive voice.
+    const targets = [...this.wsServer.getClients()].filter((client) => !this.realtimeTurnActive(client));
+    if (targets.length === 0) {
+      console.log('[WSService] Proactive TTS skipped: every client is mid-turn in a realtime session');
+      return;
+    }
+
     try {
       const requestId = `proactive-${Date.now()}`;
 
-      // Signal TTS start to all clients (with wake-phrase guard flag —
+      // Signal TTS start to the target clients (with wake-phrase guard flag -
       // proactive TTS knows the full text up front so we can compute
       // it once).
       const startMsg: WSMessage = {
@@ -634,17 +869,32 @@ export class WebSocketService implements Service {
         payload: { requestId, containsWake: containsWakePhrase(text) },
         timestamp: Date.now(),
       };
-      this.wsServer.broadcast(startMsg);
+      checkpointExecution();
+      for (const client of targets) this.wsServer.sendToClient(client, startMsg);
 
       let chunkCount = 0;
-      for await (const chunk of this.ttsProvider.synthesizeStream(text)) {
-        // Send binary audio to all connected clients
-        for (const ws of this.wsServer.getClients()) {
-          try {
-            ws.sendBinary(chunk);
-          } catch { /* client may have disconnected */ }
+      // Sentence-split like the reply path: proactive text goes to the
+      // provider whole otherwise, and the hosted provider truncates a single
+      // over-long input (billed per character, capped per request) — split
+      // sentences synthesize completely and fail independently.
+      const { splitIntoSentences } = await import('../comms/voice.ts');
+      for (const sentence of splitIntoSentences(text)) {
+        checkpointExecution();
+        try {
+          for await (const chunk of this.ttsProvider.synthesizeStream(sentence)) {
+            checkpointExecution();
+            // Send binary audio to the target clients
+            for (const ws of targets) {
+              try {
+                ws.sendBinary(chunk);
+              } catch { /* client may have disconnected */ }
+            }
+            chunkCount++;
+          }
+        } catch (err) {
+          checkpointExecution();
+          console.error('[WSService] Proactive TTS sentence error:', err instanceof Error ? err.message : err);
         }
-        chunkCount++;
       }
 
       // Signal TTS end
@@ -653,14 +903,19 @@ export class WebSocketService implements Service {
         payload: { requestId },
         timestamp: Date.now(),
       };
-      this.wsServer.broadcast(endMsg);
+      for (const client of targets) this.wsServer.sendToClient(client, endMsg);
       console.log(`[WSService] Proactive TTS complete: "${text.slice(0, 60)}..." (${chunkCount} chunks)`);
     } catch (err) {
       console.error('[WSService] Proactive TTS error:', err instanceof Error ? err.message : err);
       // Still send tts_end so client doesn't get stuck
       try {
-        this.wsServer.broadcast({ type: 'tts_end', payload: {}, timestamp: Date.now() });
+        for (const client of targets) {
+          this.wsServer.sendToClient(client, { type: 'tts_end', payload: {}, timestamp: Date.now() });
+        }
       } catch { /* ignore */ }
+      // Preserve cancellation in the delivery report after closing the UI's
+      // audio session. A canceled stream must not be reported as delivered.
+      checkpointExecution();
     }
   }
 
@@ -698,6 +953,23 @@ export class WebSocketService implements Service {
   }
 
   /**
+   * Broadcast that DB-backed settings were hot-applied to the running
+   * daemon. Payload carries section names and error strings only — never
+   * setting values (channel tokens, API keys).
+   */
+  broadcastSettingsApplied(payload: {
+    sections: string[];
+    ok: boolean;
+    errors?: { section: string; error: string }[];
+  }): void {
+    this.wsServer.broadcast({
+      type: 'settings_applied',
+      payload,
+      timestamp: Date.now(),
+    });
+  }
+
+  /**
    * Broadcast a conv-tier task lifecycle event to all connected clients. The
    * UI uses these to render status pills like `[research running - 14s]`
    * while a delegated task is in flight, and to flash a "result ready" hint
@@ -727,19 +999,6 @@ export class WebSocketService implements Service {
     this.wsServer.broadcast(message);
   }
 
-  /**
-   * Format a FileEntry tree into a compact text listing.
-   */
-  private formatFileTree(entry: { name: string; path: string; type: 'file' | 'directory'; children?: { name: string; type: 'file' | 'directory' }[] }): string {
-    const lines: string[] = [];
-    if (entry.children) {
-      for (const child of entry.children) {
-        lines.push(child.type === 'directory' ? `${child.name}/` : child.name);
-      }
-    }
-    return lines.join('\n') + '\n';
-  }
-
   broadcastApprovalUpdate(request: ApprovalRequest): void {
     const message: WSMessage = {
       type: 'notification',
@@ -747,7 +1006,7 @@ export class WebSocketService implements Service {
         source: 'approval_update',
         request,
         impact: impactFromCategory(request.action_category),
-        intent: formatApprovalIntent(request),
+        ...approvalIntentFields(request),
       },
       timestamp: Date.now(),
     };
@@ -757,10 +1016,62 @@ export class WebSocketService implements Service {
   /**
    * Route incoming WebSocket messages to the appropriate handler.
    */
+  private cancelActiveChat(
+    ws: ServerWebSocket<unknown>,
+    reason: 'user' | 'superseded' | 'voice' | 'disconnect',
+    notify = true,
+    expectedRequestId?: string,
+  ): boolean {
+    const active = this.activeChats.get(ws);
+    if (!active) return false;
+    if (expectedRequestId && active.requestId !== expectedRequestId) return false;
+    this.activeChats.delete(ws);
+    active.controller.abort(reason);
+    if (notify) {
+      // Stream chunks are broadcast to every dashboard, and the aborted relay
+      // never emits its `status: done` — so the terminal `cancelled` status
+      // (and the thinking_end that mirrors the broadcast thinking_start) must
+      // broadcast too, or mirroring clients keep a spinner forever.
+      this.wsServer.broadcast({
+        type: 'status',
+        payload: { status: 'cancelled', requestId: active.requestId, reason },
+        id: active.requestId,
+        timestamp: Date.now(),
+      });
+      // Flush the browser audio queue and its speaking state now; the provider
+      // stream may need another network chunk before its iterator observes the
+      // AbortSignal. TTS audio is per-socket (sendBinary), so this one stays
+      // addressed to the owning client.
+      this.wsServer.sendToClient(ws, {
+        type: 'tts_end',
+        payload: { requestId: active.requestId, cancelled: true },
+        id: active.requestId,
+        timestamp: Date.now(),
+      });
+      this.wsServer.broadcast({
+        type: 'thinking_end',
+        payload: { requestId: active.requestId, cancelled: true },
+        id: active.requestId,
+        timestamp: Date.now(),
+      });
+    }
+    return true;
+  }
+
   private async routeMessage(msg: WSMessage, ws: ServerWebSocket<unknown>): Promise<WSMessage | void> {
     switch (msg.type) {
       case 'chat':
         return this.handleChat(msg, ws);
+
+      case 'cancel': {
+        // Cancel stops the *response* (generation + TTS). It deliberately
+        // leaves any in-flight voiceSessions recording alone — that buffer is
+        // user input, and voice_end will process it normally.
+        const requestId = (msg.payload as { requestId?: string } | undefined)?.requestId;
+        this.cancelActiveChat(ws, 'user', true, requestId);
+        this.realtimeSessions.get(ws)?.session.interrupt();
+        return undefined;
+      }
 
       case 'command':
         return this.handleCommand(msg);
@@ -769,22 +1080,57 @@ export class WebSocketService implements Service {
         return this.handleStatus();
 
       case 'voice_start': {
-        const { requestId, currentRoom } = msg.payload as { requestId: string; currentRoom?: string };
-        // Premium path: if realtime voice is enabled + keyed, open (or reuse) a
-        // full-duplex realtime session and skip the STT accumulator entirely.
-        if (this.tryStartRealtimeVoice(ws)) return undefined;
-        this.voiceSessions.set(ws, {
+        const { requestId, currentRoom, mode } = msg.payload as {
+          requestId: string; currentRoom?: string; mode?: 'pcm' | 'wav';
+        };
+        this.quietVoiceFrames.delete(ws);
+        // A WAV-mode client is uploading a finished recording — realtime is
+        // never the right consumer for it (the session would treat the WAV
+        // container bytes as raw PCM frames). Skip the realtime starter and
+        // its gate await entirely: the accumulator is created synchronously,
+        // so no frame can arrive before a session exists.
+        //
+        // Premium path (PCM, or an older client that sends no mode): if
+        // realtime voice is enabled + keyed, open (or reuse) a full-duplex
+        // realtime session and skip the STT accumulator.
+        if (mode !== 'wav' && await this.tryStartRealtimeVoice(ws, mode)) {
+          this.pendingVoiceFrames.delete(ws);
+          return undefined;
+        }
+        // Frames buffered during the realtime starter's gate window belong to
+        // this utterance — seed the accumulator with them (mode-less clients
+        // only: a PCM refusal drops its buffer inside tryStartRealtimeVoice,
+        // and the wav path above never buffers). Messages are NOT serialized
+        // behind the gate await, so voice_end may already have raced past; in
+        // that case the utterance is complete and processing starts now.
+        const buffered = this.pendingVoiceFrames.get(ws);
+        this.pendingVoiceFrames.delete(ws);
+        const session: VoiceSession = {
           requestId,
-          chunks: [],
+          chunks: buffered?.chunks ?? [],
           startedAt: Date.now(),
           currentRoom,
-        });
+          shownApprovalId: shownApprovalIdFrom(msg.payload),
+        };
+        if (buffered?.ended) {
+          this.handleVoiceSession(session, ws).catch(err =>
+            console.error('[WSService] Voice session error:', err)
+          );
+        } else {
+          this.voiceSessions.set(ws, session);
+        }
         return undefined;
       }
 
       case 'voice_end': {
         const session = this.voiceSessions.get(ws);
-        if (!session) return undefined;
+        if (!session) {
+          // voice_start may still be mid-gate (messages aren't serialized) —
+          // mark the buffered utterance complete so the starter processes it.
+          const pending = this.pendingVoiceFrames.get(ws);
+          if (pending) pending.ended = true;
+          return undefined;
+        }
         this.voiceSessions.delete(ws);
         // Fire-and-forget: transcribe → process → TTS response
         this.handleVoiceSession(session, ws).catch(err =>
@@ -805,7 +1151,7 @@ export class WebSocketService implements Service {
         // we don't double-process the same utterance.
         this.voiceSessions.delete(ws);
         if (!text) return undefined;
-        this.processVoiceTranscript(text, requestId, ws, currentRoom).catch(err =>
+        this.processVoiceTranscript(text, requestId, ws, currentRoom, shownApprovalIdFrom(payload)).catch(err =>
           console.error('[WSService] voice_text pipeline error:', err)
         );
         return undefined;
@@ -817,12 +1163,29 @@ export class WebSocketService implements Service {
         // agent loop (see `onboarding-interviewer.ts`); doesn't touch
         // the primary chat agent or persist messages to vault
         // conversations.
-        const payload = msg.payload as { text?: string; speakReply?: boolean };
+        const payload = msg.payload as { text?: string };
         const userText = msg.type === 'interview_start' ? null : (payload?.text ?? '').trim();
-        const speakReply = payload?.speakReply !== false; // default true
-        this.handleInterviewMessage(ws, userText, speakReply).catch(err =>
+        // Ignore legacy speakReply requests: this interview is always written.
+        this.handleInterviewMessage(ws, userText).catch(err =>
           console.error('[WSService] interview pipeline error:', err)
         );
+        return undefined;
+      }
+
+      case 'interview_listen': {
+        // Tell an older dashboard that recording is unavailable. Never arm
+        // a microphone or change ordinary assistant voice routing.
+        this.wsServer.sendToClient(ws, {
+          type: 'interview_listen_state',
+          payload: { armed: false, reason: 'text-only' },
+          timestamp: Date.now(),
+        });
+        return undefined;
+      }
+
+      case 'interview_listen_stop': {
+        // No interview capture exists to stop. In particular, do not disarm
+        // a normal Pebble conversation because a stale client sent this.
         return undefined;
       }
 
@@ -840,6 +1203,12 @@ export class WebSocketService implements Service {
    * Auto-creates a task for non-trivial messages so the task board tracks agent work.
    */
   private async handleChat(msg: WSMessage, ws?: ServerWebSocket<unknown>): Promise<WSMessage | void> {
+    // The person's own turn, including the streamed answer consumed below
+    // (src/llm/origin.ts).
+    return runWithOrigin('user', () => this.handleChatTurn(msg, ws));
+  }
+
+  private async handleChatTurn(msg: WSMessage, ws?: ServerWebSocket<unknown>): Promise<WSMessage | void> {
     const payload = msg.payload as {
       text?: string;
       channel?: string;
@@ -883,6 +1252,11 @@ export class WebSocketService implements Service {
     const channel = payload.channel ?? 'websocket';
     const requestId = msg.id ?? crypto.randomUUID();
 
+    // A dashboard socket owns at most one foreground turn. This is the
+    // server-side half of typed barge-in: cancel old generation/TTS before
+    // classifying or starting the replacement message.
+    if (ws) this.cancelActiveChat(ws, 'superseded');
+
     // Text-driven Room navigation + room actions. Run the same intent
     // classifier the voice path uses on the typed text. If it parses
     // as a command (window control, navigation, room_action, "back to
@@ -907,45 +1281,19 @@ export class WebSocketService implements Service {
       // Project-scoped chat (from the Site Builder page)
       const project = await this.siteBuilderService.getProjectWithStatus(projectId);
       if (project) {
-        let fileTreeText = '';
+        let tree: FileEntry | null = null;
         try {
-          const tree = this.siteBuilderService.projectManager.getFileTree(projectId, 1);
-          fileTreeText = this.formatFileTree(tree);
+          tree = this.siteBuilderService.projectManager.getFileTree(projectId, 1);
         } catch { /* ignore */ }
-
-        siteContext = `# Site Builder Context
-
-You are working on project "${project.name}" (${project.framework}).
-- Path: ${project.path}
-- Branch: ${project.gitBranch ?? 'main'}
-- Dev server: ${project.status}
-${project.githubUrl ? `- GitHub: ${project.githubUrl}` : ''}
-${fileTreeText ? `\n## Project Structure\n\`\`\`\n${fileTreeText}\`\`\`` : ''}
-
-## Rules
-- Use site_read_file, site_write_file, site_list_files, site_run_command, site_git_commit, site_github_push tools with project_id="${projectId}".
-- Do NOT use regular read_file, write_file, or run_command — always use the site_* variants.
-- Do NOT start dev servers via site_run_command. The dev server is managed by the dashboard (make dev runs automatically).
-- Changes are auto-committed after this conversation turn completes.
-- For the "bun-react" framework: the server uses Bun.serve() with HTML imports (import from "./index.html"). Run with "bun --hot index.ts", NOT vite or webpack.`;
+        siteContext = buildProjectSiteContext(project, tree, this.siteBuilderService.autoCommitEnabled);
       }
     } else if (this.siteBuilderService) {
       // General chat (main dashboard) — give the LLM awareness of site builder projects
       try {
         const projects = await this.siteBuilderService.listProjectsWithStatus();
         if (projects.length > 0) {
-          const projectList = projects.map(p =>
-            `  - "${p.name}" (id: ${p.id}, framework: ${p.framework}, branch: ${p.gitBranch ?? 'main'}${p.githubUrl ? `, github: ${p.githubUrl}` : ''})`
-          ).join('\n');
-
-          // Most-recently-opened, used as a fallback default when the
-          // user's request offers no name hint at all.
-          const mostRecent = [...projects].sort(
-            (a, b) => (b.lastOpenedAt ?? 0) - (a.lastOpenedAt ?? 0),
-          )[0];
-          const fallbackLine = mostRecent
-            ? `\nFALLBACK PROJECT (most recently opened, use ONLY if no project name keyword matches the user's request): "${mostRecent.name}" (id: ${mostRecent.id}).`
-            : "";
+          // Every project field is model- or repo-written; see prompt-context.ts.
+          const { projectList, fallbackLine } = formatProjectList(projects);
 
           siteContext = `# Site Builder
 
@@ -996,6 +1344,12 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
         taskCommitment = createCommitment(taskLabel, {
           assigned_to: 'jarvis',
           created_from: 'user',
+          // Record which chat this came from (#571). A commitment is the one
+          // thing a turn can create whose whole effect is to schedule a LATER
+          // turn, and the tool scope is per-turn, so the executor's turn never
+          // inherited it. `projectId` is right here, so recording it costs
+          // nothing; commitment-executor.ts says why it is not yet ENFORCED.
+          ...(projectId ? { scope_id: PROJECT_SITE_CHAT_SCOPE.id } : {}),
         });
         updateCommitmentStatus(taskCommitment.id, 'active');
         taskCommitment.status = 'active';
@@ -1006,31 +1360,82 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
       }
     }
 
+    const activeChat = ws
+      ? { requestId, controller: new AbortController() }
+      : null;
+    if (ws && activeChat) this.activeChats.set(ws, activeChat);
+    let retainActiveForTTS = false;
+
     // Persist user message
     try {
       const conversation = getOrCreateConversation(channel);
       recordUserProfileTurn(text);
       addMessage(conversation.id, { role: 'user', content: text });
 
-      // Set default cwd for general tools (run_command, read_file, etc.)
-      // so they operate in the project directory during site builder conversations
-      if (projectId && this.siteBuilderService) {
-        const projectPath = this.siteBuilderService.projectManager.getProjectPath(projectId);
-        setDefaultCwd(projectPath);
-      }
+      // A chat bound to one project is held to the site tools, so the prompt's
+      // "do NOT use regular read_file, write_file, or run_command" is enforced
+      // by the registry instead of requested in prose (#561). Scoped on
+      // `projectId` alone, not on the site service being up: a project-scoped
+      // frame that found no project still must not fall back to the generic
+      // file and shell tools pointed at the project directory.
+      const scope = projectId ? PROJECT_SITE_CHAT_SCOPE : null;
 
-      const { stream, onComplete } = this.agentService.streamMessage(text, channel, siteContext);
+      // WHICH chat this is, as opposed to what it may do. There is one scope
+      // object for every project-scoped chat, so the scope alone cannot tell
+      // project A's chat from project B's -- and a delegated task's summary is
+      // rendered into its own chat's router prompt and resumable from it, so
+      // that distinction is a real boundary (#571). The project id is
+      // repo-/model-derived text used only as an opaque equality key here, so
+      // it needs no neutralising: it is never interpolated into a prompt.
+      const chatContextKey = projectId ? `site:${projectId}` : undefined;
+
+      // This used to call setDefaultCwd(projectPath) whenever `projectId` was
+      // present, so the generic tools "operate in the project directory
+      // during site builder conversations". That is the mechanism #561 is
+      // about: it is what made `read_file` and `run_command` resolve into the
+      // project with no containment, no framing and no taint, and it ran
+      // before the branch below and regardless of which one was taken.
+      //
+      // It is not set any more, and it must stay that way even now that the
+      // conv path is scoped too (#571). The default cwd is a PROCESS-WIDE
+      // global shared by every concurrent chat
+      // (actions/tools/local-tools-guard.ts), so pointing it at a project
+      // aims the generic tools of every OTHER chat in the daemon at that
+      // project's tree -- chats the site scope does not cover, because they
+      // carry no projectId. The scope closes the site chat's own use of
+      // those tools; nothing closes that one but leaving the cwd unset.
+      //
+      // The two `setDefaultCwd(null)` resets that used to end the turn went
+      // with it: nothing in production sets a non-null default cwd any more
+      // (the only remaining callers of the setter are tests), so a reset here
+      // would read as though the mechanism were still live.
+      //
+      // Nothing needed it: the site tools resolve through `project_id` and
+      // ProjectManager, not through the cwd; a card stored mid-turn already
+      // freezes its path absolute at gate time (#522); and the git refusal
+      // covers site projects through the projects dir, not through the cwd
+      // (siteRoots, file-path-policy.ts). The one thing that was genuinely
+      // lost -- a conv-path turn resolving a bare "src/App.tsx" into the
+      // project -- is restored properly now that the site prompt and the
+      // scope reach the task tier: the model is told which project it is in
+      // and hands the path to `site_read_file` with a `project_id`, which is
+      // confined to the project instead of merely aimed at it.
+      const { stream, onComplete } = this.agentService.streamMessage(text, channel, siteContext, scope, chatContextKey);
 
       // Set up streaming TTS: speak sentences as they arrive
       const ttsActive = !!(this.ttsProvider && ws);
       let ttsSentenceQueue: string[] = [];
       let ttsSpeaking = false;
       let ttsStartSent = false;
-      let ttsStreamFullyDone = false; // set AFTER relayStream returns, not per-turn 'done'
+      let ttsStreamFullyDone = false; // set AFTER relayStream returns, not on the 'done' event
       let ttsSentenceCount = 0;
       let ttsChunkCount = 0;
 
       const speakNextSentence = async () => {
+        if (activeChat?.controller.signal.aborted) {
+          ttsSentenceQueue = [];
+          return;
+        }
         if (ttsSpeaking || !ttsActive || !ws) return;
         const sentence = ttsSentenceQueue.shift();
         if (!sentence) {
@@ -1044,6 +1449,10 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
               timestamp: Date.now(),
             });
             ttsStartSent = false; // prevent duplicate tts_end
+            retainActiveForTTS = false;
+            if (activeChat && this.activeChats.get(ws) === activeChat) {
+              this.activeChats.delete(ws);
+            }
           }
           return;
         }
@@ -1053,13 +1462,17 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
         // recognizer for the duration of the audio (otherwise TTS
         // playback echoes through the mic and self-triggers).
         const sentenceHasWake = containsWakePhrase(sentence);
+        // A spoken stop phrase ("say 'Jarvis, stop'…") would echo through the
+        // mic and hit the UI's stop-phrase bypass, cancelling the very reply
+        // that's explaining it. Flag it so the UI suppresses stop matches too.
+        const sentenceHasStop = containsStopPhrase(sentence);
 
         // Send tts_start exactly once before the first audio chunk
         if (!ttsStartSent) {
           ttsStartSent = true;
           this.wsServer.sendToClient(ws, {
             type: 'tts_start',
-            payload: { requestId, containsWake: sentenceHasWake },
+            payload: { requestId, containsWake: sentenceHasWake, containsStop: sentenceHasStop },
             id: requestId,
             timestamp: Date.now(),
           });
@@ -1070,7 +1483,7 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
           // still be in the speaker buffer.)
           this.wsServer.sendToClient(ws, {
             type: 'tts_text',
-            payload: { requestId, containsWake: true },
+            payload: { requestId, containsWake: true, containsStop: sentenceHasStop },
             id: requestId,
             timestamp: Date.now(),
           });
@@ -1081,6 +1494,7 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
         try {
           if (this.ttsProvider) {
             for await (const chunk of this.ttsProvider.synthesizeStream(sentence)) {
+              if (activeChat?.controller.signal.aborted) break;
               ttsChunkCount++;
               this.wsServer.sendBinary(ws, chunk);
             }
@@ -1094,14 +1508,42 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
 
       // Relay stream to all WebSocket clients, collect full text.
       // onSentence fires for each complete sentence during streaming.
-      // NOTE: onTextDone fires per LLM turn (tool loop), NOT once at the end.
-      // We ignore onTextDone and use the relayStream return to mark stream completion.
-      const fullText = await this.streamRelay.relayStream(stream, requestId, ttsActive ? {
-        onSentence: (sentence) => {
-          ttsSentenceQueue.push(sentence);
-          speakNextSentence();
-        },
-      } : undefined);
+      // NOTE: exactly one 'done' event reaches the relay per request — the
+      // orchestrator swallows its per-iteration done events and yields a single
+      // terminal one after the tool loop settles. The dashboard relies on that:
+      // it keys the assistant message on `assistant:<requestId>` and rebuilds it
+      // from the done frame's fullText, so a second done frame for the same
+      // request would render a duplicate message under a duplicate React key.
+      // We still use the relayStream return (not onTextDone) to mark completion.
+      const fullText = await this.streamRelay.relayStream(stream, requestId, {
+        signal: activeChat?.controller.signal,
+        // Voice enters "thinking" after STT-final. Flip it off as soon as
+        // acknowledgment/final prose becomes visible instead of leaving the
+        // orb stuck there until the whole tool loop completes.
+        onTextStart: () => this.broadcastThinkingEnd(requestId),
+        ...(ttsActive ? {
+          onSentence: (sentence: string) => {
+            if (activeChat?.controller.signal.aborted) return;
+            ttsSentenceQueue.push(sentence);
+            speakNextSentence();
+          },
+        } : {}),
+      });
+
+      if (activeChat?.controller.signal.aborted) {
+        ttsSentenceQueue = [];
+        if (taskCommitment) {
+          try {
+            const updated = updateCommitmentStatus(taskCommitment.id, 'failed', 'Stopped by user');
+            if (updated) this.broadcastTaskUpdate(updated, 'updated');
+          } catch (err) {
+            console.error('[WSService] Failed to cancel task:', err);
+          } finally {
+            this.activeTaskId = null;
+          }
+        }
+        return undefined;
+      }
 
       // Stream is now fully done (all tool loop turns complete)
       ttsStreamFullyDone = true;
@@ -1117,6 +1559,7 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
           ttsStartSent = false;
         }
         // Otherwise speakNextSentence will send tts_end when queue drains
+        retainActiveForTTS = ttsSpeaking || ttsSentenceQueue.length > 0 || ttsStartSent;
       }
 
       // Persist assistant response
@@ -1141,21 +1584,20 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
         }
       }
 
-      // Clear site builder default cwd now that the turn is done
-      setDefaultCwd(null);
-
       // Fire-and-forget: run post-processing (extraction, personality)
       onComplete(fullText).catch((err) =>
         console.error('[WSService] onComplete error:', err)
       );
 
-      // Auto-commit site builder changes after chat turn
+      // Auto-commit site builder changes after chat turn (sites.auto_commit)
       if (projectId && this.siteBuilderService) {
         try {
           const projectPath = this.siteBuilderService.projectManager.getProjectPath(projectId);
           if (projectPath) {
             const commitMsg = text.length > 60 ? text.slice(0, 57) + '...' : text;
-            const commit = await this.siteBuilderService.gitManager.autoCommit(projectPath, commitMsg);
+            // Git off for the project (#523) is logged once there, not here
+            // after every turn.
+            const commit = await this.siteBuilderService.autoCommitIfEnabled(projectPath, commitMsg);
             if (commit) {
               this.broadcastSiteEvent({
                 type: 'git_commit',
@@ -1206,6 +1648,10 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
         id: requestId,
         timestamp: Date.now(),
       };
+    } finally {
+      if (ws && activeChat && !retainActiveForTTS && this.activeChats.get(ws) === activeChat) {
+        this.activeChats.delete(ws);
+      }
     }
   }
 
@@ -1214,19 +1660,38 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
    * Accumulates chunks into the active voice session for this client.
    */
   private async handleVoiceAudio(data: Buffer, ws: ServerWebSocket<unknown>): Promise<void> {
+    // A WAV upload the client explicitly opened (voice_start mode:"wav") owns
+    // its frames even while a realtime session is open on the socket: checked
+    // first, or the WAV bytes were streamed into the realtime session as PCM.
+    const session = this.voiceSessions.get(ws);
+    if (session) {
+      session.chunks.push(data);
+      return;
+    }
     // Realtime path: stream the mic frame straight into the OpenAI session.
     const realtime = this.realtimeSessions.get(ws);
     if (realtime) {
+      realtime.lastMicAt = Date.now();
       realtime.transport.pushMicChunk(data);
       return;
     }
-    const session = this.voiceSessions.get(ws);
-    if (!session) {
-      console.warn('[WSService] Binary audio received with no active voice session');
+    // A realtime start is mid-gate: hold the frames (bounded) so the first
+    // utterance isn't clipped; they flush into whichever consumer wins.
+    const pending = this.pendingVoiceFrames.get(ws);
+    if (pending) {
+      if (pending.bytes < WebSocketService.PENDING_FRAMES_MAX_BYTES) {
+        pending.chunks.push(data);
+        pending.bytes += data.length;
+      }
       return;
     }
-    session.chunks.push(data);
+    if (this.quietVoiceFrames.has(ws)) return;
+    console.warn('[WSService] Binary audio received with no active voice session');
   }
+
+  /** ~2MB ≈ 40s of 24kHz s16 mono — far beyond any gate window; the cap only
+   * exists so a client misbehaving mid-gate cannot grow the buffer unbounded. */
+  private static readonly PENDING_FRAMES_MAX_BYTES = 2 * 1024 * 1024;
 
   /**
    * Open (or reuse) a premium realtime voice session for this socket. Returns
@@ -1237,28 +1702,79 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
    * realtime (OpenAI's semantic VAD detects turns), and the session is closed
    * on disconnect or after `max_session_minutes` (cost guard).
    */
-  private tryStartRealtimeVoice(ws: ServerWebSocket<unknown>): boolean {
+  private async tryStartRealtimeVoice(ws: ServerWebSocket<unknown>, mode?: 'pcm' | 'wav'): Promise<boolean> {
     if (this.realtimeSessions.has(ws)) return true; // already streaming
 
     let resolved: ResolvedRealtimeVoice;
     try {
-      const res = resolveRealtimeVoice(this.agentService.getConfig());
-      if (!res.ok) return false;
+      const cfg = this.agentService.getConfig();
+      const res = resolveRealtimeVoice(cfg, realtimeEnablement(cfg));
+      if (!res.ok) {
+        if (mode === 'pcm') {
+          console.warn(`[WSService] realtime unavailable for a PCM voice_start (${res.reason ?? 'no reason'}), refusing session`);
+          return this.refusePcmRealtimeStart(ws, 'unavailable');
+        }
+        return false;
+      }
       resolved = res.resolved;
     } catch (err) {
       console.warn('[WSService] realtime voice resolve failed, using standard pipeline:', err);
-      return false;
+      return mode === 'pcm' ? this.refusePcmRealtimeStart(ws, 'unavailable') : false;
     }
+
+    // Buffer mic frames that arrive during the gate await below — without
+    // this the first utterance after boot/cache-clear is clipped at exactly
+    // the moment the gate exists to protect.
+    if (!this.pendingVoiceFrames.has(ws)) {
+      this.pendingVoiceFrames.set(ws, { chunks: [], bytes: 0 });
+    }
+
+    // Hosted plan gate (shared with the pebble starter + capability
+    // advertisement): cached + hard-timeout, advisory on failure.
+    //
+    // What refusal must NOT do depends on the client's capture format, which
+    // is why voice_start now carries `mode`:
+    //  - 'pcm': the client is streaming raw 24kHz PCM the WAV pipeline cannot
+    //    consume (the accumulator would concatenate headerless frames, hand
+    //    them to Whisper as audio.wav, and silently drop the turn). Report it
+    //    like the budget guard — `closed` + reason — and return true so no
+    //    standard session opens. The `plan` reason makes the client re-fetch
+    //    /api/config/voice at once, so the NEXT utterance really does go
+    //    through the standard pipeline.
+    //  - absent (older client, most likely uploading WAV): fail OPEN to the
+    //    standard pipeline. Returning true here would suppress the WAV
+    //    accumulator and silently drop every utterance for as long as the
+    //    verdict stays cached — a total voice outage, strictly worse than one
+    //    garbled transcript in the rare stale-PCM-client case.
+    //  ('wav' never reaches this method — the caller skips realtime.)
+    if (!(await hostedRealtimeIncluded(resolved))) {
+      console.warn('[WSService] realtime not included in this plan — refusing session');
+      if (mode !== 'pcm') return false; // caller seeds the accumulator with any buffered frames
+      return this.refusePcmRealtimeStart(ws, 'plan'); // raw PCM is useless to the WAV pipeline
+    }
+    // The gate await opened windows a sync starter never had:
+    //  - the client may have DISCONNECTED mid-gate. onDisconnect found no
+    //    session entry to tear down, so building one now would stream a live,
+    //    billed session into a dead socket until max_session_minutes.
+    if (!this.wsServer.getClients().has(ws)) {
+      console.warn('[WSService] client disconnected during realtime gate — not starting session');
+      this.pendingVoiceFrames.delete(ws);
+      return true;
+    }
+    //  - a second voice_start arriving mid-gate would build a SECOND session
+    //    and orphan the first (billed audio, teardown of the wrong one).
+    //    First-in wins.
+    if (this.realtimeSessions.has(ws)) return true;
 
     // Monthly spend guard: refuse new sessions once the estimated budget is
     // hit. Returns true (caller skips the standard accumulator) but opens no
     // session. Sent as `closed` (not `error`) + a message so the client stops
     // the mic via the normal close path and surfaces the reason, rather than a
-    // bare error flash. Falling through to the standard pipeline would be wrong:
-    // the client is already streaming raw realtime PCM, which the WAV-based path
-    // can't consume.
+    // bare error flash. Falling through to the standard pipeline would be wrong
+    // for the same reason as the plan gate above.
     if (resolved.monthlyBudgetUsd && !this.getRealtimeBudget().canStart(resolved.monthlyBudgetUsd)) {
       console.warn('[WSService] realtime monthly budget reached — refusing new session');
+      this.quietVoiceFrames.add(ws); // frames already on the wire have nowhere to go
       this.wsServer.sendToClient(ws, {
         type: 'realtime_status',
         payload: {
@@ -1273,7 +1789,7 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
 
     const orchestrator = this.agentService.getOrchestrator();
     const transport = new BrowserAudioTransport({
-      sendAudio: (chunk) => this.wsServer.sendBinary(ws, chunk),
+      sendAudio: this.realtimeAudioSink(ws),
       signalStopPlayback: () =>
         this.wsServer.sendToClient(ws, { type: 'tts_end', payload: { bargeIn: true }, timestamp: Date.now() }),
       // OpenAI requires input rate >= 24kHz; the browser client must capture/
@@ -1282,6 +1798,10 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
       outputSampleRate: 24000,
     });
 
+    // Session callbacks are keyed by socket. A late event from a session that
+    // has already been replaced on this socket must not tear down, or announce,
+    // its successor.
+    const isCurrent = () => this.realtimeSessions.get(ws)?.session === session;
     const session = new RealtimeVoiceSession(resolved, transport, {
       // Agent tools + dashboard navigation/in-room-action tools so the model
       // can drive the UI by voice (open settings, turn off TTS, go back…).
@@ -1297,6 +1817,10 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
         if (nav !== null) return Promise.resolve(nav);
         return orchestrator.executeRealtimeToolCall(name, args, { blockedCategories: resolved.blockedCategories });
       },
+      // Voice has no turn objects: the user starting to speak is the taint
+      // gating boundary (ordered before that utterance's tool calls; the
+      // transcript event is not).
+      onUserTurnStart: () => orchestrator.resetRealtimeTaint(),
       onTranscript: (t) =>
         this.wsServer.sendToClient(ws, {
           type: 'realtime_transcript',
@@ -1306,8 +1830,14 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
       onError: (err) => {
         console.error('[WSService] realtime voice error:', err);
         this.wsServer.sendToClient(ws, { type: 'realtime_status', payload: { state: 'error', message: err }, timestamp: Date.now() });
+        // The dashboard ends its side on this status (mic stopped, output
+        // dropped), so a daemon session left open would stream billed audio
+        // nobody hears until max_session_minutes. Benign errors never get here
+        // (RealtimeSession swallows them). No `closed` follows: the client
+        // already handled the end, and a close would cut its error flash.
+        if (isCurrent()) this.closeRealtimeVoice(ws, { notify: false });
       },
-      onClose: () => this.closeRealtimeVoice(ws),
+      onClose: () => { if (isCurrent()) this.closeRealtimeVoice(ws); },
     });
 
     const timeout = setTimeout(() => {
@@ -1315,12 +1845,27 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
       this.closeRealtimeVoice(ws);
     }, resolved.maxSessionMinutes * 60_000);
 
-    this.realtimeSessions.set(ws, { session, transport, timeout, startedAt: Date.now() });
+    // Frames that arrived mid-gate belong to this utterance; the transport
+    // buffers pre-connect frames itself, so pushing before connect is safe.
+    const gateBuffered = this.pendingVoiceFrames.get(ws);
+    this.pendingVoiceFrames.delete(ws);
+    // Any accumulator still here predates the session (a WAV or mode-less start
+    // that never got its voice_end). handleVoiceAudio checks accumulators first,
+    // so a stale one would swallow every realtime mic frame.
+    this.voiceSessions.delete(ws);
+    this.realtimeSessions.set(ws, {
+      session, transport, timeout, startedAt: Date.now(),
+      hosted: resolved.provider === 'usejarvis_ai',
+      lastMicAt: gateBuffered?.chunks.length ? Date.now() : 0,
+    });
+    if (gateBuffered) for (const frame of gateBuffered.chunks) transport.pushMicChunk(frame);
     session.connect().then(
-      () => this.wsServer.sendToClient(ws, { type: 'realtime_status', payload: { state: 'live', model: resolved.model }, timestamp: Date.now() }),
+      () => {
+        if (isCurrent()) this.wsServer.sendToClient(ws, { type: 'realtime_status', payload: { state: 'live', model: resolved.model }, timestamp: Date.now() });
+      },
       (err) => {
         console.error('[WSService] realtime connect failed:', err);
-        this.closeRealtimeVoice(ws);
+        if (isCurrent()) this.closeRealtimeVoice(ws);
       },
     );
     return true;
@@ -1379,21 +1924,85 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
     return this.realtimeBudget;
   }
 
-  /** Tear down a realtime voice session and notify the client. */
-  private closeRealtimeVoice(ws: ServerWebSocket<unknown>): void {
+  /**
+   * Where a realtime session's output audio goes: this socket, tagged so the
+   * dashboard can tell it from encoded TTS arriving on the same socket
+   * (src/comms/realtime-frame.ts).
+   */
+  private realtimeAudioSink(ws: ServerWebSocket<unknown>): (chunk: Buffer) => void {
+    return (chunk) => {
+      const tagged = tagRealtimePcm(chunk);
+      this.wsServer.sendBinary(ws, Buffer.from(tagged.buffer, tagged.byteOffset, tagged.byteLength));
+    };
+  }
+
+  /** Mic audio this recent means the user is in a realtime turn. */
+  private static readonly REALTIME_MIC_ACTIVE_MS = 2_000;
+
+  /**
+   * True while this socket's realtime session is mid-turn: the model has a
+   * response in flight or requested, or the user's mic streamed into it within
+   * the last REALTIME_MIC_ACTIVE_MS.
+   */
+  private realtimeTurnActive(ws: ServerWebSocket<unknown>): boolean {
+    const entry = this.realtimeSessions.get(ws);
+    if (!entry) return false;
+    return entry.session.isResponding || Date.now() - entry.lastMicAt < WebSocketService.REALTIME_MIC_ACTIVE_MS;
+  }
+
+  private static readonly PCM_REFUSAL_MESSAGES = {
+    plan: 'Live voice is not included in your plan, so this session was not started. '
+      + 'Say that again and it will go through the standard voice pipeline.',
+    unavailable: 'Live voice is not available right now, so this session was not started. '
+      + 'Say that again and it will go through the standard voice pipeline.',
+  } as const;
+
+  /**
+   * Refuse a PCM voice_start that realtime cannot serve: the hosted plan
+   * excludes it (`plan`), or it is off or not configured (`unavailable`). The
+   * client is streaming raw 24 kHz frames the WAV accumulator cannot consume,
+   * and its settings poll can still say realtime is on, so falling back to the
+   * standard pipeline would silently drop the turn. The `closed` status and its
+   * reason make the client re-check availability before the next utterance.
+   * Returns true so no standard session opens.
+   */
+  private refusePcmRealtimeStart(ws: ServerWebSocket<unknown>, reason: 'plan' | 'unavailable'): true {
+    this.pendingVoiceFrames.delete(ws);
+    this.quietVoiceFrames.add(ws);
+    this.wsServer.sendToClient(ws, {
+      type: 'realtime_status',
+      payload: { state: 'closed', reason, message: WebSocketService.PCM_REFUSAL_MESSAGES[reason] },
+      timestamp: Date.now(),
+    });
+    return true;
+  }
+
+  /** Tear down a realtime voice session and (unless told not to) notify the client. */
+  private closeRealtimeVoice(ws: ServerWebSocket<unknown>, { notify = true }: { notify?: boolean } = {}): void {
     const entry = this.realtimeSessions.get(ws);
     if (!entry) return;
     this.realtimeSessions.delete(ws);
+    this.quietVoiceFrames.add(ws);
     clearTimeout(entry.timeout);
     // Record estimated spend against the monthly budget (only meaningful when a
     // budget is set; recording always is cheap and keeps the cap honest if one
     // is added mid-month).
-    try {
-      this.getRealtimeBudget().recordSessionSeconds((Date.now() - entry.startedAt) / 1000);
-    } catch (err) {
-      console.warn('[WSService] failed to record realtime spend:', err);
+    //
+    // EXCEPT on the hosted path, where the proxy is the billing authority and
+    // the local $/min estimate is deliberately unset. Writing hosted minutes
+    // into this shared ledger would charge them to a BYO key later: a user who
+    // runs 90 hosted minutes and then adds their own OpenAI key with a $25 cap
+    // would find $27 of spend they never incurred, and realtime refused
+    // immediately.
+    if (!entry.hosted) {
+      try {
+        this.getRealtimeBudget().recordSessionSeconds((Date.now() - entry.startedAt) / 1000);
+      } catch (err) {
+        console.warn('[WSService] failed to record realtime spend:', err);
+      }
     }
     try { entry.session.close(); } catch { /* ignore */ }
+    if (!notify) return;
     try {
       this.wsServer.sendToClient(ws, { type: 'realtime_status', payload: { state: 'closed' }, timestamp: Date.now() });
     } catch { /* socket may already be gone */ }
@@ -1413,9 +2022,8 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
   /**
    * Phase B — onboarding interview message handler. Drives the
    * `onboarding-interviewer` module's agent loop, streams the
-   * assistant text back to the UI as an `interview_assistant`
-   * message, and (optionally) speaks it via TTS so the orb can
-   * play the question aloud.
+   * assistant text back to the UI as an `interview_assistant` message.
+   * Interview replies are always written, independently of voice settings.
    *
    * `userText === null` means "start the interview" (first turn);
    * the agent opens with its scripted intro + first question.
@@ -1425,13 +2033,48 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
   private async handleInterviewMessage(
     ws: ServerWebSocket<unknown>,
     userText: string | null,
-    speakReply: boolean,
   ): Promise<void> {
-    let session = this.interviewSessions.get(ws);
-    if (!session) {
-      session = createInterviewSession();
-      this.interviewSessions.set(ws, session);
+    if (!this.interviewSessions.has(ws)) {
+      this.interviewSessions.set(ws, createInterviewSession());
     }
+
+    // One turn at a time per session. `runInterviewTurn` mutates the session's
+    // message history across awaits, so two overlapping turns interleave into
+    // a history no provider will accept (two user turns in a row, orphaned
+    // tool results). Hold an additional typed reply until the current turn
+    // finishes instead of dropping it or racing.
+    if (this.interviewTurnsInFlight.has(ws)) {
+      if (userText) {
+        const queued = this.interviewPendingText.get(ws);
+        // Preserve the order of additional text sent during a pending turn.
+        this.interviewPendingText.set(ws, queued ? `${queued} ${userText}` : userText);
+      }
+      return;
+    }
+
+    this.interviewTurnsInFlight.add(ws);
+    try {
+      await this.runInterviewTurnForSocket(ws, userText);
+    } finally {
+      this.interviewTurnsInFlight.delete(ws);
+    }
+
+    // Drain whatever landed mid-turn. Dropped when the interview wrapped or
+    // the socket went away while we were talking.
+    const pending = this.interviewPendingText.get(ws);
+    this.interviewPendingText.delete(ws);
+    if (pending && this.interviewSessions.has(ws)) {
+      await this.handleInterviewMessage(ws, pending);
+    }
+  }
+
+  /** One written interview turn: run the agent, send the text, wrap up. */
+  private async runInterviewTurnForSocket(
+    ws: ServerWebSocket<unknown>,
+    userText: string | null,
+  ): Promise<void> {
+    const session = this.interviewSessions.get(ws);
+    if (!session) return;
 
     const llm = this.agentService.getLLMManager();
     // Just check that at least one provider is registered. The interviewer
@@ -1451,6 +2094,7 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
       result = await runInterviewTurn(session, llm, userText);
     } catch (err) {
       console.error('[WSService] Interview turn failed:', err);
+      if (this.interviewSessions.get(ws) !== session) return;
       this.wsServer.sendToClient(ws, {
         type: 'interview_error',
         payload: { message: err instanceof Error ? err.message : String(err) },
@@ -1459,68 +2103,21 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
       return;
     }
 
+    // A disconnected or replaced session must not receive a late reply.
+    if (this.interviewSessions.get(ws) !== session) return;
     const text = result.assistantText.trim();
 
-    // Decide up-front whether audio will follow, and TELL the UI in the
-    // text message. The UI must not guess: when it assumed TTS based on
-    // its own (possibly stale) settings fetch and no `tts_start` ever
-    // arrived — e.g. TTS disabled, or no provider loaded — it sat in
-    // "Jarvis is thinking…" forever with the composer disabled.
-    const willSpeak = Boolean(speakReply && this.ttsProvider && text);
-
-    // Send the text reply for the UI to render in the chat-bubble
-    // layout (always — the bubble is the visual record even when TTS
-    // is on).
+    // Keep will_speak explicit so an older dashboard does not wait for TTS.
     this.wsServer.sendToClient(ws, {
       type: 'interview_assistant',
       payload: {
         text,
         facts_recorded: result.factsRecorded,
         done: result.done,
-        will_speak: willSpeak,
+        will_speak: false,
       },
       timestamp: Date.now(),
     });
-
-    // Stream the audio via the existing `tts_start` + binary chunks
-    // pipeline so the UI's MicOrb plays it through the normal
-    // "speaking" state machine.
-    if (willSpeak && this.ttsProvider) {
-      const requestId = `interview-${Date.now()}`;
-      // Tracks whether the tts_start frame went out: the finally block
-      // below closes it with tts_end exactly when it was opened, so a
-      // provider that throws -- even before the first chunk -- never
-      // strands the UI in "speaking" with no audio and no tts_end.
-      let ttsStarted = false;
-      try {
-        this.wsServer.sendToClient(ws, {
-          type: 'tts_start',
-          // containsWake=true conservatively suppresses the wake
-          // recognizer for the entire interview reply — interviews
-          // are short and we don't need "Jarvis" interrupts here.
-          payload: { requestId, containsWake: true },
-          id: requestId,
-          timestamp: Date.now(),
-        });
-        ttsStarted = true;
-        for await (const chunk of this.ttsProvider.synthesizeStream(text)) {
-          this.wsServer.sendBinary(ws, chunk);
-        }
-      } catch (err) {
-        console.warn('[WSService] Interview TTS failed:', err);
-      } finally {
-        // Always close the TTS frame once it was opened — a synthesis
-        // failure mid-stream must not leave the UI waiting forever.
-        if (ttsStarted) {
-          this.wsServer.sendToClient(ws, {
-            type: 'tts_end',
-            payload: { requestId },
-            id: requestId,
-            timestamp: Date.now(),
-          });
-        }
-      }
-    }
 
     if (result.done) {
       this.wsServer.sendToClient(ws, {
@@ -1532,6 +2129,7 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
         timestamp: Date.now(),
       });
       this.interviewSessions.delete(ws);
+      this.endInterviewSession(ws);
     }
   }
 
@@ -1551,7 +2149,7 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
     try {
       const transcript = await this.sttProvider.transcribe(audioBuffer);
       if (!transcript.trim()) return;
-      await this.processVoiceTranscript(transcript, session.requestId, ws, session.currentRoom);
+      await this.processVoiceTranscript(transcript, session.requestId, ws, session.currentRoom, session.shownApprovalId);
     } catch (err) {
       console.error('[WSService] Voice session error:', err);
       const message = err instanceof Error ? err.message : 'Voice processing failed';
@@ -1627,11 +2225,38 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
     requestId: string,
     ws: ServerWebSocket<unknown>,
     currentRoom?: string,
+    shownApprovalId?: string | null,
+  ): Promise<void> {
+    // The person speaking: the intent classifier and any turn it hands to chat.
+    return runWithOrigin('user', () => this.processVoiceTranscriptTurn(transcript, requestId, ws, currentRoom, shownApprovalId));
+  }
+
+  private async processVoiceTranscriptTurn(
+    transcript: string,
+    requestId: string,
+    ws: ServerWebSocket<unknown>,
+    currentRoom?: string,
+    shownApprovalId?: string | null,
   ): Promise<void> {
     const trimmed = transcript.trim();
     if (!trimmed) return;
 
     console.log('[WSService] Voice transcript:', trimmed);
+
+    // Hard interrupt is transport control, not a conversational turn. Do it
+    // before transcript echo/classification so "Jarvis stop" never produces a
+    // user bubble, an LLM answer, or another overlapping TTS stream.
+    if (isVoiceStopCommand(trimmed)) {
+      this.cancelActiveChat(ws, 'voice');
+      this.realtimeSessions.get(ws)?.session.interrupt();
+      this.wsServer.sendToClient(ws, {
+        type: 'tts_end',
+        payload: { requestId, cancelled: true },
+        id: requestId,
+        timestamp: Date.now(),
+      });
+      return;
+    }
 
     // Echo transcript back so the UI shows it as a user message immediately,
     // regardless of which routing path the classifier picks.
@@ -1765,10 +2390,15 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
     if (route === 'act' && intent.confirmation_response) {
       const decision = intent.confirmation_response;
       try {
-        const resolved = await this.resolveLatestPendingByVoice(decision, intent.confidence);
+        const resolved = await this.resolveLatestPendingByVoice(decision, intent.confidence, shownApprovalId);
         if (resolved) {
-          if (resolved.kind === 'gated') {
-            this.broadcastVoiceApprovalGated(resolved.label, resolved.message, requestId);
+          if (resolved.kind === 'refused') {
+            // In the thread, where the person reads replies: nothing was
+            // decided, and which request is waiting (#809).
+            this.broadcastAssistantAck(resolved.message, requestId);
+          } else if (resolved.kind === 'gated') {
+            // In the thread too, and saying which reason (#856).
+            this.broadcastAssistantAck(resolved.message, requestId);
           } else {
             const verb = decision === 'approve' ? 'Approving' : 'Cancelling';
             this.broadcastAssistantAck(`${verb} ${resolved.label}.`, requestId);
@@ -1841,13 +2471,35 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
    *
    * Returns null when nothing is pending so the caller can fall through to
    * the chat agent (so "yes" still means "yes, I agree" in conversation).
+   *
+   * An approval is decided only when it is the one the person was answering
+   * (#809): `shownApprovalId` is the newest pending approval the dashboard
+   * showed when they started speaking (`shownApprovalIdFrom`), and the newest
+   * pending approval now must be that one. This used to resolve whatever was
+   * newest at the moment the transcript arrived, so a request that came in
+   * while the person was saying "yes" was the one approved, and the reply
+   * named it by the engine's reason ("execute_command requires user
+   * approval"), so nothing told them it was not what they had read. A
+   * mismatch is `refused`, with a message saying nothing was decided and what
+   * is waiting (`voiceApprovalMismatch`).
+   *
+   * The same holds when the approval they were answering has gone and nothing
+   * else is pending: their "yes" was not about a clarifier or a repeat-back,
+   * so it confirms neither.
+   *
+   * And it holds only while one approval is pending (#855): with two cards up,
+   * the one on top is not necessarily the one they read, so a yes or no is
+   * `refused` (`voiceApprovalAmbiguous`) and each is decided on its card. A
+   * mismatch is reported first, since it says more about what happened.
    */
   async resolveLatestPendingByVoice(
     decision: 'approve' | 'cancel',
     confidence = 1,
+    shownApprovalId?: string | null,
   ): Promise<
     | { kind: 'approval' | 'clarifier' | 'repeat_back'; label: string }
-    | { kind: 'gated'; label: string; message: string }
+    | { kind: 'gated'; label: string; reason: VoiceApprovalGateReason; message: string }
+    | { kind: 'refused'; message: string }
     | null
   > {
     // 1. Pending approvals — newest first.
@@ -1855,13 +2507,54 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
       const pending = this.approvalManager.getPending();
       if (pending.length > 0) {
         const latest = pending.reduce((a, b) => (a.created_at > b.created_at ? a : b));
-        const label = (latest.reason && latest.reason.trim()) || latest.tool_name;
+        const label = voiceApprovalLabel(latest);
+
+        const shown = typeof shownApprovalId === 'string' ? this.approvalManager.getRequest(shownApprovalId) : null;
+        const mismatch = voiceApprovalMismatch(decision, latest, shownApprovalId, shown);
+        if (mismatch) {
+          // Nothing decided; logged like a gated reply so a refused voice
+          // decision is forensically visible against the request it did not
+          // touch.
+          this.auditTrail?.log({
+            agent_id: latest.agent_id,
+            agent_name: latest.agent_name,
+            tool_name: latest.tool_name,
+            action_category: latest.action_category as ActionCategory,
+            authority_decision: 'approval_required',
+            approval_id: latest.id,
+            executed: false,
+            channel: 'voice',
+          });
+          return { kind: 'refused', message: mismatch };
+        }
+        if (pending.length > 1) {
+          // The newest is the one shown, but it is not the only one (#855):
+          // the person may have been reading any card on the rail.
+          this.auditTrail?.log({
+            agent_id: latest.agent_id,
+            agent_name: latest.agent_name,
+            tool_name: latest.tool_name,
+            action_category: latest.action_category as ActionCategory,
+            authority_decision: 'approval_required',
+            approval_id: latest.id,
+            executed: false,
+            channel: 'voice',
+          });
+          return { kind: 'refused', message: voiceApprovalAmbiguous(decision, pending.length) };
+        }
 
         // Two-tier safety: destructive impacts never resolve by voice;
         // non-destructive require confidence ≥ 0.85. Gate decision is a
         // pure helper so it's unit-testable without spinning up the
         // approval pipeline. See gateVoiceApprovalResolution.
-        const gate = gateVoiceApprovalResolution(latest.action_category as ActionCategory, confidence);
+        // A request whose tool marked it click-only (`confirm: 'always'`,
+        // `approvalNeedsClick`) is gated like a destructive one, the card must
+        // be clicked, but reported as click_only (#856): it may not be
+        // destructive at all. Checked first, so a request that is both is
+        // reported as click_only.
+        const gate = approvalNeedsClick(latest)
+          ? { kind: 'clarify' as const, reason: 'click_only' as const }
+          : gateVoiceApprovalResolution(latest.action_category as ActionCategory, confidence);
         if (gate.kind === 'clarify') {
           // Pending approval STAYS in the queue — user can resolve via
           // dashboard click. We log a 'voice' channel audit row marked
@@ -1877,7 +2570,8 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
             executed: false,
             channel: 'voice',
           });
-          return { kind: 'gated', label, message: gate.message };
+          const why: VoiceApprovalGateReason = gate.reason === 'destructive_impact' ? 'destructive' : gate.reason;
+          return { kind: 'gated', label, reason: why, message: voiceApprovalGatedMessage(decision, why, latest) };
         }
 
         if (decision === 'approve') {
@@ -1899,7 +2593,7 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
           // endpoint: inline requests are executed by the blocked gate.
           if (this.deferredExecutor && approved.tool_name !== 'request_approval' && approved.execution_mode !== 'inline') {
             try {
-              await this.deferredExecutor.executeApproved(latest.id);
+              await this.deferredExecutor.executeApproved(latest.id, 'voice');
             } catch (err) {
               console.warn('[WSService] voice-approved execution failed:', err);
             }
@@ -1927,6 +2621,12 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
         const updated = this.approvalManager.getRequest(latest.id);
         if (updated) this.broadcastApprovalUpdate(updated);
         return { kind: 'approval', label };
+      }
+      if (typeof shownApprovalId === 'string') {
+        // They were answering an approval that is no longer pending: decided
+        // on another surface, or expired. Their "yes" was about that card.
+        const nothing = decision === 'approve' ? "I haven't approved anything" : "I haven't cancelled anything";
+        return { kind: 'refused', message: `The request you were looking at has already been decided or has expired, so ${nothing}. Nothing else is waiting for approval.` };
       }
     }
 
@@ -2018,29 +2718,6 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
     this.wsServer.broadcast(message);
   }
 
-  /**
-   * Broadcast a "voice approval gated" notice — the user's spoken yes/no
-   * was heard but suppressed because either the action is destructive
-   * (always click) or STT confidence was too low (please repeat or click).
-   *
-   * The pending approval STAYS in the queue; this notice tells the UI
-   * to show a transient banner so the user knows their voice didn't
-   * resolve anything (vs silent no-op which would be confusing).
-   */
-  private broadcastVoiceApprovalGated(label: string, message: string, requestId?: string): void {
-    const wsMessage: WSMessage = {
-      type: 'notification',
-      payload: {
-        source: 'voice_approval_gated',
-        label,
-        message,
-      },
-      id: requestId,
-      timestamp: Date.now(),
-    };
-    this.wsServer.broadcast(wsMessage);
-  }
-
   /** Broadcast: classifier didn't understand; ask the user to confirm the verbatim transcript. */
   private broadcastRepeatBackRequest(pending: PendingVoiceConfirmation): void {
     const message: WSMessage = {
@@ -2057,9 +2734,10 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
   }
 
   /**
-   * Public exposure of `formatApprovalIntent` so api-routes can produce the
-   * same intent string for REST responses (Phase 5B audit fix). Falls back
-   * to `reason || tool_name` if the helper isn't available.
+   * The joined approval sentence the WS broadcasts send as `intent`
+   * (`formatApprovalIntent`). The REST listing now calls
+   * `approvalIntentFields` itself; this stays for callers that hold only the
+   * service.
    */
   computeApprovalIntent(request: ApprovalRequest): string {
     return formatApprovalIntent(request);
@@ -2282,73 +2960,6 @@ function looksLikeCommitment(text: string): boolean {
 }
 
 /**
- * Build a short imperative sentence describing an approval request, for use
- * as the `intent` field in the dashboard ApprovalCard. Prefers the LLM-supplied
- * reason when it looks like a complete sentence; otherwise synthesizes one
- * from tool_name + arguments.
- */
-function formatApprovalIntent(request: ApprovalRequest): string {
-  const reason = (request.reason ?? '').trim();
-
-  // `reason` is usually an imperative sentence drafted by the LLM (e.g.,
-  // "Reply to Anya — move Monday review to 3pm"). Keep it as-is when present.
-  if (reason.length > 0) return reason;
-
-  let args: Record<string, unknown> = {};
-  try {
-    args = JSON.parse(request.tool_arguments ?? '{}');
-  } catch {
-    // fall through with empty args
-  }
-
-  // Per-tool fallbacks for the common destructive/external intents.
-  switch (request.tool_name) {
-    case 'send_email': {
-      const to = asString(args.to) ?? 'someone';
-      const subject = asString(args.subject);
-      return subject
-        ? `Send email to ${to} — "${subject}"`
-        : `Send email to ${to}`;
-    }
-    case 'send_message': {
-      const channel = asString(args.channel) ?? 'channel';
-      return `Send message via ${channel}`;
-    }
-    case 'run_command':
-    case 'execute_command': {
-      const cmd = asString(args.command) ?? 'a shell command';
-      return `Run: ${cmd}`;
-    }
-    case 'delete_file':
-    case 'delete_data': {
-      const path = asString(args.path) ?? asString(args.target) ?? 'the target';
-      return `Delete ${path}`;
-    }
-    case 'install_software': {
-      const pkg = asString(args.package) ?? asString(args.name) ?? 'software';
-      return `Install ${pkg}`;
-    }
-    case 'make_payment': {
-      const amount = asString(args.amount) ?? asString(args.total);
-      const to = asString(args.recipient) ?? asString(args.to) ?? 'recipient';
-      return amount ? `Pay ${amount} to ${to}` : `Make a payment to ${to}`;
-    }
-    case 'spawn_agent': {
-      const role = asString(args.role) ?? 'an agent';
-      return `Spawn ${role}`;
-    }
-    default: {
-      const verb = request.tool_name.replace(/_/g, ' ');
-      return `${verb}`.replace(/^./, (c) => c.toUpperCase());
-    }
-  }
-}
-
-function asString(v: unknown): string | undefined {
-  return typeof v === 'string' && v.length > 0 ? v : undefined;
-}
-
-/**
  * Short ack message for window-control voice commands. Mirrors the
  * "Opening the X room." style of the navigation acks.
  */
@@ -2500,16 +3111,16 @@ function ackForRoomAction(ra: { room: string; action: string; args?: Record<stri
     case 'test_provider':
       return a.provider ? `Testing ${String(a.provider)}.` : `Testing provider.`;
     case 'enable_telegram':
-      return `Enabling Telegram. Restart Jarvis to apply.`;
+      return `Enabling Telegram.`;
     case 'disable_telegram':
-      return `Disabling Telegram. Restart Jarvis to apply.`;
+      return `Disabling Telegram.`;
     case 'enable_discord':
-      return `Enabling Discord. Restart Jarvis to apply.`;
+      return `Enabling Discord.`;
     case 'disable_discord':
-      return `Disabling Discord. Restart Jarvis to apply.`;
+      return `Disabling Discord.`;
     case 'set_stt_provider':
       return a.provider
-        ? `Setting STT to ${String(a.provider)}. Restart Jarvis to apply.`
+        ? `Setting STT to ${String(a.provider)}.`
         : `Updating STT provider.`;
     case 'enable_tts':
       return `Turning on text to speech.`;

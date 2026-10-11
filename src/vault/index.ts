@@ -36,6 +36,7 @@ export {
   updateFact,
   deleteFact,
   verifyFact,
+  correctFact,
 } from './facts.ts';
 
 // Re-export relationships module
@@ -71,11 +72,13 @@ export {
 } from './observations.ts';
 
 // Re-export vectors module
-export type { VectorRecord } from './vectors.ts';
+export type { VectorRecord, SimilarityMatch } from './vectors.ts';
 export {
   storeVector,
   findSimilar,
+  findSimilarByRef,
   deleteVectors,
+  countVectors,
 } from './vectors.ts';
 
 // Re-export extractor module

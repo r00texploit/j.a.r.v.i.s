@@ -63,10 +63,15 @@ type PanelSpec struct {
 	// SummonHotkey, if non-empty, registers a global OS hotkey that
 	// toggles cursor-follow on this panel and dispatches a JS callback
 	// in the page (`window.__pebble_summon` / `window.__pebble_dismiss`)
-	// to set the visual state. Format: "ctrl+space", "alt+j", etc.
-	// Currently only "ctrl+space" is supported (Win11). Returns an error
-	// silently logged on platforms where global hotkeys aren't wired yet
-	// (macOS / Linux); the panel still spawns and follows cursor.
+	// to set the visual state. Format: "ctrl+space", "alt+j", etc -- the
+	// shared grammar in hotkeys_keyspec.go, the same one the pebble uses.
+	//
+	// Wired on all three platforms: panels_runtime.go calls the same
+	// startHotkeyListener the pebble does. A registration that fails is
+	// logged and non-fatal; the panel still spawns and follows the cursor.
+	// Nothing in the daemon sets this today, so the path is unreachable in
+	// practice -- which is why its "registered" log line does not append
+	// hotkeyAccessibilityCaveat() the way the pebble's does (#563).
 	SummonHotkey string `json:"summon_hotkey"`
 	// Fullscreen sizes the window to the primary monitor and disables
 	// window movement (the Clicky pattern). The page is responsible for
@@ -201,6 +206,10 @@ func resolveSpec(spec PanelSpec) PanelSpec {
 
 // ErrPanelUnknown is returned by Close/Focus when the id is not registered.
 var ErrPanelUnknown = errors.New("panel not found")
+
+// errPanelWindowClosed is returned by Focus/SetWindowState when the id is still
+// registered but its window has already closed (see panelImpl.windowClosed).
+var errPanelWindowClosed = errors.New("window already closed")
 
 // ErrPanelExists is returned by Spawn when a non-multi-instance panel with
 // the same id is already open. Callers should Focus(id) instead.

@@ -1,13 +1,155 @@
-import { TerminalExecutor, type CommandResult } from './executor.ts';
-import { readFileSync, existsSync } from 'node:fs';
+import type { CommandResult } from './executor.ts';
+import { readFileSync, existsSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import { sanitizedEnv, type ExtraEnv } from '../../util/subprocess-env.ts';
 
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+/** The Windows programs the daemon runs from WSL, and where each lives under the Windows directory. */
+const WINDOWS_SYSTEM_EXES = {
+  'cmd.exe': ['System32', 'cmd.exe'],
+  'clip.exe': ['System32', 'clip.exe'],
+  'powershell.exe': ['System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'],
+} as const;
+export type WindowsSystemExe = keyof typeof WINDOWS_SYSTEM_EXES;
+
+/** /proc/mounts escapes space, tab, newline and backslash in a path as \ooo. */
+function unescapeMountField(field: string): string {
+  return field.replace(/\\([0-7]{3})/g, (_, oct: string) => String.fromCharCode(parseInt(oct, 8)));
+}
+
+/**
+ * Where each whole Windows drive is mounted, read from the kernel's mount
+ * table: a drvfs mount (9p on WSL2, drvfs on WSL1) whose source is a drive
+ * root, `C:\`. Mounts of a folder on a drive (Docker Desktop's
+ * `C:\Program Files\Docker\...`) are not drive roots and are skipped.
+ *
+ * One mount per drive, the first listed (#896 review): the automount happens
+ * as the distro starts, so it is listed before anything mounted later -- and
+ * a mount another distro makes under the shared /mnt/wsl shows up here too,
+ * with whatever source string it was given. Nothing under /mnt/wsl is taken.
+ * C: first, then the rest in drive order.
+ *
+ * @internal Exported for wsl-bridge.test.ts.
+ */
+export function drvfsDriveRoots(mounts: string): Array<{ drive: string; mountPoint: string }> {
+  const roots = new Map<string, string>();
+  for (const line of mounts.split('\n')) {
+    const [source, rawMountPoint, fsType] = line.split(' ');
+    if (!source || !rawMountPoint || !fsType) continue;
+    if (fsType !== '9p' && fsType !== 'drvfs') continue;
+    const drive = /^([A-Za-z]):\\?$/.exec(unescapeMountField(source))?.[1]?.toUpperCase();
+    if (!drive || roots.has(drive)) continue;
+    const mountPoint = unescapeMountField(rawMountPoint);
+    if (mountPoint === '/mnt/wsl' || mountPoint.startsWith('/mnt/wsl/')) continue;
+    roots.set(drive, mountPoint);
+  }
+  const rank = (drive: string) => (drive === 'C' ? 0 : 1);
+  return [...roots].map(([drive, mountPoint]) => ({ drive, mountPoint }))
+    .sort((a, b) => rank(a.drive) - rank(b.drive) || a.drive.localeCompare(b.drive));
+}
+
+let windowsDirForTests: string | null = null;
+let mountTableForTests: string | null = null;
+
+/** @internal Test only: use `dir` as the Windows directory (null restores the mount table). */
+export function __setWindowsDirForTests(dir: string | null): void {
+  windowsDirForTests = dir;
+}
+
+/** @internal Test only: read this text instead of /proc/self/mounts (null restores it). */
+export function __setMountTableForTests(text: string | null): void {
+  mountTableForTests = text;
+}
+
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The absolute path of a Windows system program, found under the Windows
+ * directory of a mounted drive rather than through PATH (#896).
+ *
+ * WSL appends the Windows PATH to the distro's, so a bare `powershell.exe`
+ * runs the first one on that combined list, and System32 is not near the
+ * front of it: measured on a stock WSL2 install, PATH put ~/.local/bin,
+ * ~/.bun/bin, the usual Linux dirs and six third-party Windows dirs (Microsoft
+ * MPI, four Razer SDK dirs, the WSL app package) ahead of
+ * /mnt/c/Windows/system32. A `powershell.exe` or `clip.exe` placed in any of
+ * those would be the one that ran, and saw the clipboard or the script.
+ *
+ * The system drive's own mount is the anchor instead: the mount table comes
+ * from the kernel, and the Windows directory on the system drive is writable
+ * only by an administrator.
+ *
+ * Which drive is the system drive is decided once, by the kernel image
+ * (Windows\System32\ntoskrnl.exe), C: first; the program is then taken from
+ * that drive or not at all (#896 review). Looking for the program itself on
+ * every drive in turn would let a drive where anyone can create folders -- a
+ * second NTFS volume's root, a FAT/exFAT stick -- supply it whenever the
+ * system drive's copy was missing. A non-C system drive is still found when
+ * C: holds no Windows at all; a drive lettered before it that plants a
+ * kernel image could then win, which is a machine whose drive letters an
+ * attacker already chose. Throws when there is no system drive or the program
+ * is not on it, which means interop is not usable and nothing should run.
+ */
+export function windowsSystemExe(name: WindowsSystemExe, mounts?: string): string {
+  const rel = WINDOWS_SYSTEM_EXES[name];
+  if (windowsDirForTests !== null) return join(windowsDirForTests, ...rel);
+  let table = mounts ?? mountTableForTests ?? undefined;
+  if (table === undefined) {
+    try {
+      table = readFileSync('/proc/self/mounts', 'utf-8');
+    } catch {
+      table = '';
+    }
+  }
+  const system = drvfsDriveRoots(table).find(({ mountPoint }) => isFile(join(mountPoint, 'Windows', 'System32', 'ntoskrnl.exe')));
+  if (!system) {
+    throw new Error(`${name} was not run: no mounted drive holds a Windows installation (Windows\\System32\\ntoskrnl.exe)`);
+  }
+  const candidate = join(system.mountPoint, 'Windows', ...rel);
+  if (!isFile(candidate)) {
+    throw new Error(`${name} was not run: it is not in the Windows directory of the system drive ${system.drive}:`);
+  }
+  return candidate;
+}
+
+/**
+ * Longest `-Command` argument runPowerShell hands powershell.exe. A Windows
+ * command line tops out at 32,767 UTF-16 units, and WSL interop adds the
+ * executable path and the other flags; past this, fail with a clear error
+ * rather than a truncated or refused launch.
+ */
+export const POWERSHELL_COMMAND_MAX = 30_000;
+
+/**
+ * Windows interop from inside WSL.
+ *
+ * Every child is spawned from an argv array, never a shell string (#519): the
+ * previous version built `$SHELL -c` command lines by interpolation, so a path
+ * or script containing `$()` or a backtick ran in the Linux shell. With argv
+ * there is no Linux shell to escape for. The Windows side has its own
+ * command-line parsing, which argv alone does not neutralise, so what crosses
+ * it is kept to text that no Windows parser treats specially: fixed flags,
+ * plain paths for wslpath (a Linux binary, so no Windows parsing at all), and
+ * base64 for PowerShell.
+ *
+ * There is deliberately no "run this cmd.exe command line" method. One existed
+ * (runWindowsCommand) with no caller anywhere; a cmd.exe command line is code
+ * by definition, and making data inside it safe depends both on cmd.exe's own
+ * metacharacters (`& | < > ^ % ( ) "`) and on how WSL interop re-quotes argv
+ * into a Windows command line. Run Windows programs with an argv array
+ * instead, or through runPowerShell with the data kept out of the script.
+ */
 export class WSLBridge {
-  private executor: TerminalExecutor;
   private windowsHome: string | null = null;
 
   constructor() {
-    this.executor = new TerminalExecutor();
-
     if (WSLBridge.isWSL()) {
       this.detectWindowsHome();
     }
@@ -34,31 +176,29 @@ export class WSLBridge {
     }
   }
 
-  async runWindowsCommand(command: string): Promise<CommandResult> {
-    if (!WSLBridge.isWSL()) {
-      throw new Error('Not running in WSL environment');
-    }
-
-    try {
-      return await this.executor.execute(`cmd.exe /C "${command.replace(/"/g, '\\"')}"`);
-    } catch (error) {
-      throw new Error(`Failed to run Windows command: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-
+  /**
+   * Run `script` as PowerShell source. The script is CODE: never interpolate
+   * a path, or any model- or user-supplied text, into it.
+   *
+   * It reaches powershell.exe as base64 of its UTF-8 inside a fixed wrapper,
+   * the same way #515 carries toast text, so no quoting layer between here and
+   * PowerShell's parser can change it. Not `-EncodedCommand` (UTF-16 base64,
+   * twice the length, and it reports progress as CLIXML on stderr), not
+   * `$args` (powershell.exe joins every argument after -Command into the
+   * script), not stdin (read in the OEM code page).
+   *
+   * Known limitation, shared with the #515 toast: under Constrained Language
+   * Mode (a WDAC or AppLocker policy) the wrapper cannot run, because
+   * [Convert] and [Text.Encoding] are not core types there. The call fails
+   * with a language-mode error rather than running anything else.
+   */
   async runPowerShell(script: string): Promise<CommandResult> {
     if (!WSLBridge.isWSL()) {
       throw new Error('Not running in WSL environment');
     }
 
     try {
-      const escapedScript = script
-        .replace(/\\/g, '\\\\')
-        .replace(/"/g, '\\"')
-        .replace(/\$/g, '\\$')
-        .replace(/`/g, '\\`');
-
-      return await this.executor.execute(`powershell.exe -Command "${escapedScript}"`);
+      return await runArgv([windowsSystemExe('powershell.exe'), '-NoProfile', '-NonInteractive', '-Command', buildPowerShellCommand(script)]);
     } catch (error) {
       throw new Error(`Failed to run PowerShell script: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -69,20 +209,19 @@ export class WSLBridge {
   }
 
   private detectWindowsHome(): void {
-    try {
-      const result = this.executor.execute('cmd.exe /C "echo %USERPROFILE%"');
-      result.then(res => {
-        const path = res.stdout.trim();
+    // Separate argv elements with no spaces or quotes, so WSL interop passes
+    // them through unquoted and cmd.exe expands %USERPROFILE% itself. /d skips
+    // AutoRun commands, which could otherwise print ahead of the echo.
+    // Resolved inside the chain, so a missing cmd.exe lands in the catch.
+    Promise.resolve().then(() => runArgv([windowsSystemExe('cmd.exe'), '/d', '/c', 'echo', '%USERPROFILE%'])).then(res => {
+      const path = res.stdout.trim();
 
-        if (path && !path.includes('%')) {
-          this.windowsHome = this.convertWindowsPath(path);
-        }
-      }).catch(() => {
-        this.windowsHome = null;
-      });
-    } catch {
+      if (path && !path.includes('%')) {
+        this.windowsHome = this.convertWindowsPath(path);
+      }
+    }).catch(() => {
       this.windowsHome = null;
-    }
+    });
   }
 
   private convertWindowsPath(windowsPath: string): string {
@@ -104,8 +243,7 @@ export class WSLBridge {
     }
 
     try {
-      const result = await this.executor.execute(`wslpath -w "${wslPath}"`);
-      return result.stdout.trim();
+      return await runWslpath('-w', wslPath);
     } catch (error) {
       throw new Error(`Failed to convert WSL path: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -117,10 +255,147 @@ export class WSLBridge {
     }
 
     try {
-      const result = await this.executor.execute(`wslpath -u "${windowsPath}"`);
-      return result.stdout.trim();
+      return await runWslpath('-u', windowsPath);
     } catch (error) {
       throw new Error(`Failed to convert Windows path: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+}
+
+/**
+ * Appended to every script. A bare `-Command` script exits 1 when its last
+ * statement fails, but here the last statement powershell.exe sees is the
+ * dot-source, whose own `$?` is true, so without this a failing script would
+ * exit 0. On its own line, so a trailing comment cannot swallow it, and after
+ * a `;`, so a trailing `|` cannot pipe into it.
+ *
+ * Not identical in every case: a script that leaves with `return` or `break`
+ * skips this line and exits 0 even if the statement before failed, and one
+ * that ends in a line-continuation backtick runs its last command where a bare
+ * -Command would fail to parse.
+ */
+const EXIT_ON_FAILURE = '\n;if (-not $?) { exit 1 }';
+
+/**
+ * The `-Command` text for runPowerShell: a fixed wrapper that decodes the
+ * script and dot-sources it, so it runs in the scope a bare `-Command` would
+ * have given it and, with the caveats at EXIT_ON_FAILURE, its exit code. The wrapper has
+ * no `"` and its only quotes enclose base64, whose alphabet no Windows or
+ * PowerShell parser treats specially.
+ */
+export function buildPowerShellCommand(script: string): string {
+  const encoded = Buffer.from(script + EXIT_ON_FAILURE, 'utf8').toString('base64');
+  const command = `. ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}'))))`;
+
+  if (command.length > POWERSHELL_COMMAND_MAX) {
+    throw new Error(`script too long for a Windows command line (${command.length} > ${POWERSHELL_COMMAND_MAX} characters once encoded)`);
+  }
+
+  return command;
+}
+
+/**
+ * wslpath is the Linux side of WSL, so argv reaches it exactly. It has no
+ * `--`, so a path starting with `-` would be read as an option: refuse it
+ * rather than guess (prefix a relative path with `./`).
+ */
+async function runWslpath(flag: '-w' | '-u', path: string): Promise<string> {
+  if (path.startsWith('-')) {
+    throw new Error(`refusing a path that starts with "-", which wslpath would read as an option: ${JSON.stringify(path)}`);
+  }
+
+  const result = await runArgv(['wslpath', flag, path]);
+
+  if (result.exitCode !== 0) {
+    throw new Error(`wslpath exited with code ${result.exitCode}${result.stderr.trim() ? `: ${result.stderr.trim()}` : ''}`);
+  }
+
+  // Only the terminator wslpath adds: leading or trailing spaces can be part
+  // of the path.
+  return result.stdout.replace(/\r?\n$/, '');
+}
+
+/**
+ * The sanitizedEnv extras a spawn needs to launch a Windows program from WSL
+ * (#519): WSL_INTEROP, the socket interop launches it through on WSL2;
+ * WSL_DISTRO_NAME; and WSLENV.
+ */
+export function wslInteropExtras(): Pick<ExtraEnv, 'WSL_INTEROP' | 'WSL_DISTRO_NAME' | 'WSLENV'> {
+  return {
+    WSL_INTEROP: process.env.WSL_INTEROP,
+    WSL_DISTRO_NAME: process.env.WSL_DISTRO_NAME,
+    WSLENV: process.env.WSLENV,
+  };
+}
+
+/**
+ * Spawn `argv` with no shell. The env is the sanitized allowlist plus three
+ * WSL names: WSL_INTEROP, the socket a Windows program is launched through on
+ * WSL2 (the one interop needs); WSL_DISTRO_NAME, this distro's name; and
+ * WSLENV, the list of variables shared with the Windows side (only names that
+ * survive the allowlist can be). Keeping them is for interop to work, not a security
+ * boundary: whether /init falls back to a default socket without WSL_INTEROP
+ * was not verified.
+ *
+ * On timeout this stops waiting and kills the Linux-side process: for a
+ * Windows program that is the interop relay, and the Windows process itself
+ * may survive it. The child gets SIGKILL, its pipe readers are cancelled, and
+ * the call rejects at once rather than waiting for pipes a grandchild can hold
+ * open.
+ *
+ * @internal Exported for wsl-bridge.test.ts only.
+ */
+export async function runArgv(argv: string[], timeoutMs: number = DEFAULT_TIMEOUT_MS): Promise<CommandResult> {
+  const startTime = Date.now();
+
+  const proc = Bun.spawn(argv, {
+    env: sanitizedEnv(wslInteropExtras()),
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+
+  const stdoutReader = proc.stdout.getReader();
+  const stderrReader = proc.stderr.getReader();
+
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      proc.kill('SIGKILL');
+      // Stop buffering, and let go of the pipes, even if a grandchild still
+      // holds them open.
+      stdoutReader.cancel().catch(() => {});
+      stderrReader.cancel().catch(() => {});
+      reject(new Error(`${argv[0]} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    const [stdout, stderr, exitCode] = await Promise.race([
+      Promise.all([readText(stdoutReader), readText(stderrReader), proc.exited]),
+      deadline,
+    ]);
+
+    return { stdout, stderr, exitCode, duration: Date.now() - startTime };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function readText(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<string> {
+  const chunks: Uint8Array[] = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+
+    if (done) {
+      break;
+    }
+
+    if (value) {
+      chunks.push(value);
+    }
+  }
+
+  return Buffer.concat(chunks).toString('utf-8');
 }

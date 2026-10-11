@@ -1,5 +1,5 @@
 import React, { useRef, useState } from "react";
-import { ArrowRight } from "lucide-react";
+import { ArrowRight, Square } from "lucide-react";
 import { Icon } from "../ui";
 import "./Composer.css";
 
@@ -8,6 +8,11 @@ export interface ComposerProps {
   onSlash?: () => void;
   placeholder?: string;
   disabled?: boolean;
+  responding?: boolean;
+  onStop?: () => void;
+  value?: string;
+  onValueChange?: (value: string) => void;
+  autoFocus?: boolean;
 }
 
 export function Composer({
@@ -15,9 +20,42 @@ export function Composer({
   onSlash,
   placeholder = "Ask Jarvis, or press / to summon a tool…",
   disabled,
+  responding = false,
+  onStop,
+  value: controlledValue,
+  onValueChange,
+  autoFocus = false,
 }: ComposerProps) {
-  const [value, setValue] = useState("");
+  const [localValue, setLocalValue] = useState("");
+  const value = controlledValue ?? localValue;
+  const setValue = onValueChange ?? setLocalValue;
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  React.useEffect(() => {
+    const el = inputRef.current;
+    if (el) {
+      el.style.height = "auto";
+      el.style.height = el.scrollHeight + "px";
+    }
+  }, [value]);
+
+  // Opening Talk focuses the composer. If it opened while disabled (waiting
+  // for the daemon), focus it once enabled unless the user is typing in
+  // another field. After that, a reconnect only restores focus the disconnect
+  // took away (disabling the textarea drops focus to <body>).
+  const openedEnabled = useRef(!disabled);
+  const autoFocused = useRef(false);
+  React.useEffect(() => {
+    if (!autoFocus || disabled) return;
+    const input = inputRef.current;
+    const active = document.activeElement as HTMLElement | null;
+    const focusLost = !active || active === document.body;
+    const typingElsewhere = !!active && active !== input
+      && (active.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName));
+    const first = !autoFocused.current;
+    autoFocused.current = true;
+    if (first ? openedEnabled.current || !typingElsewhere : focusLost) input?.focus();
+  }, [autoFocus, disabled]);
 
   // Global `/` opens the command palette directly. Suppressed inside any
   // editable element so it doesn't hijack normal typing — typing `/` in
@@ -110,12 +148,14 @@ export function Composer({
           /
         </button>
         <button
-          type="submit"
-          className="v2-composer__send"
-          disabled={disabled || value.trim().length === 0}
-          aria-label="Send"
+          type={responding ? "button" : "submit"}
+          className={`v2-composer__send${responding ? " v2-composer__send--stop" : ""}`}
+          disabled={disabled || (!responding && value.trim().length === 0)}
+          aria-label={responding ? "Stop response" : "Send"}
+          title={responding ? "Stop response" : "Send"}
+          onClick={responding ? onStop : undefined}
         >
-          <Icon icon={ArrowRight} size={12} strokeWidth={2} />
+          <Icon icon={responding ? Square : ArrowRight} size={12} strokeWidth={2.5} />
         </button>
       </div>
     </form>

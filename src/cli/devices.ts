@@ -19,6 +19,7 @@ import { loadConfig } from '../config/loader.ts';
 import { initDatabase, getDb } from '../vault/schema.ts';
 import { enrollDevice } from '../sidecar/enrollment.ts';
 import type { SidecarRecord } from '../sidecar/types.ts';
+import { resolveExternalOrigin } from '../util/external-origin.ts';
 
 interface CliIo {
   out: (line: string) => void;
@@ -33,11 +34,16 @@ const defaultIo: CliIo = {
 async function openVault(io: CliIo): Promise<{ dataDir: string; brainUrl: string }> {
   const config = await loadConfig();
   initDatabase(config.daemon.db_path, { quiet: true });
-  const brainUrl = config.daemon.brain_domain ?? `localhost:${config.daemon.port}`;
-  if (!config.daemon.brain_domain) {
+  const resolved = resolveExternalOrigin(config);
+  for (const warning of resolved.warnings) io.err(`warning: ${warning}`);
+  const brainUrl = resolved.httpOrigin;
+  if (resolved.source === 'fallback' && resolved.warnings.length === 0) {
     io.err(
-      'warning: daemon.brain_domain is not set; tokens will point at ' +
-        `localhost:${config.daemon.port} and only work for sidecars on this machine.`,
+      'warning: daemon.public_url is not set; tokens will point at ' +
+        `localhost:${config.daemon.port} and only work for sidecars on this machine. ` +
+        'Before enrolling a sidecar on another machine, set daemon.public_url ' +
+        'to the brain URL that device can reach, restart Jarvis, and run this command again. ' +
+        'See docs/SELF_HOSTING.md#the-url-baked-into-enrollment-tokens.',
     );
   }
   return { dataDir: config.daemon.data_dir, brainUrl };

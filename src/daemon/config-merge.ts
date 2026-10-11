@@ -104,11 +104,15 @@ function mergeCloudSubBlock(
   existing: AnyRec | undefined,
   incoming: AnyRec,
 ): AnyRec {
-  return {
-    ...existing,
-    ...incoming,
-    api_key: (incoming.api_key as string) || (existing?.api_key as string) || '',
-  };
+  const merged: AnyRec = { ...existing, ...incoming };
+  const key = (incoming.api_key as string) || (existing?.api_key as string) || '';
+  // Never materialize an explicit '' — persistSectionSecrets reads an empty
+  // credential as "delete the stored key", so a key-less merge writing '' into
+  // a touched sub-block would erase a keychain entry the caller never meant
+  // to clear.
+  if (key) merged.api_key = key;
+  else delete merged.api_key;
+  return merged;
 }
 
 /**
@@ -189,4 +193,72 @@ export function mergeVoiceConfig(
   }
 
   return { ...merged, ...patch } as VoiceConfig;
+}
+
+/**
+ * Warm-engine idle TTL: JARVIS_ENGINE_IDLE_TTL_MS env var wins over the
+ * `workflows.engineIdleTtlMs` setting — `workflows` is a USER-owned config
+ * section, so managed hosts can't reach it through the system config file;
+ * the env var lets them tune the fleet from the unit file. Non-positive or
+ * non-numeric values fall back to the runtime default (5 min) with a warn:
+ * 0 would mean "never evict the ~100MB engine", the opposite of what a
+ * host lowering the TTL wants.
+ */
+export function resolveEngineIdleTtlMs(
+  configured: number | undefined,
+  env: Record<string, string | undefined> = process.env,
+): number | undefined {
+  const envRaw = env['JARVIS_ENGINE_IDLE_TTL_MS'];
+  const raw = envRaw !== undefined ? Number(envRaw) : configured;
+  if (raw === undefined) return undefined;
+  if (!Number.isFinite(raw) || raw <= 0) {
+    console.warn(
+      `[Daemon] Ignoring engine idle TTL ${JSON.stringify(envRaw ?? configured)} (${envRaw !== undefined ? 'JARVIS_ENGINE_IDLE_TTL_MS' : 'workflows.engineIdleTtlMs'}): must be a positive number of ms; using default`,
+    );
+    return undefined;
+  }
+  return raw;
+}
+
+/**
+ * Engine bundle cache retention, same precedence shape as the idle TTL above:
+ * the env var wins over the user-owned `workflows` setting so a fleet
+ * operator can tune it from the unit file.
+ *
+ * Unlike the TTL, 0 is MEANINGFUL here and is accepted: it disables that one
+ * cap (keep every bundle / never expire by age). Disabling both leaves the
+ * cache unpruned, which is the pre-#491 behaviour and a legitimate choice for
+ * a host that manages the directory itself. Negative or non-numeric values
+ * are ignored with a warning.
+ */
+export function resolveEngineCacheRetention(
+  configured: { maxBundles?: number; maxAgeDays?: number },
+  env: Record<string, string | undefined> = process.env,
+): { keep?: number; maxAgeMs?: number } {
+  const read = (
+    envName: string,
+    configuredValue: number | undefined,
+    settingName: string,
+  ): number | undefined => {
+    // An empty value is how a unit file blanks a variable, and `Number('')`
+    // is 0 -- which is meaningful here (it disables the cap). Treat blank as
+    // "not set" so `JARVIS_ENGINE_CACHE_MAX_BUNDLES=` cannot silently turn
+    // pruning off.
+    const envRaw = env[envName]?.trim() ? env[envName] : undefined;
+    const raw = envRaw !== undefined ? Number(envRaw) : configuredValue;
+    if (raw === undefined) return undefined;
+    if (!Number.isFinite(raw) || raw < 0) {
+      console.warn(
+        `[Daemon] Ignoring ${JSON.stringify(envRaw ?? configuredValue)} for ${envRaw !== undefined ? envName : settingName}: must be a non-negative number; using default`,
+      );
+      return undefined;
+    }
+    return raw;
+  };
+  const keep = read('JARVIS_ENGINE_CACHE_MAX_BUNDLES', configured.maxBundles, 'workflows.engineCacheMaxBundles');
+  const maxAgeDays = read('JARVIS_ENGINE_CACHE_MAX_AGE_DAYS', configured.maxAgeDays, 'workflows.engineCacheMaxAgeDays');
+  const out: { keep?: number; maxAgeMs?: number } = {};
+  if (keep !== undefined) out.keep = keep;
+  if (maxAgeDays !== undefined) out.maxAgeMs = maxAgeDays * 24 * 60 * 60_000;
+  return out;
 }

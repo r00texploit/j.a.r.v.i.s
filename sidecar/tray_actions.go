@@ -4,6 +4,7 @@ package main
 // (the tray itself is Windows/macOS, but these reuse the panel webview service).
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -36,9 +37,28 @@ func (c *SidecarClient) openRoom(id PanelID, route, title string, w, h int) {
 		log.Printf("[tray] cannot open %q: %v", title, err)
 		return
 	}
+	// Mint a short-lived access token for the panel. The dashboard data plane
+	// (/api, /ws, the HTML load itself) accepts ONLY these minted access tokens,
+	// never the long-lived enrollment JWT (c.config.Token) — so injecting the
+	// enrollment JWT here returns a 401. Mirrors the brain-driven panel.spawn
+	// path, which mints via this same provider (NewHandlerRegistry(..., c.tokenProvider.Token)).
+	// Snapshot obsCtx under the lock: connectAndServe re-writes it under c.mu on
+	// every reconnect, and openRoom runs on a tray / startup goroutine — an
+	// unlocked read of the interface value races a reconnect that lands mid-open.
+	c.mu.Lock()
+	ctx := c.obsCtx
+	c.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	accessToken, err := c.tokenProvider.Token(ctx)
+	if err != nil {
+		log.Printf("[tray] cannot open %q: mint access token: %v", title, err)
+		return
+	}
 	// sanitizePanelURL host-checks against the brain origin and appends the
-	// sidecar token (so the panel authenticates as this sidecar).
-	safeURL, err := sanitizePanelURL(origin+"/"+route, c.claims.Brain, c.config.Token)
+	// short-lived access token (so the panel authenticates as this sidecar).
+	safeURL, err := sanitizePanelURL(origin+"/"+route, c.claims.Brain, accessToken)
 	if err != nil {
 		log.Printf("[tray] cannot open %q: %v", title, err)
 		return
@@ -51,7 +71,14 @@ func (c *SidecarClient) openRoom(id PanelID, route, title string, w, h int) {
 		Resizable: true,
 	})
 	if errors.Is(err, ErrPanelExists) {
-		_ = c.panels.Focus(id) // already open — bring it forward instead
+		// Already open: bring it forward instead. Logged either way, because
+		// this branch used to be silent, and a crash inside it on macOS left
+		// sidecar.log ending on the RPC that triggered it with nothing after.
+		if err := c.panels.Focus(id); err != nil {
+			log.Printf("[tray] focus %q failed: %v", title, err)
+			return
+		}
+		log.Printf("[tray] focused %q", title)
 		return
 	}
 	if err != nil {

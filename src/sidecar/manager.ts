@@ -18,13 +18,20 @@ import type {
   ConnectedSidecar,
   SidecarCapability,
   UnavailableCapability,
+  SidecarUpdatePhase,
+  SidecarUpdateState,
 } from './types.ts';
 import type { RPCRequest, RPCTimeouts, SidecarEvent, RPCResultPayload, RPCErrorPayload, RPCProgressPayload } from './protocol.ts';
 import { DEFAULT_RPC_TIMEOUTS } from './protocol.ts';
-import { EventScheduler } from './scheduler.ts';
-import { RPCTracker } from './rpc.ts';
+import { EventScheduler, type DroppedEventsStats } from './scheduler.ts';
+import { RPCTracker, SidecarRPCError } from './rpc.ts';
+import { ActionOutcomeError } from '../actions/action-outcome.ts';
+import { BinarySpool, type BinarySpoolStats } from './binary-spool.ts';
 import { SidecarConnection } from './connection.ts';
-import { classifySidecarVersion, SIDECAR_MIN_VERSION, SIDECAR_RECOMMENDED_VERSION } from './compat.ts';
+import { assertMachineDispatch } from '../actions/machine-scope';
+import { checkpointExecution } from '../actions/execution-scope';
+import { PanelSessionStore, vaultPanelSessionSink, type PanelSession, type PanelSocket } from './panel-sessions.ts';
+import { classifySidecarVersion, isUpdateAvailable, SIDECAR_LATEST_VERSION, SIDECAR_MIN_VERSION, SIDECAR_RECOMMENDED_VERSION } from './compat.ts';
 import { chmodWithWarning, secureDirectory, secureWriteFile } from '../util/fs-secure.ts';
 import { computeAnonId } from '../telemetry/anon-id.ts';
 import { loadOrGenerateSidecarKeys, enrollDevice, buildEnrollmentUrls, isLocalhostBrainUrl } from './enrollment.ts';
@@ -38,11 +45,15 @@ const PUBLIC_KEY_FILE = 'public.pem';
 
 // Short-lived access tokens. The enrollment JWT is a long-lived REFRESH-style
 // credential that never leaves the sidecar except as an Authorization: Bearer
-// header to /sidecar/connect and the token-mint endpoint. Everything on the
-// data plane (panel /api fetches, the /ws control socket) authenticates with
-// one of these instead: minted on demand from the enrollment JWT, signed with
-// the same ES256 key, scoped by audience, and verified statelessly (signature +
-// exp + aud, no DB hit) so a leak is bounded to the TTL rather than forever.
+// header to /sidecar/connect and the token-mint endpoint.
+//
+// An access token is the BOOTSTRAP for a panel webview: minted on demand from
+// the enrollment JWT, signed with the same ES256 key, scoped by audience, and
+// verified statelessly (signature + exp + aud, no DB hit). It is presented
+// once, as ?token= on a panel's spawn URL, and exchanged for a panel session
+// (panel-sessions.ts) -- the session, not this token, is what authenticates
+// the data plane afterwards, and the TTL below therefore bounds the bootstrap
+// and nothing else.
 const ACCESS_TOKEN_AUDIENCE = 'brain-api';
 const ACCESS_TOKEN_TTL_SECONDS = 600; // 10 minutes
 
@@ -57,6 +68,77 @@ export function sanitizeIanaTimezone(value: unknown): string | undefined {
   const trimmed = value.trim();
   if (trimmed.length === 0 || trimmed.length > 64) return undefined;
   return IANA_TZ_RE.test(trimmed) ? trimmed : undefined;
+}
+
+/** Send handle for a sidecar's dedicated realtime-audio pipe. */
+export interface SidecarAudioChannel {
+  /** Send a raw PCM playback frame (s16/mono/24 kHz) to the sidecar. */
+  sendPCM(buf: Buffer): void;
+  /** Tell the sidecar to flush playback immediately (barge-in). */
+  sendFlush(): void;
+}
+
+/**
+ * Every sidecar event type delivered to `onEvent` listeners. An event type
+ * missing from this list is silently dropped by the scheduler, so a listener
+ * in daemon/index.ts that switches on a type not listed here never fires.
+ * Append; never replace the list (a replacement once took the pebble, tray,
+ * panels, region capture, wake word and realtime voice offline).
+ */
+export const SIDECAR_EVENT_TYPES: readonly string[] = [
+  'screen_capture', 'context_changed', 'idle_detected', 'clipboard_change', 'file_change',
+  'process_started', 'process_stopped', 'notification',
+  'pebble.summon', 'pebble.palette', 'pebble.blind_toggle', 'pebble.open_answer',
+  'panel.bounds_changed', 'panel.closed',
+  'audio.session_start', 'audio.session_end', 'audio.wake_segment',
+  'region.captured', 'region.cancelled',
+  'sub_pebble.clicked', 'sub_pebble.open_full',
+  'pebble.realtime_start', 'pebble.realtime_stop', 'pebble.audio_frame', 'pebble.mic_blocked',
+  'tray.set_pause', 'tray.set_mute', 'notify.action',
+  // Skill recorder: one event per click/commit while a recording is live,
+  // and one when the sidecar ends the recording (cap hit, RPC stop).
+  'ui_interaction', 'ui_recording',
+  // Self-update progress (recorded on the connection by the manager itself).
+  'update_progress',
+];
+
+/** Update phases a sidecar may report; anything else is dropped. */
+const UPDATE_PHASES: ReadonlySet<string> = new Set([
+  'available', 'checking', 'downloading', 'verifying', 'installing', 'restarting', 'failed', 'unavailable',
+]);
+
+/** Bounded copy of an untrusted string field, or undefined. */
+function boundedString(value: unknown, max: number): string | undefined {
+  if (typeof value !== 'string' || value.length === 0) return undefined;
+  return value.length > max ? `${value.slice(0, max)}...` : value;
+}
+
+/**
+ * The register `features` list, sanitized: it is untrusted sidecar input that
+ * reaches the dashboard, so keep only short identifier-like strings.
+ */
+export function sanitizeFeatures(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const f of raw) {
+    if (typeof f === 'string' && /^[a-z][a-z0-9_.-]{0,63}$/.test(f) && !out.includes(f)) out.push(f);
+    if (out.length >= 32) break;
+  }
+  return out;
+}
+
+/** An update_progress payload, validated, or null when it is not one. */
+export function parseUpdateProgress(payload: unknown, now: Date = new Date()): SidecarUpdateState | null {
+  if (typeof payload !== 'object' || payload === null) return null;
+  const p = payload as Record<string, unknown>;
+  if (typeof p.phase !== 'string' || !UPDATE_PHASES.has(p.phase)) return null;
+  return {
+    phase: p.phase as SidecarUpdatePhase,
+    version: boundedString(p.version, 64),
+    error: boundedString(p.error, 1000),
+    manual_command: boundedString(p.manual_command, 500),
+    at: now.toISOString(),
+  };
 }
 
 export class SidecarManager implements Service {
@@ -76,8 +158,13 @@ export class SidecarManager implements Service {
   /** Protocol infrastructure */
   private scheduler: EventScheduler;
   private rpcTracker: RPCTracker;
+  private binarySpool: BinarySpool;
   private sidecarConnections = new Map<string, SidecarConnection>();
+  private connectionSessions = new WeakMap<SidecarConnection, string>();
   private revocationSweepTimer: ReturnType<typeof setInterval> | null = null;
+  /** Panel webview sessions (panel-sessions.ts). Owned here because this is
+   *  what knows about enrollment and revocation, which is what bounds them. */
+  private panelSessions = new PanelSessionStore({ sink: vaultPanelSessionSink(getDb) });
   private progressListeners = new Set<(sidecarId: string, rpcId: string, progress: number, message?: string) => void>();
   private eventListeners = new Set<(sidecarId: string, event: SidecarEvent) => void>();
   // Two parallel notify APIs:
@@ -90,10 +177,28 @@ export class SidecarManager implements Service {
   private connectedListeners = new Set<(sidecar: ConnectedSidecar) => void>();
   private disconnectedListeners = new Set<(sidecarId: string) => void>();
 
+  /**
+   * Dedicated realtime-audio pipes, one per sidecar (the pebble's `?channel=audio`
+   * connection). Kept separate from `sidecarConnections` so a 2.4 MB screenshot on
+   * the control connection can't queue in front of audio frames. Binary frames on
+   * this socket are raw PCM (mic in / playback out).
+   */
+  private audioChannels = new Map<string, ServerWebSocket<unknown>>();
+  private audioFrameListeners = new Set<(sidecarId: string, frame: Buffer) => void>();
+
   constructor(dataDir: string) {
     this.dataDir = dataDir;
     this.scheduler = new EventScheduler();
     this.rpcTracker = new RPCTracker();
+    this.binarySpool = new BinarySpool(dataDir);
+  }
+
+  /**
+   * Event-pressure counters: queue-overflow drops and disk-spool activity.
+   * For dashboards/health surfaces, mirroring WorkflowEventBuffer.dropped().
+   */
+  getEventStats(): { dropped: DroppedEventsStats; spool: BinarySpoolStats } {
+    return { dropped: this.scheduler.dropped(), spool: this.binarySpool.stats() };
   }
 
   /**
@@ -105,17 +210,18 @@ export class SidecarManager implements Service {
    * glance which knob is active when something looks wrong (env var vs
    * config.yaml vs default-fallback). Pass undefined for silent setters.
    */
-  setBrainUrl(url: string, source?: 'env' | 'config' | 'default'): void {
+  setBrainUrl(url: string, source?: 'env' | 'config' | 'public_url' | 'default'): void {
     this.brainUrl = url;
     if (source) {
       const { brainWs } = buildEnrollmentUrls(url);
-      const sourceLabel = source === 'env' ? 'JARVIS_BRAIN_DOMAIN env var'
+      const sourceLabel = source === 'env' ? 'JARVIS_PUBLIC_URL / JARVIS_BRAIN_DOMAIN env var'
+        : source === 'public_url' ? 'daemon.public_url / JARVIS_PUBLIC_URL'
         : source === 'config' ? 'config.yaml daemon.brain_domain'
-        : `default fallback — set daemon.brain_domain in config.yaml or JARVIS_BRAIN_DOMAIN env to override`;
+        : `default fallback — set daemon.public_url in config.yaml or JARVIS_PUBLIC_URL env to override`;
       console.log(`[SidecarManager] Brain URL: ${brainWs} (source: ${sourceLabel})`);
       if (isLocalhostBrainUrl(url)) {
         console.warn(
-          `[SidecarManager] Brain URL points at a local host. Sidecars on other machines will NOT be able to reach this URL — only enroll local sidecars, or set daemon.brain_domain to a routable hostname before enrolling remote sidecars.`,
+          `[SidecarManager] Brain URL points at a local host. Sidecars on other machines will NOT be able to reach this URL — only enroll local sidecars, or set daemon.public_url to a routable HTTPS origin before enrolling remote sidecars.`,
         );
       }
     }
@@ -128,6 +234,15 @@ export class SidecarManager implements Service {
     try {
       await this.loadOrGenerateKeys();
 
+      // Panels open across a restart present their cookie immediately, so this
+      // has to happen before the server takes a request. Without it a hosted
+      // update (`systemctl restart` on the instance unit) would stand every
+      // open panel down onto a permanent 401.
+      const restored = this.panelSessions.hydrate();
+      if (restored > 0) {
+        console.log(`[SidecarManager] Restored ${restored} panel session(s)`);
+      }
+
       // CLI revocations happen in another process; sweep so they take
       // effect on live sessions within ~30s, not only at the next connect.
       this.revocationSweepTimer = setInterval(() => {
@@ -136,13 +251,24 @@ export class SidecarManager implements Service {
         } catch (err) {
           console.error('[SidecarManager] Revocation sweep failed:', err);
         }
+        // Panel windows are revoked on the same beat as connections, in a
+        // SEPARATE pass with its own try: a panel session can outlive the
+        // connection that spawned it (a sidecar that reconnects after a blip
+        // leaves its windows open on purpose), so sweeping connections alone
+        // would miss the panels of a device revoked while briefly offline --
+        // and a throw in that sweep must not be what skips this one.
+        try {
+          this.sweepPanelSessions();
+        } catch (err) {
+          console.error('[SidecarManager] Panel session sweep failed:', err);
+        }
       }, 30_000);
 
       // Wire scheduler handlers
       this.scheduler.on('rpc_result', async (sidecarId, event) => {
         const payload = event.payload as RPCResultPayload | RPCErrorPayload;
         if (payload.error) {
-          this.rpcTracker.fail(payload.rpc_id, new Error(`${payload.error.code}: ${payload.error.message}`));
+          this.rpcTracker.fail(payload.rpc_id, new SidecarRPCError(payload.error.code, payload.error.message));
         } else {
           // Attach binary data to result when present (e.g. capture_screen returns image in binary)
           const result = payload.result as Record<string, unknown> | undefined;
@@ -160,16 +286,24 @@ export class SidecarManager implements Service {
         }
       });
 
-      // Register handlers for each sidecar observer event type
-      const sidecarEventTypes = ['screen_capture', 'context_changed', 'idle_detected', 'clipboard_change', 'file_change', 'process_started', 'process_stopped', 'notification', 'pebble.summon', 'pebble.palette', 'pebble.blind_toggle', 'pebble.open_answer', 'panel.bounds_changed', 'panel.closed', 'audio.session_start', 'audio.session_end', 'audio.wake_segment', 'region.captured', 'region.cancelled', 'sub_pebble.clicked', 'sub_pebble.open_full'];
+      // Register handlers for each sidecar event type the daemon listens to.
       const sidecarEventHandler = async (sidecarId: string, event: SidecarEvent) => {
+        if (event.event_type === 'update_progress') this.recordUpdateProgress(sidecarId, event.payload);
         for (const listener of this.eventListeners) {
           listener(sidecarId, event);
         }
       };
-      for (const type of sidecarEventTypes) {
+      for (const type of SIDECAR_EVENT_TYPES) {
         this.scheduler.on(type, sidecarEventHandler);
       }
+      // Realtime voice events bypass the 1-per-tick queue: realtime_start must
+      // open the session before mic frames arrive, and audio_frame streams at
+      // ~25/s (faster than the queue drains). Direct dispatch keeps them
+      // real-time and in receive order.
+      // update_progress too: it is rare and carries state (a failure with the
+      // command to run by hand), so it must not be the event a full queue
+      // evicts.
+      this.scheduler.setDirectTypes(['pebble.realtime_start', 'pebble.realtime_stop', 'pebble.audio_frame', 'update_progress']);
 
       this.rpcTracker.onDetachedComplete((rpcId, result, error) => {
         if (error) {
@@ -180,6 +314,7 @@ export class SidecarManager implements Service {
       });
 
       this.scheduler.start();
+      this.binarySpool.start();
 
       this._status = 'running';
       console.log('[SidecarManager] Started — keys loaded, scheduler running');
@@ -197,13 +332,21 @@ export class SidecarManager implements Service {
       this.revocationSweepTimer = null;
     }
 
+    // Forget panel sessions in memory. They stay on disk, which is what lets a
+    // panel survive the restart this stop is usually half of; what must not
+    // survive is a stopped manager still resolving cookies.
+    this.panelSessions.clear();
+
     // Stop scheduler
     this.scheduler.stop();
+    this.binarySpool.stop();
 
-    // Close all sidecar connections and fail pending RPCs
+    // Close all sidecar connections and fail pending RPCs. Use WS 1001 (Going
+    // Away) + reason so the sidecar recognizes a planned restart and reconnects
+    // promptly against the freshly-booted brain (same keys + JWT).
     for (const [id, conn] of this.sidecarConnections) {
       this.rpcTracker.failAll(id, 'manager stopping');
-      conn.close();
+      conn.close(1001, 'server restarting');
     }
     this.sidecarConnections.clear();
 
@@ -315,6 +458,16 @@ export class SidecarManager implements Service {
       // RPCs indefinitely (stolen-device scenario).
       this.handleSidecarDisconnect(id);
       this.connected.delete(id);
+      // And the device's open PANEL windows, which authenticate with a session
+      // of their own (panel-sessions.ts). Both halves of the data plane have to
+      // go: an HTTP request is refused by `resolvePanelSession` on its own, but
+      // a panel's WebSocket is authorized once at the upgrade and never
+      // re-checked, so deleting the session alone would leave a revoked laptop
+      // chatting over the socket it already had. deleteBySid hangs up.
+      const panels = this.panelSessions.deleteBySid(id);
+      if (panels > 0) {
+        console.log(`[SidecarManager] Closed ${panels} panel session(s) for revoked sidecar ${id}`);
+      }
       console.log(`[SidecarManager] Revoked and removed sidecar ${id}`);
       return true;
     }
@@ -341,6 +494,49 @@ export class SidecarManager implements Service {
     return severed;
   }
 
+  /**
+   * Hygiene pass over panel sessions: drop what has aged past the store's cap,
+   * what has been idle long enough to have no window left (gated on the
+   * sidecar being connected, see below), and what belongs to a sidecar that is
+   * no longer enrolled.
+   *
+   * NOT the correctness boundary. `resolvePanelSession` re-checks enrollment
+   * and age on every single request, so a session that should be dead is
+   * already refused before this ever runs. This is what stops an abandoned
+   * panel's entry from sitting in the map until the process restarts, and what
+   * closes a revoked device's panels when the revocation happened in the CLI
+   * process (which the daemon only learns about by looking).
+   *
+   * Enrollment is queried once per DISTINCT sidecar rather than once per
+   * session, so a device with six panels open costs one lookup.
+   */
+  sweepPanelSessions(): number {
+    // Only a CONNECTED sidecar's sessions may be idle-collected. A machine that
+    // is asleep or partitioned still has its panel windows on screen and its
+    // sockets died with the connection, so without this gate the sweep would
+    // collect a live user's session and strand them on a 401 they cannot
+    // recover from.
+    //
+    // The gate alone is not enough, because it only says "connected NOW" while
+    // lastSeenAt may be hours stale: handleSidecarConnect refreshes this
+    // device's sessions on the way in, so the idle clock genuinely measures
+    // time spent connected-with-no-panel rather than time since the last
+    // fetch. Even then a socketless page (the onboarding wizard, the
+    // task/answer/palette rooms) is a real open window with no socket at all,
+    // which is why the window is hours rather than minutes.
+    let closed = this.panelSessions.sweep((sid) => this.sidecarConnections.has(sid));
+    const enrolled = new Map<string, boolean>();
+    for (const session of this.panelSessions.list()) {
+      let ok = enrolled.get(session.sid);
+      if (ok === undefined) {
+        ok = this.isEnrolled(session.sid);
+        enrolled.set(session.sid, ok);
+      }
+      if (!ok && this.panelSessions.delete(session.id)) closed++;
+    }
+    return closed;
+  }
+
   /** Check if a sidecar ID is enrolled (not revoked) */
   isEnrolled(id: string): boolean {
     const db = getDb();
@@ -357,6 +553,13 @@ export class SidecarManager implements Service {
   // --------------- Connection Tracking ---------------
 
   /** Register a connected sidecar (called after WS handshake + registration message) */
+  /** Currently CONNECTED sidecars (not merely enrolled — listSidecars() is
+   * the DB view). Exposed so callers can re-push a capability advertisement
+   * to live sidecars after config changes, rather than only at connect. */
+  listConnected(): ConnectedSidecar[] {
+    return [...this.connected.values()];
+  }
+
   registerConnection(sidecar: ConnectedSidecar): void {
     // The reported timezone is untrusted sidecar input headed for sensitive
     // sinks: `jarvis sidecars list --json` (read by the hosting server) and,
@@ -438,6 +641,18 @@ export class SidecarManager implements Service {
     return this.connected.has(id);
   }
 
+  /** Daemon-owned generation for this exact socket, never a sidecar-provided ID. */
+  getConnectionSessionId(id: string): string | null {
+    const connection = this.sidecarConnections.get(id);
+    if (!connection) return null;
+    let session = this.connectionSessions.get(connection);
+    if (!session) {
+      session = generateId();
+      this.connectionSessions.set(connection, session);
+    }
+    return session;
+  }
+
   // --------------- Protocol: Token Validation ---------------
 
   /**
@@ -474,12 +689,19 @@ export class SidecarManager implements Service {
   }
 
   /**
-   * Mint a short-lived access token for an enrolled sidecar. This is the only
-   * credential that authenticates the data plane (panel /api fetches + /ws); the
-   * enrollment JWT is never accepted there. Enrollment is checked here at mint
-   * time, so a revoked sidecar can't obtain new tokens (and existing ones expire
-   * within the TTL). Returns null if the sidecar isn't enrolled or keys aren't
-   * loaded.
+   * Mint a short-lived access token for an enrolled sidecar.
+   *
+   * This is the BOOTSTRAP credential for a panel webview, not what
+   * authenticates it: the page presents this once as ?token=, the brain
+   * exchanges it for a panel session, and the session is what authenticates
+   * the data plane from then on (see openPanelSession and panel-sessions.ts).
+   * The enrollment JWT is never accepted on the data plane at all.
+   *
+   * Enrollment is checked here at mint time, so a revoked sidecar can't obtain
+   * new tokens. Note this no longer bounds much on its own: a session opened
+   * with a token outlives that token, and it is the session's own cap and
+   * enrollment re-check that bound it. Returns null if the sidecar isn't
+   * enrolled or keys aren't loaded.
    */
   async issueAccessToken(sid: string): Promise<{ token: string; expiresIn: number } | null> {
     if (!this.privateKey) return null;
@@ -496,9 +718,16 @@ export class SidecarManager implements Service {
 
   /**
    * Verify a short-lived access token. Returns { sid } if the signature,
-   * audience, and expiry all check out, else null. Deliberately stateless (no
-   * DB / isEnrolled lookup): the short TTL is the revocation mechanism, which
-   * also keeps this cheap on every authenticated request.
+   * audience, and expiry all check out, else null.
+   *
+   * Deliberately stateless (no DB / isEnrolled lookup). That USED to be safe
+   * because this gated every authenticated request and the short TTL was
+   * therefore the revocation mechanism. It no longer gates them: it runs once,
+   * at bootstrap, and the callers that took over the data plane
+   * (openPanelSession, resolvePanelSession) do their own isEnrolled check
+   * precisely because a session outlives one TTL. Keep this stateless, but do
+   * not reintroduce it as a per-request gate on the strength of the old
+   * comment.
    */
   async verifyAccessToken(token: string): Promise<{ sid: string } | null> {
     if (!this.publicKey) return null;
@@ -515,18 +744,97 @@ export class SidecarManager implements Service {
     }
   }
 
+  // --------------- Panel sessions ---------------
+
+  /**
+   * Exchange a bootstrap access token for a panel session (panel-sessions.ts).
+   *
+   * This is the ONLY way a session is created, and it is what keeps the new
+   * scheme's trust anchored where the old one had it: the token can only have
+   * come from `issueAccessToken`, which mints solely for the /sidecar/token
+   * endpoint, which accepts solely the enrollment JWT. So a session still
+   * traces back to a device that proved possession of that credential -- the
+   * cookie simply stops BEING the credential.
+   *
+   * One token can open MORE than one session, by design (the sidecar reuses a
+   * cached token across spawns). See panel-sessions.ts for what that means for
+   * a leaked spawn URL.
+   *
+   * Returns null for anything unverifiable, expired, or belonging to a sidecar
+   * that has since been revoked. The enrollment re-check is not redundant with
+   * `verifyAccessToken`, which is deliberately stateless.
+   */
+  async openPanelSession(accessToken: string): Promise<PanelSession | null> {
+    const verified = await this.verifyAccessToken(accessToken);
+    if (!verified) return null;
+    if (!this.isEnrolled(verified.sid)) return null;
+    return this.panelSessions.create(verified.sid);
+  }
+
+  /**
+   * Resolve a panel-session cookie to its sidecar, or null.
+   *
+   * The enrollment lookup runs on EVERY authenticated request. That is the
+   * trade this design makes knowingly: `verifyAccessToken` skipped it because
+   * a 10-minute TTL was the revocation mechanism, and a session that outlives
+   * one TTL has to pay for what that bought. On a single-user brain it is a
+   * local prepared query, not a per-tenant round trip.
+   */
+  resolvePanelSession(sessionId: string): PanelSession | null {
+    const session = this.panelSessions.get(sessionId);
+    if (!session) return null;
+    if (!this.isEnrolled(session.sid)) {
+      // Revoked out from under a live panel. Drop it here rather than waiting
+      // for a sweep, so the very request that noticed is also the one refused.
+      this.panelSessions.delete(session.id);
+      return null;
+    }
+    return session;
+  }
+
+  /** A panel's WebSocket opened on this session. An open socket is liveness:
+   *  a healthy panel makes no HTTP requests, so without this an idle-but-open
+   *  window would look abandoned. */
+  panelSocketOpened(sessionId: string, socket: PanelSocket): void {
+    this.panelSessions.socketOpened(sessionId, socket);
+  }
+
+  /** A panel's WebSocket closed. When the last one goes the session becomes
+   *  idle-collectable, which is how a closed window is cleaned up without
+   *  threading panel ids through every spawn path. */
+  panelSocketClosed(sessionId: string, socket: PanelSocket): void {
+    this.panelSessions.socketClosed(sessionId, socket);
+  }
+
+  /** Live panel sessions. For tests and ops surfaces. */
+  listPanelSessions(): PanelSession[] {
+    return this.panelSessions.list();
+  }
+
   // --------------- Protocol: WebSocket Handlers ---------------
 
   /** Called when a sidecar WebSocket connects (after JWT validation) */
   handleSidecarConnect(ws: ServerWebSocket<unknown>, sidecarId: string): void {
+    // This device's panels get a fresh idle window. Its own socket comes back
+    // a second or two before theirs do (their reconnect loop retries every
+    // ~2s), and without this a sweep landing in that gap would collect a panel
+    // that is still on the user's screen -- see touchBySid.
+    this.panelSessions.touchBySid(sidecarId);
+
     const connection = new SidecarConnection(
       sidecarId,
       ws,
       this.scheduler,
-      () => this.handleSidecarDisconnect(sidecarId),
+      () => this.handleSidecarDisconnect(sidecarId, ws),
+      this.binarySpool,
     );
     connection.startHeartbeat();
+    // A reconnect can land before the previous socket's close (a sidecar that
+    // restarted itself to update, a flaky network). Retire the old one
+    // quietly: its close is ignored below, since it no longer owns the id.
+    const previous = this.sidecarConnections.get(sidecarId);
     this.sidecarConnections.set(sidecarId, connection);
+    if (previous && !previous.ownsSocket(ws)) previous.close();
     this.touchSidecar(sidecarId);
     console.log(`[SidecarManager] Sidecar WS connected: ${sidecarId}`);
   }
@@ -556,21 +864,27 @@ export class SidecarManager implements Service {
                 reason: 'incompatible',
                 min: SIDECAR_MIN_VERSION,
                 your_version: reportedVersion,
+                // The version to update to: the sidecar offers to install it.
+                latest: SIDECAR_LATEST_VERSION,
               }));
             } catch { /* socket may already be gone */ }
             ws.close(4001, 'sidecar version incompatible');
             return;
           }
 
+          // Every accepted registration is acknowledged with the sidecar
+          // version this brain ships with, which a self-updating sidecar
+          // offers to install. Sidecars that predate self-update ignore the
+          // unknown fields (and only ever looked at update_suggested).
+          try {
+            ws.send(JSON.stringify({
+              type: 'register_ack',
+              update_status: verdict,
+              latest: SIDECAR_LATEST_VERSION,
+              ...(verdict === 'suggested' ? { update_suggested: true, recommended: SIDECAR_RECOMMENDED_VERSION } : {}),
+            }));
+          } catch { /* best-effort */ }
           if (verdict === 'suggested') {
-            // Compatible but below RECOMMENDED — accept and advise an update.
-            try {
-              ws.send(JSON.stringify({
-                type: 'register_ack',
-                update_suggested: true,
-                recommended: SIDECAR_RECOMMENDED_VERSION,
-              }));
-            } catch { /* best-effort */ }
             console.log(`[SidecarManager] Sidecar ${sidecarId} v${reportedVersion} is below recommended ${SIDECAR_RECOMMENDED_VERSION} — update suggested`);
           }
 
@@ -583,6 +897,7 @@ export class SidecarManager implements Service {
             platform: parsed.platform ?? 'unknown',
             version: reportedVersion,
             updateStatus: verdict,
+            features: sanitizeFeatures(parsed.features),
             capabilities: parsed.capabilities ?? [],
             unavailableCapabilities: parsed.unavailable_capabilities ?? [],
             timezone: typeof parsed.timezone === 'string' ? parsed.timezone : undefined,
@@ -617,9 +932,29 @@ export class SidecarManager implements Service {
     }
   }
 
-  /** Called when a sidecar WebSocket disconnects */
-  handleSidecarDisconnect(sidecarId: string): void {
+  /**
+   * Called when a sidecar WebSocket disconnects.
+   *
+   * Deliberately does NOT close the device's panel sessions, and that omission
+   * is the design, not an oversight. A disconnect is not a security event: it
+   * is a network blip, a brain restart, a laptop lid. The panels are native
+   * windows owned by the sidecar PROCESS, so if that process is gone its
+   * windows went with it and there is nothing to protect; if it is merely
+   * offline for eight seconds, the windows are still on screen in front of a
+   * working user, and standing them down onto a 401 they cannot recover from
+   * would recreate the exact failure panel sessions were introduced to remove.
+   *
+   * Revocation is the event that closes panels -- see revokeSidecar and
+   * sweepPanelSessions.
+   */
+  handleSidecarDisconnect(sidecarId: string, ws?: ServerWebSocket<unknown>): void {
     const conn = this.sidecarConnections.get(sidecarId);
+    // A socket that has already been replaced by a newer connection for the
+    // same sidecar closing late must not tear the newer one down.
+    if (ws && conn && !conn.ownsSocket(ws)) {
+      console.log(`[SidecarManager] Stale socket for ${sidecarId} closed; keeping the newer connection`);
+      return;
+    }
     if (conn) {
       conn.close();
       this.sidecarConnections.delete(sidecarId);
@@ -641,9 +976,12 @@ export class SidecarManager implements Service {
     params: Record<string, unknown> = {},
     timeouts: RPCTimeouts = DEFAULT_RPC_TIMEOUTS,
   ): Promise<unknown> {
+    checkpointExecution();
+    assertMachineDispatch(sidecarId);
     const connection = this.sidecarConnections.get(sidecarId);
     if (!connection) {
-      throw new Error(`Sidecar ${sidecarId} is not connected`);
+      throw new ActionOutcomeError({ status: 'blocked', code: 'SIDECAR_OFFLINE',
+        message: `Sidecar ${sidecarId} is not connected`, effect: 'not_started' });
     }
 
     const rpcId = generateId();
@@ -661,6 +999,19 @@ export class SidecarManager implements Service {
     return this.rpcTracker.dispatch(rpcId, sidecarId, method, timeouts);
   }
 
+  /**
+   * Send an RPC without tracking a response — for high-rate fire-and-forget
+   * calls (realtime PCM frames) where a pending-tracker entry + timeout timer
+   * per call is pure overhead. Silently drops if the sidecar isn't connected.
+   */
+  dispatchNotify(sidecarId: string, method: string, params: Record<string, unknown> = {}): void {
+    checkpointExecution();
+    assertMachineDispatch(sidecarId);
+    const connection = this.sidecarConnections.get(sidecarId);
+    if (!connection) return;
+    connection.sendRPC({ type: 'rpc_request', id: generateId(), method, params });
+  }
+
   /** Register a listener for RPC progress events */
   onProgress(listener: (sidecarId: string, rpcId: string, progress: number, message?: string) => void): void {
     this.progressListeners.add(listener);
@@ -669,6 +1020,64 @@ export class SidecarManager implements Service {
   /** Register a listener for sidecar events */
   onEvent(listener: (sidecarId: string, event: SidecarEvent) => void): void {
     this.eventListeners.add(listener);
+  }
+
+  // ───────────────────────── Realtime audio channel ─────────────────────────
+
+  /** Register the pebble's dedicated audio pipe (replaces any stale one). */
+  registerAudioChannel(sidecarId: string, ws: ServerWebSocket<unknown>): void {
+    const prev = this.audioChannels.get(sidecarId);
+    if (prev && prev !== ws) {
+      try { prev.close(); } catch { /* already gone */ }
+    }
+    this.audioChannels.set(sidecarId, ws);
+    console.log(`[SidecarManager] realtime audio channel open for ${sidecarId}`);
+  }
+
+  /** Deregister the audio pipe on close (only if it's still the current one). */
+  unregisterAudioChannel(sidecarId: string, ws: ServerWebSocket<unknown>): void {
+    if (this.audioChannels.get(sidecarId) === ws) {
+      this.audioChannels.delete(sidecarId);
+      console.log(`[SidecarManager] realtime audio channel closed for ${sidecarId}`);
+    }
+  }
+
+  /** Route an inbound mic PCM frame from the audio channel to listeners. */
+  handleAudioFrame(sidecarId: string, frame: Buffer): void {
+    for (const listener of this.audioFrameListeners) listener(sidecarId, frame);
+  }
+
+  /** Listen for inbound mic PCM frames (wired to the realtime session). */
+  onAudioFrame(listener: (sidecarId: string, frame: Buffer) => void): void {
+    this.audioFrameListeners.add(listener);
+  }
+
+  /** A send handle for the audio pipe, or null when no channel is connected. */
+  getAudioChannel(sidecarId: string): SidecarAudioChannel | null {
+    const ws = this.audioChannels.get(sidecarId);
+    if (!ws) return null;
+    return {
+      sendPCM: (buf: Buffer) => { try { ws.send(buf); } catch { /* gone */ } },
+      sendFlush: () => { try { ws.send(JSON.stringify({ t: 'flush' })); } catch { /* gone */ } },
+    };
+  }
+
+  /**
+   * Record a sidecar's update_progress on its live connection (surfaced as
+   * `update_state` by the API). Malformed payloads are ignored.
+   */
+  recordUpdateProgress(sidecarId: string, payload: unknown): void {
+    const conn = this.connected.get(sidecarId);
+    const state = parseUpdateProgress(payload);
+    if (!conn || !state) return;
+    conn.updateState = state;
+    // JSON-quoted: the text comes from the sidecar and must not be able to
+    // forge extra log lines.
+    if (state.phase === 'failed') {
+      console.warn(`[SidecarManager] Sidecar ${sidecarId} update to ${JSON.stringify(state.version ?? '?')} failed: ${JSON.stringify(state.error ?? 'unknown error')}`);
+    } else {
+      console.log(`[SidecarManager] Sidecar ${sidecarId} update: ${state.phase} ${JSON.stringify(state.version ?? '')}`);
+    }
   }
 
   /** Register a listener for sidecar connect events */
@@ -695,6 +1104,10 @@ export class SidecarManager implements Service {
       unavailable_capabilities: conn?.unavailableCapabilities,
       version: conn?.version ?? record.version ?? undefined,
       update_status: conn?.updateStatus,
+      features: conn?.features,
+      latest_version: SIDECAR_LATEST_VERSION,
+      update_available: isUpdateAvailable(conn?.version ?? record.version),
+      update_state: conn?.updateState,
     };
   }
 }

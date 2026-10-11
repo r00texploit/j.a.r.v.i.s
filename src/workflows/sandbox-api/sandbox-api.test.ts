@@ -6,7 +6,7 @@
  */
 
 import { test, expect, describe, beforeAll, afterAll, beforeEach } from "bun:test";
-import { EngineTokenSigner } from "./engine-token";
+import { EngineTokenSigner, engineTokensEqual } from "./engine-token";
 import { SandboxRegistry } from "./sandbox-registry";
 import { SandboxApi } from "./server";
 import { CredentialResolver } from "../credentials/adapter";
@@ -15,12 +15,21 @@ import { closeWorkflowDb, initWorkflowDb } from "../db";
 import { _clearStoreForTests } from "../db/repos/store-entry";
 import { createFlow, setPublishedVersion, updateFlowStatus } from "../db/repos/flow";
 import { createDraftVersion, lockVersion } from "../db/repos/flow-version";
+import { createFlowRun } from "../db/repos/flow-run";
+import { getWaitpoint } from "../db/repos/waitpoint";
 
 const sampleIdentity = () => ({
   sandboxId: SandboxRegistry.newSandboxId(),
   runId: "run_test_" + Math.random().toString(36).slice(2, 10),
   projectId: DEFAULT_IDS.project,
 });
+
+function persistedIdentity() {
+  const flow = createFlow();
+  const version = createDraftVersion({ flowId: flow.id, displayName: "Sandbox API test" });
+  const run = createFlowRun({ flowId: flow.id, flowVersionId: version.id, status: "RUNNING" });
+  return { ...sampleIdentity(), runId: run.id, projectId: run.projectId };
+}
 
 describe("EngineTokenSigner", () => {
   test("mint+verify round-trip preserves claims", async () => {
@@ -58,6 +67,16 @@ describe("EngineTokenSigner", () => {
     const signer = new EngineTokenSigner();
     const { token } = await signer.mint(sampleIdentity(), -10);
     await expect(signer.verify(token)).rejects.toThrow();
+  });
+
+  test("engineTokensEqual matches only the identical string and tolerates a length mismatch", () => {
+    expect(engineTokensEqual("sentinel-token-value", "sentinel-token-value")).toBe(true);
+    expect(engineTokensEqual("sentinel-token-value", "sentinel-token-valuX")).toBe(false);
+    // `timingSafeEqual` throws on differing lengths, so the length guard has
+    // to absorb that rather than turn a superseded token into a 500.
+    expect(engineTokensEqual("short", "sentinel-token-value")).toBe(false);
+    expect(engineTokensEqual("", "")).toBe(true);
+    expect(engineTokensEqual("", "sentinel-token-value")).toBe(false);
   });
 });
 
@@ -645,6 +664,21 @@ describe("SandboxApi routes (B3: files, waitpoints, logs)", () => {
     expect(r.status).toBe(403);
   });
 
+  test("POST /v1/waitpoints accepts DELAY (stored as TIMER) and normalizes RFC-1123 -> ISO", async () => {
+    // delay-for pieces send type 'DELAY' with an RFC-1123 (toUTCString) time.
+    const rfc1123 = new Date("2026-07-07T03:00:00Z").toUTCString();
+    const r = await authedFetchForRun("/v1/waitpoints", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ flowRunId: testRunId, stepName: "delay", type: "DELAY", resumeDateTime: rfc1123 }),
+    });
+    expect(r.status).toBe(200);
+    const { waitpointId } = (await r.json()) as { waitpointId: string };
+    const wp = getWaitpoint(waitpointId);
+    expect(wp?.type).toBe("TIMER"); // DELAY mapped so the scheduler finds it
+    expect(wp?.resumeDateTime).toBe("2026-07-07T03:00:00.000Z"); // normalized to ISO for lexical compare
+  });
+
   test("POST /v1/waitpoints rejects unsupported type", async () => {
     const r = await authedFetchForRun("/v1/waitpoints", {
       method: "POST",
@@ -677,6 +711,8 @@ describe("SandboxApi routes (B3: files, waitpoints, logs)", () => {
 });
 
 describe("SandboxApi routes (G: jarvis-tool/notify/context)", () => {
+  beforeAll(() => { initWorkflowDb(":memory:"); });
+  afterAll(() => { closeWorkflowDb(); });
   let api: SandboxApi;
   let signer: EngineTokenSigner;
   let registry: SandboxRegistry;
@@ -685,7 +721,7 @@ describe("SandboxApi routes (G: jarvis-tool/notify/context)", () => {
   let contextCalls: Array<{ method: string; input: unknown }>;
 
   async function authedFetch(path: string, init: RequestInit = {}): Promise<Response> {
-    const id = sampleIdentity();
+    const id = persistedIdentity();
     const { token } = await signer.mint(id);
     registry.register({
       ...id,
@@ -721,19 +757,19 @@ describe("SandboxApi routes (G: jarvis-tool/notify/context)", () => {
         contextProvider: {
           vaultSearch: async (input) => {
             contextCalls.push({ method: "vaultSearch", input });
-            return [];
+            return { result: [] };
           },
           vaultGetEntity: async (id) => {
             contextCalls.push({ method: "vaultGetEntity", input: id });
-            return null;
+            return { result: null };
           },
           awarenessRecent: async (input) => {
             contextCalls.push({ method: "awarenessRecent", input });
-            return [];
+            return { result: [] };
           },
           commitmentsList: async (input) => {
             contextCalls.push({ method: "commitmentsList", input });
-            return [];
+            return { result: [] };
           },
         },
       },
@@ -959,6 +995,8 @@ describe("SandboxApi routes (G unconfigured -> 503)", () => {
 });
 
 describe("SandboxApi routes (H: jarvis-agent/trigger)", () => {
+  beforeAll(() => { initWorkflowDb(":memory:"); });
+  afterAll(() => { closeWorkflowDb(); });
   let api: SandboxApi;
   let signer: EngineTokenSigner;
   let registry: SandboxRegistry;
@@ -981,7 +1019,7 @@ describe("SandboxApi routes (H: jarvis-agent/trigger)", () => {
   };
 
   async function authedFetch(path: string, init: RequestInit = {}): Promise<Response> {
-    const id = sampleIdentity();
+    const id = persistedIdentity();
     const { token } = await signer.mint(id);
     registry.register({
       ...id,
@@ -1067,6 +1105,17 @@ describe("SandboxApi routes (H: jarvis-agent/trigger)", () => {
     expect(r.status).toBe(400);
   });
 
+  test("POST /v1/jarvis/agent/delegate refuses more than 200 maxIterations and accepts exactly 200", async () => {
+    const delegate = (maxIterations: number) =>
+      authedFetch("/v1/jarvis/agent/delegate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ goal: "x", maxIterations }),
+      });
+    expect((await delegate(201)).status).toBe(400);
+    expect((await delegate(200)).status).toBe(200);
+  });
+
   test("POST /v1/jarvis/events/poll forwards eventType+filter+since", async () => {
     pollReply = {
       events: [
@@ -1147,6 +1196,8 @@ describe("SandboxApi routes (H: jarvis-agent/trigger)", () => {
 });
 
 describe("SandboxApi routes (workflows/start error mapping)", () => {
+  beforeAll(() => { initWorkflowDb(":memory:"); });
+  afterAll(() => { closeWorkflowDb(); });
   // The route maps typed errors (carrying `.code`) into specific HTTP
   // statuses so the piece's error message derives cleanly from status
   // instead of grepping the body. Each test below installs a fresh
@@ -1157,7 +1208,7 @@ describe("SandboxApi routes (workflows/start error mapping)", () => {
   let throwError: { code: string; message: string } | null = null;
 
   async function authedFetch(path: string, init: RequestInit = {}): Promise<Response> {
-    const id = sampleIdentity();
+    const id = persistedIdentity();
     const { token } = await signer.mint(id);
     registry.register({
       ...id,
@@ -1220,6 +1271,12 @@ describe("SandboxApi routes (workflows/start error mapping)", () => {
 
   test("VERSION_MISSING -> 422", async () => {
     throwError = { code: "VERSION_MISSING", message: "flow X has no version" };
+    const r = await start();
+    expect(r.status).toBe(422);
+  });
+
+  test("WORKFLOW_NOT_READY -> 422", async () => {
+    throwError = { code: "WORKFLOW_NOT_READY", message: "trigger (cron): Invalid cron expression" };
     const r = await start();
     expect(r.status).toBe(422);
   });
@@ -1295,12 +1352,14 @@ describe("SandboxApi routes (H unconfigured -> 503)", () => {
 });
 
 describe("SandboxApi /v1/jarvis/* envelope hardening (G+H review #7)", () => {
+  beforeAll(() => { initWorkflowDb(":memory:"); });
+  afterAll(() => { closeWorkflowDb(); });
   let api: SandboxApi;
   let signer: EngineTokenSigner;
   let registry: SandboxRegistry;
 
   async function authedFetch(path: string, init: RequestInit = {}): Promise<Response> {
-    const id = sampleIdentity();
+    const id = persistedIdentity();
     const { token } = await signer.mint(id);
     registry.register({
       ...id,
@@ -1327,10 +1386,10 @@ describe("SandboxApi /v1/jarvis/* envelope hardening (G+H review #7)", () => {
         toolsInvoke: async () => ({ result: {}, toolName: "" }),
         notify: async () => ({ delivered: [], failed: [] }),
         contextProvider: {
-          vaultSearch: async () => [],
-          vaultGetEntity: async () => null,
-          awarenessRecent: async () => [],
-          commitmentsList: async () => [],
+          vaultSearch: async () => ({ result: [] }),
+          vaultGetEntity: async () => ({ result: null }),
+          awarenessRecent: async () => ({ result: [] }),
+          commitmentsList: async () => ({ result: [] }),
         },
         agentDelegate: async () => ({ finalMessage: "", toolCalls: [], status: "completed" }),
         eventsPoll: async () => ({ events: [], cursor: 7 }),

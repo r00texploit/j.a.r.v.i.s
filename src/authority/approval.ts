@@ -1,11 +1,22 @@
 /**
  * Approval Manager — Handles the lifecycle of approval requests.
  *
- * Persists to SQLite: pending → approved/denied → executed
+ * Persists to SQLite: pending -> approved -> claimed -> executed (with a receipt).
+ *
+ * A decision and its execution are separate writes, so a crash can fall
+ * between them. The claim marks that one executor took the approved request
+ * before dispatch; the receipt records what that execution produced. After a
+ * restart, an approved row without a receipt is reconciled as `not_started`
+ * (never claimed: nothing happened) or `unknown` (claimed by a previous
+ * process: the effect may have happened). Neither is replayed; both wait for
+ * the user, who can run a not-started row once or close either.
  */
 
 import { getDb, generateId } from '../vault/schema.ts';
 import type { ActionCategory } from '../roles/authority.ts';
+import type { ApprovalGuard, ToolDefinition, ToolRegistry } from '../actions/tools/registry.ts';
+import type { ReviewedExecution } from '../actions/tools/reviewed-call-scope.ts';
+import { rawUiGate } from './ui-intent';
 
 export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired' | 'executed';
 export type ApprovalUrgency = 'urgent' | 'normal';
@@ -18,8 +29,25 @@ export type ApprovalUrgency = 'urgent' | 'normal';
  *    endpoints must only flip the status, never execute.
  *  - 'deferred': nobody is waiting; whichever endpoint approves it runs
  *    the tool via DeferredExecutor (the legacy fire-and-forget path).
+ *  - 'workflow': a durable workflow effect owns dispatch and continuation.
+ *    Approval endpoints resolve only; the workflow scheduler resumes the run.
  */
-export type ApprovalExecutionMode = 'inline' | 'deferred';
+export type ApprovalExecutionMode = 'inline' | 'deferred' | 'workflow';
+
+/** What a receipt says the execution produced. */
+export type ApprovalReceiptOutcome = 'committed' | 'failed' | 'blocked';
+
+/**
+ * What happened to an approved request's execution:
+ *  - committed, failed, blocked: a receipt; the row is `executed`.
+ *  - not_started: reconciled after a restart. Approved, never claimed, so no
+ *    effect happened. The user may run it once or close it.
+ *  - unknown: reconciled after a restart. Claimed by a previous process that
+ *    never wrote a receipt, so the effect may have happened. Never run again
+ *    automatically; the user checks what happened and closes it.
+ *  - closed: the user resolved a not_started or unknown row without running it.
+ */
+export type ApprovalExecutionOutcome = ApprovalReceiptOutcome | 'not_started' | 'unknown' | 'closed';
 
 export type ApprovalRequest = {
   id: string;
@@ -38,9 +66,112 @@ export type ApprovalRequest = {
   executed_at: number | null;
   execution_result: string | null;
   created_at: number;
+  /** Set when an executor took the approved request; null until then. */
+  execution_claimed_at?: number | null;
+  execution_claimed_by?: string | null;
+  /** The daemon process that claimed it; a different boot never wrote our receipt. */
+  execution_boot_id?: string | null;
+  execution_outcome?: ApprovalExecutionOutcome | null;
+  resolved_at?: number | null;
+  resolved_by?: string | null;
+  resolution_note?: string | null;
 };
 
+/**
+ * One word for where a request stands, for lists and cards. Pending rows
+ * await a decision; approved rows are awaiting execution, in flight, or
+ * reconciled; executed rows carry their receipt's outcome.
+ */
+export type ApprovalExecutionState =
+  | 'pending' | 'denied' | 'expired'
+  | 'awaiting_execution' | 'in_flight'
+  | ApprovalExecutionOutcome;
+
+export function executionState(request: ApprovalRequest): ApprovalExecutionState {
+  if (request.status === 'executed') return request.execution_outcome ?? 'committed';
+  if (request.status !== 'approved') return request.status;
+  if (request.execution_outcome) return request.execution_outcome;
+  return request.execution_claimed_at ? 'in_flight' : 'awaiting_execution';
+}
+
+const UNRESOLVED = `status = 'approved' AND execution_outcome IN ('not_started', 'unknown')`;
+
+/**
+ * One id per process, so every manager in this daemon agrees on which claims
+ * are its own. Tests pass an explicit id to stand in for a previous boot.
+ */
+const PROCESS_BOOT_ID = generateId();
+
+/**
+ * True when the request must be resolved by a click, never by voice or an
+ * auto-approval: the gated tool declared `confirm: 'always'` (its context is
+ * the JSON the orchestrator wrote for it). Installing input hooks is the
+ * case today. Destructive impacts are handled separately by the voice gate.
+ */
+export function approvalNeedsClick(request: Pick<ApprovalRequest, 'context'>): boolean {
+  const raw = request.context ?? '';
+  if (!raw.startsWith('{')) return false;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return !!parsed && typeof parsed === 'object' && (parsed as Record<string, unknown>).confirm === 'always';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The card sentence a gated tool wrote into the request context, if any.
+ *
+ * Never for `request_approval`: its `context` is the model's own `context`
+ * argument, stored verbatim, so a JSON object there is not a gate's sentence
+ * however it is spelled (#721). Every other writer of `context` is trusted
+ * code (`gateContext`, the workflow effect boundary).
+ */
+export function approvalIntentFromContext(request: Pick<ApprovalRequest, 'context' | 'tool_name'>): string | null {
+  if (request.tool_name === 'request_approval') return null;
+  const raw = request.context ?? '';
+  if (!raw.startsWith('{')) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    const intent = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>).intent : undefined;
+    return typeof intent === 'string' && intent.trim() ? intent.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * How much of a request id a Telegram/Discord card shows and a reply must
+ * name: the first group of the UUID (`approvalChannelCard`).
+ */
+export const APPROVAL_SHORT_ID_LENGTH = 8;
+
+const SHORT_ID = new RegExp(`^[0-9a-f]{${APPROVAL_SHORT_ID_LENGTH}}$`);
+
+/** What a reply's short id names (`ApprovalManager.findByShortId`). */
+export type ShortIdMatch =
+  | { status: 'found'; request: ApprovalRequest }
+  /** No pending request has that short id. */
+  | { status: 'none' }
+  /** More than one pending request has it, so it names none of them. */
+  | { status: 'ambiguous' }
+  /** Not a whole short id: wrong length, or not lower-case hex. */
+  | { status: 'malformed' };
+
 export class ApprovalManager {
+  /** Identity of this process. A claim carrying another boot id never got its receipt from us. */
+  readonly bootId: string;
+  // UI dispatch is process-bound: durable approvals survive a restart, but
+  // browser controllers and structural element IDs do not. A missing binding
+  // must require fresh review, never fall back to the main agent's registry.
+  private uiExecutions = new Map<string, {
+    registry: ToolRegistry; tool: ToolDefinition; arguments: string; current: ApprovalGuard;
+  }>();
+
+  constructor(bootId: string = PROCESS_BOOT_ID) {
+    this.bootId = bootId;
+  }
+
   /**
    * Create a new approval request and persist to DB.
    */
@@ -54,18 +185,34 @@ export class ApprovalManager {
     reason: string;
     context: string;
     executionMode?: ApprovalExecutionMode;
+    /** Trusted originating registry, supplied by the agent, never model input. */
+    toolRegistry?: ToolRegistry;
   }): ApprovalRequest {
     const db = getDb();
     const id = generateId();
     const now = Date.now();
     const toolArgs = JSON.stringify(params.toolArguments);
     const executionMode = params.executionMode ?? 'deferred';
+    const tool = params.toolRegistry?.get(params.toolName);
+    let current: ApprovalGuard | undefined;
+    if (tool && rawUiGate(params.toolName, params.toolArguments)) {
+      try {
+        current = tool.captureApprovalGuard?.(JSON.parse(toolArgs)) ?? (() => true);
+      } catch {
+        // A failed subject capture must not create an executable approval.
+        current = () => false;
+      }
+    }
 
     db.run(
       `INSERT INTO approval_requests (id, agent_id, agent_name, tool_name, tool_arguments, action_category, urgency, reason, context, status, execution_mode, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       [id, params.agentId, params.agentName, params.toolName, toolArgs, params.actionCategory, params.urgency, params.reason, params.context, executionMode, now]
     );
+
+    if (tool && current && params.toolRegistry) {
+      this.uiExecutions.set(id, { registry: params.toolRegistry, tool, arguments: toolArgs, current });
+    }
 
     return {
       id,
@@ -84,7 +231,51 @@ export class ApprovalManager {
       executed_at: null,
       execution_result: null,
       created_at: now,
+      execution_claimed_at: null,
+      execution_claimed_by: null,
+      execution_boot_id: null,
+      execution_outcome: null,
+      resolved_at: null,
+      resolved_by: null,
+      resolution_note: null,
     };
+  }
+
+  /** Resolve only the exact live implementation/subject captured for this row. */
+  getUiExecutionRegistry(request: ApprovalRequest): ToolRegistry | null {
+    return this.getUiExecution(request)?.registry ?? null;
+  }
+
+  /**
+   * The same resolution, together with what the guard bound at review (#676)
+   * -- for the executor, which has to run the call inside that scope.
+   *
+   * `reviewed` is ALWAYS an object here, `{}` for a guard that bound nothing,
+   * so the execution can tell "approved, with nothing bound" from "not an
+   * approved execution at all". Read from the SAME binding the check passed
+   * on, so the two cannot come from different approvals.
+   */
+  getUiExecution(request: ApprovalRequest): { registry: ToolRegistry; reviewed: ReviewedExecution } | null {
+    const binding = this.uiExecutions.get(request.id);
+    if (!binding || binding.arguments !== request.tool_arguments ||
+        binding.registry.get(request.tool_name) !== binding.tool) return null;
+    try {
+      if (!binding.current()) return null;
+      const reviewed = binding.current.reviewed ?? {};
+      // The model loop that raised the card is carried ONLY while a live gate
+      // in that loop is the one running the call (#827). A deferred row --
+      // created so, or an inline one demoted after its wait timed out -- runs
+      // whenever the person gets to it, often while that loop has moved on
+      // without the result: its navigate would then write the loop's record,
+      // and the loop's next card would bind a page its model never read.
+      if (request.execution_mode !== 'inline' && reviewed.readLog) {
+        const { readLog: _detached, ...rest } = reviewed;
+        return { registry: binding.registry, reviewed: rest };
+      }
+      return { registry: binding.registry, reviewed };
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -97,13 +288,27 @@ export class ApprovalManager {
   }
 
   /**
-   * Find a request by short ID prefix (for Telegram/Discord commands).
+   * The pending request a Telegram/Discord `approve <id>` or `deny <id>` names
+   * (#810).
+   *
+   * The id must be the whole short id the card shows -- the first
+   * `APPROVAL_SHORT_ID_LENGTH` characters of the request id -- and must name
+   * exactly one pending request. This used to be a prefix match with no
+   * minimum length that took the first row, so `approve a` approved whichever
+   * pending request happened to come first with an id starting `a`: one the
+   * person may never have seen. (Worse, the reply parser matched any hex-
+   * looking word, so `approve all of them` sent `a`.) A shorter or longer id is
+   * `malformed`, and one that matches two pending requests is `ambiguous`;
+   * neither decides anything.
    */
-  findByShortId(shortId: string): ApprovalRequest | null {
+  findByShortId(shortId: string): ShortIdMatch {
+    if (!SHORT_ID.test(shortId)) return { status: 'malformed' };
     const db = getDb();
-    const row = db.query('SELECT * FROM approval_requests WHERE id LIKE ? AND status = ?')
-      .get(`${shortId}%`, 'pending') as ApprovalRequest | null;
-    return row;
+    const rows = db.query('SELECT * FROM approval_requests WHERE substr(id, 1, ?) = ? AND status = ? LIMIT 2')
+      .all(APPROVAL_SHORT_ID_LENGTH, shortId, 'pending') as ApprovalRequest[];
+    if (rows.length === 0) return { status: 'none' };
+    if (rows.length > 1) return { status: 'ambiguous' };
+    return { status: 'found', request: rows[0]! };
   }
 
   /**
@@ -135,6 +340,7 @@ export class ApprovalManager {
     );
 
     if (result.changes === 0) return null;
+    this.uiExecutions.delete(requestId);
     return this.getRequest(requestId);
   }
 
@@ -172,16 +378,110 @@ export class ApprovalManager {
   }
 
   /**
-   * Mark an approved request as executed with its result.
+   * Take an approved request for execution. Exactly one caller wins: the
+   * update is conditional on the row being approved and unclaimed, or
+   * reconciled as not started, which is the user's explicit second run.
+   * Returns false when another executor holds it, when it was reconciled as
+   * `unknown` (its effect may already have happened), or when it was closed.
    */
-  markExecuted(requestId: string, executionResult: string): void {
+  claimExecution(requestId: string, claimedBy: string): boolean {
+    const db = getDb();
+    const result = db.run(
+      `UPDATE approval_requests
+         SET execution_claimed_at = ?, execution_claimed_by = ?, execution_boot_id = ?, execution_outcome = NULL
+       WHERE id = ? AND status = 'approved' AND execution_claimed_at IS NULL
+         AND (execution_outcome IS NULL OR execution_outcome = 'not_started')`,
+      [Date.now(), claimedBy, this.bootId, requestId]
+    );
+    return result.changes > 0;
+  }
+
+  /**
+   * Record the receipt of an approved request's execution. `committed` is
+   * the tool returning, `failed` the tool throwing, `blocked` a refusal under
+   * emergency state. Only an approved row can receive a receipt; returns
+   * whether one was written.
+   */
+  markExecuted(requestId: string, executionResult: string, outcome: ApprovalReceiptOutcome = 'committed'): boolean {
     const db = getDb();
     const now = Date.now();
 
-    db.run(
-      `UPDATE approval_requests SET status = 'executed', executed_at = ?, execution_result = ? WHERE id = ?`,
-      [now, executionResult, requestId]
+    const result = db.run(
+      `UPDATE approval_requests SET status = 'executed', executed_at = ?, execution_result = ?, execution_outcome = ?
+       WHERE id = ? AND status = 'approved'`,
+      [now, executionResult, outcome, requestId]
     );
+    if (result.changes > 0) this.uiExecutions.delete(requestId);
+    return result.changes > 0;
+  }
+
+  /**
+   * Startup reconciliation, run once before anything can execute. Pending
+   * inline rows lose their gate on restart and go to the deferred path. An
+   * approved row with a claim from another process and no receipt is
+   * `unknown`: the effect may have happened. An approved row never claimed
+   * is `not_started`: nothing happened. Neither is run here. Workflow-owned
+   * rows are left alone; their truth is the workflow effect record.
+   */
+  reconcileAfterRestart(): { demotedInline: number; notStarted: number; interrupted: number } {
+    this.uiExecutions.clear();
+    const db = getDb();
+    const demotedInline = this.demoteAllPendingInline();
+    // APPROVED inline rows lost their gate too: whoever runs one now (the
+    // execute route, after the person chooses to) hands the result to a
+    // person, not to the loop that asked. `inline` must keep meaning "a live
+    // gate owns this", because the executor keys site-playbook delivery on it
+    // (#830): left inline, an approved `browser_snapshot` card run from the
+    // dashboard after a restart recorded a playbook no model would read, and
+    // the chat's next snapshot got none for 30 minutes. Not counted in
+    // `demotedInline`, which names the pending rows that go back on the queue.
+    // WHATEVER the row's outcome: one an earlier boot already reconciled to
+    // not_started or unknown has no live gate either, and stayed inline.
+    db.run(
+      `UPDATE approval_requests SET execution_mode = 'deferred'
+       WHERE status = 'approved' AND execution_mode = 'inline'`
+    );
+    const interrupted = db.run(
+      `UPDATE approval_requests SET execution_outcome = 'unknown'
+       WHERE status = 'approved' AND execution_claimed_at IS NOT NULL AND execution_outcome IS NULL
+         AND execution_mode != 'workflow' AND (execution_boot_id IS NULL OR execution_boot_id != ?)`,
+      [this.bootId]
+    ).changes;
+    const notStarted = db.run(
+      `UPDATE approval_requests SET execution_outcome = 'not_started'
+       WHERE status = 'approved' AND execution_claimed_at IS NULL AND execution_outcome IS NULL
+         AND execution_mode != 'workflow'`
+    ).changes;
+    return { demotedInline, notStarted, interrupted };
+  }
+
+  /**
+   * Approved rows that need the user: reconciled as not started or unknown
+   * and not yet closed. These are absent from `getPending()` on purpose;
+   * approving them again is impossible and running them is a separate,
+   * explicit decision.
+   */
+  getUnresolved(): ApprovalRequest[] {
+    const db = getDb();
+    return db.query(
+      `SELECT * FROM approval_requests WHERE ${UNRESOLVED} ORDER BY decided_at DESC, created_at DESC`
+    ).all() as ApprovalRequest[];
+  }
+
+  /**
+   * Resolve an unresolved row without running it. The status stays
+   * `approved`, which is what the user decided; the outcome says the
+   * execution was closed and by whom.
+   */
+  closeUnresolved(requestId: string, resolvedBy: string, note?: string): boolean {
+    const db = getDb();
+    const result = db.run(
+      `UPDATE approval_requests SET execution_outcome = 'closed', resolved_at = ?, resolved_by = ?, resolution_note = ?
+       WHERE id = ? AND ${UNRESOLVED}`,
+      [Date.now(), resolvedBy, note ?? null, requestId]
+    );
+    if (result.changes > 0) this.uiExecutions.delete(requestId);
+    return result.changes > 0;
   }
 
   /**
@@ -239,6 +539,9 @@ export class ApprovalManager {
       `UPDATE approval_requests SET status = 'expired' WHERE status = 'pending' AND created_at < ?`,
       [cutoff]
     );
+    for (const id of this.uiExecutions.keys()) {
+      if (this.getRequest(id)?.status === 'expired') this.uiExecutions.delete(id);
+    }
     return result.changes;
   }
 

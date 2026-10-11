@@ -24,6 +24,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { closeRL, ask, askYesNo, c } from './helpers.ts';
 import { stopDaemonGracefully } from './daemon-control.ts';
+import { isLocked } from '../daemon/pid.ts';
 import { getAutostartName, isAutostartInstalled, uninstallAutostart } from './autostart.ts';
 import {
   detectInstallMethod,
@@ -225,16 +226,29 @@ try {
 
 // ── Side-effect cleanup (synchronous, parent process) ───────────────
 
-async function runSideEffectCleanup(plan: CleanupPlan): Promise<void> {
-  await stopDaemonGracefully({
-    onStart: (pid) => console.log(c.dim(`Stopping daemon (PID ${pid})...`)),
-    onForce: (pid) => console.log(c.dim(`Force-killing daemon (PID ${pid})...`)),
-  });
-
+async function runSideEffectCleanup(plan: CleanupPlan): Promise<boolean> {
+  // Autostart FIRST, then the daemon. Both service definitions relaunch a
+  // daemon that exits unsuccessfully (systemd Restart=on-failure, the launchd
+  // plist's KeepAlive={SuccessfulExit: false} since #549), and a stop that
+  // overruns the drain deadline escalates to SIGKILL, which is exactly that: the
+  // daemon comes back under a new pid, the stop reports `stopped: false`, we
+  // abort, and the unload that would have broken the cycle never runs. Every
+  // retry loops the same way. Removing the service first cannot loop.
+  //
+  // Before #549 this held for EVERY stop on macOS, clean drain included, because
+  // `KeepAlive=true` relaunched after any exit; a plist installed by an older
+  // version still behaves that way, which is another reason the order stands.
   if (plan.autostartInstalled) {
     console.log(c.dim(`Removing ${getAutostartName()}...`));
     try {
-      await uninstallAutostart();
+      // The result matters, not just an exception: a launchd agent that could not
+      // be unloaded is still there to relaunch the daemon the stop below is about
+      // to make exit, which is the loop this ordering exists to avoid. The
+      // uninstall still goes on -- the user asked for it -- but says so.
+      if (!await uninstallAutostart()) {
+        console.log(c.yellow('  ! The service could not be removed, so it may relaunch the daemon.'));
+        console.log(c.dim('    If the stop below fails, remove it by hand and re-run `jarvis uninstall`.'));
+      }
     } catch (err) {
       // Autostart removal can fail if systemd/launchd is in a weird state.
       // Surface the error but don't abort — the user still wants the rest
@@ -243,6 +257,23 @@ async function runSideEffectCleanup(plan: CleanupPlan): Promise<void> {
       console.log(c.dim(`    You may need to remove it manually.`));
     }
   }
+
+  const stop = await stopDaemonGracefully({
+    onStart: (pid) => console.log(c.dim(`Stopping daemon (PID ${pid})...`)),
+    onForce: (pid) => console.log(c.dim(`Force-killing daemon (PID ${pid})...`)),
+  });
+  // A daemon we failed to kill is still writing jarvis.db, the keychain, and
+  // workflow state. removablePaths includes the data dir, so continuing would
+  // rm -rf it underneath a live writer. Bail — the caller aborts the uninstall.
+  if (!stop.stopped) {
+    const holder = isLocked();
+    console.log(c.red(`\n✗ Daemon (PID ${holder ?? stop.pid}) could not be stopped.`));
+    console.log(c.dim('  Uninstall aborted: removing the data dir while it is running would corrupt it.'));
+    console.log(c.dim('  Stop it as its owner (or with root), then re-run `jarvis uninstall`.'));
+    return false;
+  }
+
+  return true;
 }
 
 // ── Package removal (detached process) ──────────────────────────────
@@ -268,10 +299,11 @@ function printPlan(plan: CleanupPlan): void {
   console.log(c.dim(`  (${plan.methodReason})`));
   console.log('');
   console.log(c.dim('Planned cleanup:'));
-  console.log(c.dim(`  • Stop daemon (if running)`));
+  // In the order runSideEffectCleanup does it: autostart first, then the daemon.
   if (plan.autostartInstalled) {
     console.log(c.dim(`  • Remove autostart: ${getAutostartName()}`));
   }
+  console.log(c.dim(`  • Stop daemon (if running)`));
   for (const target of plan.removablePaths) {
     console.log(c.dim(`  • Remove: ${target}`));
   }
@@ -332,7 +364,13 @@ export async function runUninstallWizard(packageRoot = PACKAGE_ROOT): Promise<vo
 
   closeRL();
 
-  await runSideEffectCleanup(plan);
+  // A false here means the daemon survived the stop. Nothing further may run:
+  // both the dev/unknown path and schedulePackageRemoval below delete the data
+  // dir that daemon is still writing to.
+  if (!await runSideEffectCleanup(plan)) {
+    process.exitCode = 1;
+    return;
+  }
 
   if (plan.method === 'dev' || plan.method === 'unknown') {
     console.log(c.green('\n✓ Side-effect cleanup complete.'));

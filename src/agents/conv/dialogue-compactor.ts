@@ -17,6 +17,7 @@
 
 import type { LLMManager } from '../../llm/manager.ts';
 import type { LLMMessage } from '../../llm/provider.ts';
+import { runWithOrigin } from '../../llm/origin.ts';
 
 type CacheEntry = {
   /** Head slice size at the time we summarized. */
@@ -104,8 +105,10 @@ export class DialogueCompactor {
     this.pending.add(conversationId);
     const headCount = messages.length - this.keepRecent;
     const head = messages.slice(0, headCount);
-    this.summarizeHead(head)
+    // Background: a summary of messages the conversation already sent.
+    runWithOrigin('background', () => this.summarizeHead(head))
       .then(summary => {
+        this.sweepExpired(Date.now());
         this.cache.set(conversationId, {
           headCount,
           summary,
@@ -118,6 +121,18 @@ export class DialogueCompactor {
       .finally(() => {
         this.pending.delete(conversationId);
       });
+  }
+
+  /**
+   * Drop summaries past their TTL. compact() ignores them already, but
+   * nothing removed them, and since #884 every channel sender has their own
+   * conversation, so the keys grow with the number of people who message the
+   * bot rather than with the owner's own chats.
+   */
+  private sweepExpired(now: number): void {
+    for (const [id, entry] of this.cache) {
+      if (now - entry.builtAt >= CACHE_TTL_MS) this.cache.delete(id);
+    }
   }
 
   private async summarizeHead(head: LLMMessage[]): Promise<string> {

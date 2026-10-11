@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,22 +44,25 @@ func (e *tokenRejectedError) Error() string {
 }
 
 type SidecarClient struct {
-	config          *SidecarConfig
-	claims          *SidecarTokenClaims
-	tokenProvider   *accessTokenProvider // mints short-lived panel access tokens
-	handlers        map[string]RPCHandler
+	config        *SidecarConfig
+	claims        *SidecarTokenClaims
+	tokenProvider *accessTokenProvider // mints short-lived panel access tokens
+	handlers      map[string]RPCHandler
 	// conn is read by readLoop/sendJSON/sendBinary (per-connection goroutines)
 	// and written by connectAndServe; Stop() clears it from the signal-handler
 	// goroutine. atomic.Pointer makes those cross-goroutine accesses race-free
 	// (c.mu intentionally does not cover conn).
-	conn            atomic.Pointer[websocket.Conn]
-	reconnectDelay  time.Duration
-	stopped         bool
-	incompatible    bool         // brain hard-blocked us (version < MIN); do not reconnect
-	connState       atomic.Int32 // connConnecting/connConnected/connError (tray icon + status)
-	alertOnce       sync.Once    // show the invalid-token pop-up at most once
-	availableCaps   []SidecarCapability
-	unavailableCaps []UnavailableCapability
+	conn           atomic.Pointer[websocket.Conn]
+	reconnectDelay time.Duration
+	stopped        bool
+	incompatible   bool         // brain hard-blocked us (version < MIN); do not reconnect
+	connState      atomic.Int32 // connConnecting/connConnected/connError (tray icon + status)
+	alertOnce      sync.Once    // show the invalid-token pop-up at most once
+	// openDashboardOnce gates the "Open dashboard at startup" preference to a
+	// single firing per process — see shouldOpenDashboardAtStartup.
+	openDashboardOnce sync.Once
+	availableCaps     []SidecarCapability
+	unavailableCaps   []UnavailableCapability
 
 	shutdown  func()             // full process-shutdown (client stop + ctx cancel); set by runWithTray
 	obsCancel context.CancelFunc // cancel function for running observers
@@ -71,6 +75,62 @@ type SidecarClient struct {
 	subPebble SubPebbleService       // per-sub-agent rail overlays (CapSubPebble)
 	playback  *AudioPlaybackService  // pebble TTS playback (alongside CapPebble)
 	regions   RegionSelectionService // T19 drag-select capture (alongside CapPebble)
+
+	// Realtime voice (gpt-realtime). streamPlayer is the live PCM playback
+	// device, read by the readLoop's pebble.play_pcm fast-path; realtime is the
+	// per-connection controller (built in connectAndServe). atomic.Pointer
+	// because it's re-assigned on every reconnect while the tray/Cocoa/hotkey
+	// threads read it — a plain field is a data race.
+	streamPlayer atomic.Pointer[AudioStreamPlayer]
+	realtime     atomic.Pointer[realtimeVoice]
+
+	// updater owns self-update: what the brain advertised, whether it is
+	// installable, and the install itself (updater.go, client_update.go).
+	updater *Updater
+
+	// wakeSuppress is the current connection's wake-listener suppression hook,
+	// published here so the playback state hook can find it. The wake listener
+	// is per-connection but the playback service outlives a reconnect (and is
+	// rebuilt by reloadConfig), so the two can't be captured in one closure.
+	wakeSuppress atomic.Pointer[func(playing bool)]
+}
+
+// installPlayStateHook wires a playback service's state callback. Two jobs on
+// each edge:
+//
+//   - Suppress wake captures while TTS is playing, so JARVIS's own voice
+//     through the speakers doesn't trigger a self-wake.
+//   - Hold ambient screen awareness off, so a screenshot + OCR tick can't stall
+//     the cgo audio callback with a GC pause, or make the brain pull a
+//     multi-megabyte capture down the same connection the TTS clips arrive on.
+//     This half is deliberately NOT gated on the wake listener: it matters even
+//     when there is no wake listener to suppress.
+//
+// Called from connectAndServe and from reloadConfig, since either can be the
+// point at which a live playback service first exists.
+func (c *SidecarClient) installPlayStateHook(pb *AudioPlaybackService) {
+	if pb == nil {
+		return
+	}
+	// Sequence number of the hold this hook took when playback started, so the
+	// matching end event can't shorten a hold that a NEWER turn has since
+	// taken. The worker debounces its idle announcement by over a second, which
+	// is easily long enough for the next turn to have started.
+	var holdSeq atomic.Uint64
+	pb.SetPlayStateListener(func(playing bool) {
+		if h := c.wakeSuppress.Load(); h != nil {
+			(*h)(playing)
+		}
+		if playing {
+			holdSeq.Store(ambientHoldFor(voiceTurnAmbientHold))
+			return
+		}
+		// Not a hard release: streaming TTS idles the queue for the 300-800 ms
+		// it takes to synthesize the next sentence, and the next clip
+		// re-extends. The tail keeps the observer out of those gaps while still
+		// recovering promptly at the end of the answer.
+		ambientEndHoldAfter(holdSeq.Load(), voiceTurnAmbientTail)
+	})
 }
 
 func NewSidecarClient(config *SidecarConfig) (*SidecarClient, error) {
@@ -88,6 +148,9 @@ func NewSidecarClient(config *SidecarConfig) (*SidecarClient, error) {
 		tokenProvider:  newAccessTokenProvider(claims.Brain, config.Token),
 		reconnectDelay: minReconnectDelay,
 	}
+	// The first-run windows are behind us, so the overlay and panel services
+	// below may start Linux's shared GTK loop (gtk_main_linux.go).
+	allowSharedUILoop()
 	client.runPreflight()
 	client.panels = maybeNewPanelService(client.availableCaps)
 	client.pebble = maybeNewPebbleService(client.availableCaps)
@@ -104,6 +167,7 @@ func NewSidecarClient(config *SidecarConfig) (*SidecarClient, error) {
 		client.regions = NewRegionSelectionService()
 	}
 	client.handlers = NewHandlerRegistry(config, &client.mu, client.availableCaps, client.panels, client.pebble, client.subPebble, client.playback, client.regions, client.reloadConfig, client.claims.Brain, client.tokenProvider.Token)
+	client.initUpdater()
 	return client, nil
 }
 
@@ -181,6 +245,10 @@ func normalizeBrainOverride(raw string) string {
 	return fmt.Sprintf("%s://%s/sidecar/connect", wsScheme, trimmed)
 }
 
+// blockedRetryInterval is how long a sidecar the brain refused as too old
+// waits before trying to connect again.
+const blockedRetryInterval = 30 * time.Minute
+
 func (c *SidecarClient) Start(ctx context.Context) {
 	c.stopped = false
 	for !c.stopped {
@@ -189,11 +257,20 @@ func (c *SidecarClient) Start(ctx context.Context) {
 			return
 		}
 		if c.incompatible {
-			// The brain refused us for being too old. Reconnecting would just be
-			// refused again, so stop hammering and leave the loud message up for
-			// the user running the sidecar in a terminal.
-			log.Printf("[sidecar] Not reconnecting — update the sidecar and restart.")
-			return
+			// The brain refused us for being too old. Reconnecting right away
+			// would just be refused again, but stay alive: the update prompt
+			// and the tray's Update item are how this gets fixed, and returning
+			// here used to end the process on Windows and Linux. Try again much
+			// later, in case the brain changed (rolled back, or lowered its
+			// floor) while this sidecar waited.
+			log.Printf("[sidecar] Not reconnecting for %s: update the sidecar and restart.", blockedRetryInterval)
+			select {
+			case <-time.After(blockedRetryInterval):
+			case <-ctx.Done():
+				return
+			}
+			c.incompatible = false
+			continue
 		}
 		var tokErr *tokenRejectedError
 		if errors.As(err, &tokErr) {
@@ -206,7 +283,7 @@ func (c *SidecarClient) Start(ctx context.Context) {
 			c.alertOnce.Do(func() {
 				platformShowAlert("JARVIS Sidecar",
 					"This machine's enrollment token is not valid — the brain rejected it.\n\n"+
-						"Re-enroll the sidecar from the dashboard, update the token in the config, then restart.")
+						"Re-enroll it by running 'jarvis enroll \"<device-name>\"' on the brain machine, update the token in the config, then restart.")
 			})
 			<-ctx.Done()
 			return
@@ -257,6 +334,15 @@ func (c *SidecarClient) editConfig(fn func(cfg *SidecarConfig)) error {
 	defer c.mu.Unlock()
 	fn(c.config)
 	return SaveConfig(c.config)
+}
+
+// BrainOverride returns the config's manual brain-URL override (lock-protected;
+// "" when unset). Used by the settings window's token check so a pasted token
+// is verified against the URL the client will actually dial.
+func (c *SidecarClient) BrainOverride() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.config.Brain
 }
 
 // Preferences returns a copy of the current preferences (lock-protected).
@@ -319,7 +405,19 @@ func (c *SidecarClient) SetShutdown(fn func()) { c.shutdown = fn }
 // (e.g. a broken build), the current process is kept alive and the error is
 // reported instead of leaving the user with no sidecar.
 func (c *SidecarClient) Restart() error {
-	cmd, err := relaunchSidecar()
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("could not launch a new instance: %v", err)
+	}
+	return c.handOff(exe)
+}
+
+// handOff is Restart with an explicit executable: a self-update relaunches
+// the binary it just installed, which after a swap is no longer what
+// os.Executable() resolves to (on Linux /proc/self/exe follows the renamed-
+// aside old file).
+func (c *SidecarClient) handOff(exe string) error {
+	cmd, err := relaunchSidecar(exe)
 	if err != nil {
 		return fmt.Errorf("could not launch a new instance: %v", err)
 	}
@@ -350,6 +448,25 @@ func (c *SidecarClient) applyPebblePrefs() {
 		p := c.Preferences()
 		c.pebble.SetEthereal(p.EtherealPebble, p.EtherealIdleSeconds)
 	}
+}
+
+// shouldOpenDashboardAtStartup reports whether this connection should open the
+// dashboard window because of the "Open dashboard at startup" preference.
+//
+// True at most once per process, and only on the FIRST successful registration:
+// the panel needs a minted access token and the brain origin, so it cannot run
+// before we are connected, and a reconnect must never re-open a window the user
+// deliberately closed. The once-guard is consumed on the first call regardless
+// of the preference, so toggling the setting on mid-session does not retro-fire
+// on the next reconnect — it is a *startup* setting and takes effect on the
+// next launch.
+func (c *SidecarClient) shouldOpenDashboardAtStartup() bool {
+	first := false
+	c.openDashboardOnce.Do(func() { first = true })
+	if !first {
+		return false
+	}
+	return c.Preferences().OpenDashboardAtStartup
 }
 
 func (c *SidecarClient) reloadConfig() {
@@ -385,6 +502,10 @@ func (c *SidecarClient) reloadConfig() {
 		c.pebble = NewPebbleService()
 		c.pebble.SetEthereal(c.config.Preferences.EtherealPebble, c.config.Preferences.EtherealIdleSeconds)
 		c.playback = NewAudioPlaybackService()
+		// This service was born mid-connection, so connectAndServe's install
+		// already ran against the old (nil) one. Without this, wake suppression
+		// and the ambient hold stay dead until the next reconnect.
+		c.installPlayStateHook(c.playback)
 		c.regions = NewRegionSelectionService()
 	} else if !hasPebble && c.pebble != nil {
 		_ = c.pebble.Close()
@@ -483,6 +604,9 @@ func (c *SidecarClient) connectAndServe(ctx context.Context) error {
 	// Start observers (clipboard, etc.) — cancelled when connection drops
 	obsCtx, obsCancel := context.WithCancel(ctx)
 	defer obsCancel()
+	// A recording cannot outlive the connection that started it: the brain
+	// owns the session, and without it nothing would ever send recorder_stop.
+	defer stopRecording("disconnect")
 
 	sendFn := func(ctx context.Context, event SidecarEvent, binaryData []byte) error {
 		return c.sendEvent(ctx, event, binaryData)
@@ -495,6 +619,24 @@ func (c *SidecarClient) connectAndServe(ctx context.Context) error {
 	c.mu.Unlock()
 
 	StartObservers(obsCtx, c.config, c.availableCaps, sendFn)
+	// Give the skill recorder access to the event channel so recorder_start
+	// can stream ui_interaction events to the brain, and the pebble so a live
+	// recording is visible.
+	setRecorderSender(obsCtx, sendFn)
+	setRecorderIndicator(c.pebble)
+
+	// "Open dashboard at startup" — the user asked to see the full window and
+	// not just the pebble. Placed after the c.mu block above so obsCtx is
+	// already published when OpenChat snapshots it, and on its own goroutine
+	// because minting the panel's access token is a network round-trip that
+	// must not stall this loop.
+	// OpenChat already handles every failure itself (no 'windows' capability,
+	// unknown brain origin, mint failure) and focuses the window instead of
+	// spawning a second one if it is somehow already open.
+	if c.shouldOpenDashboardAtStartup() {
+		log.Println("[sidecar] opening the dashboard (open-at-startup preference)")
+		go c.OpenChat()
+	}
 
 	// Wire the pebble's summon hotkey to the brain via a SidecarEvent.
 	// The daemon listens for "pebble.summon" and drives state transitions
@@ -508,9 +650,12 @@ func (c *SidecarClient) connectAndServe(ctx context.Context) error {
 		// pebble is — no separate config gate, since the pebble is the
 		// whole reason wake-word matters. Emits one `audio.wake_segment`
 		// per VAD-detected utterance to the daemon, which transcribes +
-		// regex-matches "jarvis". Pauses around Ctrl+Space session
+		// regex-matches "jarvis". Pauses around summon-hotkey session
 		// captures so it doesn't fight for the mic device.
 		wakeListener := NewWakeListenerService(audioSvc, sendFn, DefaultWakeListenerOpts())
+		// Start() itself consults micMuted(), so a reconnect while muted comes up
+		// with the device closed instead of silently re-arming always-on
+		// listening behind a menu that still says muted.
 		if err := wakeListener.Start(ctx); err != nil {
 			log.Printf("[wake] failed to start: %v", err)
 			wakeListener = nil
@@ -525,26 +670,72 @@ func (c *SidecarClient) connectAndServe(ctx context.Context) error {
 			defer wakeListener.Stop()
 		}
 
-		// Suppress wake captures while TTS is playing so JARVIS's own
-		// voice through the speakers doesn't trigger a self-wake. Hooked
-		// via the playback service's state-change callback.
-		if wakeListener != nil && c.playback != nil {
-			c.playback.SetPlayStateListener(func(playing bool) {
-				wakeListener.Suppress(playing)
-			})
+		// Publish this connection's wake listener so the playback state hook can
+		// suppress it. The hook itself is installed on whichever playback
+		// service is live (see installPlayStateHook), which is not necessarily
+		// the one this connection started with: reloadConfig rebuilds the
+		// service when the pebble capability toggles.
+		if wakeListener != nil {
+			suppress := func(playing bool) { wakeListener.Suppress(playing) }
+			c.wakeSuppress.Store(&suppress)
+			defer c.wakeSuppress.Store(nil)
 		}
+		c.installPlayStateHook(c.playback)
 
 		// runSessionCapture handles one summon→capture→stream cycle. Used
-		// by both the Ctrl+Space hotkey path and the wake-word follow-up
+		// by both the summon-hotkey path and the wake-word follow-up
 		// path (when the daemon dispatches `pebble.start_listening` after
 		// matching a wake phrase that had no trailing command).
 		var sessionInFlight atomic.Bool
-		runSessionCapture := func(sessionID string) {
+
+		// micRefused is the visible consequence of a mute-blocked mic. An early
+		// return with no feedback reads as a broken hotkey, so say it twice: on
+		// the pebble (local, immediate — mic state is sidecar-owned) and to the
+		// brain, which can explain it in conversation rather than waiting for
+		// audio that is never coming.
+		micRefused := func(source, sessionID string) {
+			log.Printf("[audio] %s refused — microphone muted (session=%s)", source, sessionID)
+			if c.pebble != nil {
+				flashMutedPebble(c.pebble)
+			}
+			evt := SidecarEvent{
+				Type:      "sidecar_event",
+				EventType: "pebble.mic_blocked",
+				Timestamp: time.Now().UnixMilli(),
+				Priority:  "normal",
+				Payload: map[string]any{
+					"reason":     "muted",
+					"source":     source,
+					"session_id": sessionID,
+				},
+			}
+			if err := sendFn(ctx, evt, nil); err != nil {
+				log.Printf("[audio] failed to emit mic_blocked event: %v", err)
+			}
+		}
+
+		runSessionCapture := func(sessionID, source string) {
+			// Mute is a gate, not a pause: checked here, where the mic is opened,
+			// rather than left to whoever paused the wake listener. Before the
+			// in-flight CAS and before audio.session_start, so a refused session
+			// leaves no state behind and the daemon never sees a start with no end.
+			if micMuted() {
+				micRefused(source, sessionID)
+				return
+			}
 			if !sessionInFlight.CompareAndSwap(false, true) {
 				log.Printf("[audio] session %s skipped — capture already in flight", sessionID)
 				return
 			}
 			defer sessionInFlight.Store(false)
+
+			// The turn starts here and ends somewhere in the daemon (STT, then
+			// the LLM, then TTS), so hold ambient screen awareness off on a
+			// deadline rather than a balanced pair: if the response never comes
+			// back, the hold expires on its own instead of stranding the
+			// observer off. Each clip the playback service renders pushes the
+			// deadline back out, so a long answer stays covered.
+			ambientHoldFor(voiceTurnAmbientHold)
 
 			startEvt := SidecarEvent{
 				Type:      "sidecar_event",
@@ -567,6 +758,16 @@ func (c *SidecarClient) connectAndServe(ctx context.Context) error {
 			pcm, dur, err := pebbleCaptureWithVAD(audioSvc, sessionID, DefaultVADOpts())
 			if err != nil {
 				log.Printf("[audio] capture failed: %v", err)
+				return
+			}
+			// Muted mid-capture: the tray closure above already released the
+			// device, so this is whatever was recorded BEFORE the user muted.
+			// Drop it rather than ship it — mute has to mean the audio doesn't
+			// leave the machine, not just that the next capture is refused.
+			// micRefused also unwinds the summon the brain is holding.
+			if micMuted() {
+				log.Printf("[audio] session %s discarded (%d PCM bytes) — muted mid-capture", sessionID, len(pcm))
+				micRefused(source, sessionID)
 				return
 			}
 
@@ -594,6 +795,149 @@ func (c *SidecarClient) connectAndServe(ctx context.Context) error {
 			} else {
 				log.Printf("[audio] streamed session %s to daemon (%d PCM bytes, %.2fs)", sessionID, len(pcm), dur.Seconds())
 			}
+		}
+
+		// ── Native realtime voice (gpt-realtime) ──────────────────────────
+		// When the daemon reports realtime is enabled, the summon hotkey
+		// toggles a perpetual speech-to-speech session instead of the one-shot
+		// capture above. A dedicated 24 kHz streaming capture feeds the daemon;
+		// inbound PCM plays through a persistent low-latency device. See
+		// realtimeVoice + PebbleRealtimeManager (daemon side).
+		realtimeCapture := NewStreamingCaptureService(realtimeInputSampleRate)
+		emit := func(eventType string, payload map[string]any) {
+			evt := SidecarEvent{
+				Type:      "sidecar_event",
+				EventType: eventType,
+				Timestamp: time.Now().UnixMilli(),
+				Priority:  "normal",
+				Payload:   payload,
+			}
+			if err := sendFn(ctx, evt, nil); err != nil {
+				log.Printf("[realtime] emit %s failed: %v", eventType, err)
+			}
+		}
+		setStream := func(p *AudioStreamPlayer) { c.streamPlayer.Store(p) }
+		setPebbleState := func(s PebbleState) { _ = c.pebble.SetState(s) }
+		resumeWake := func() {
+			if wakeListener != nil {
+				wakeListener.Resume(ctx)
+			}
+		}
+		// openAudio dials a SECOND, dedicated WebSocket (`?channel=audio`) used
+		// only for realtime PCM — isolated from this control connection so a
+		// 2.4 MB screenshot can't queue in front of audio frames. Returns false
+		// (graceful) if the dial fails, in which case the controller falls back
+		// to streaming mic over the main connection as `pebble.audio_frame`.
+		openAudio := func(onBinary func([]byte), onFlush func()) (func([]byte) error, func(), bool) {
+			audioURL := c.claims.Brain + "?channel=audio"
+			aconn, _, derr := websocket.Dial(ctx, audioURL, &websocket.DialOptions{
+				HTTPHeader: http.Header{"Authorization": []string{"Bearer " + token}},
+			})
+			if derr != nil {
+				log.Printf("[realtime] audio channel dial failed (using main connection): %v", derr)
+				return nil, nil, false
+			}
+			aconn.SetReadLimit(4 << 20) // playback deltas can be tens of KB
+			go func() {
+				for {
+					typ, data, rerr := aconn.Read(context.Background())
+					if rerr != nil {
+						return // conn closed on Stop → read loop exits
+					}
+					switch typ {
+					case websocket.MessageBinary:
+						onBinary(data) // playback PCM
+					case websocket.MessageText:
+						// Control frames are JSON ({"t":"flush"}); parse rather
+						// than substring-match so unrelated text can't flush.
+						var ctl struct {
+							T string `json:"t"`
+						}
+						if json.Unmarshal(data, &ctl) == nil && ctl.T == "flush" {
+							onFlush() // barge-in
+						}
+					}
+				}
+			}()
+			// Keepalive: the brain's WS server reaps sockets idle >30 s, and an
+			// audio channel is legitimately silent between utterances. Ping until
+			// the conn dies or the connection context ends; each write is bounded
+			// so a wedged TCP conn can't park the goroutine forever.
+			go func() {
+				t := time.NewTicker(20 * time.Second)
+				defer t.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-t.C:
+						wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+						err := aconn.Write(wctx, websocket.MessageText, []byte(`{"t":"ping"}`))
+						cancel()
+						if err != nil {
+							return
+						}
+					}
+				}
+			}()
+			writePCM := func(frame []byte) error {
+				return aconn.Write(context.Background(), websocket.MessageBinary, frame)
+			}
+			closeFn := func() { _ = aconn.Close(websocket.StatusNormalClosure, "") }
+			log.Printf("[realtime] dedicated audio channel open")
+			return writePCM, closeFn, true
+		}
+		rt := newRealtimeVoice(realtimeCapture, wakeListener, emit, setStream, setPebbleState, resumeWake, openAudio,
+			func() { micRefused("realtime", "") })
+		c.realtime.Store(rt)
+		// Tear the session down when this connection ends.
+		defer rt.Stop(false)
+
+		// Tray "Mute microphone" toggle → apply the gate locally. The tray thread
+		// writes TrayStatus.Muted before this runs, so micMuted() is already
+		// authoritative and every path that would OPEN the mic is already closed.
+		// What's left for this closure is the mic that is open right now: end a
+		// live realtime session, cut off an in-flight one-shot capture, release
+		// the always-on wake mic, and show the muted pebble. Unmuting re-arms the
+		// wake listener and clears the pebble. (Stop() calls resumeWake
+		// internally, but that Resume is now refused by the mute gate rather than
+		// defeated by call ordering.)
+		setTrayApplyMute(func(muted bool) {
+			if muted {
+				if rt := c.realtime.Load(); rt != nil {
+					rt.Stop(true)
+				}
+				// A one-shot capture already holds the device — the gate below
+				// only stops the NEXT one. Cut this one off now rather than at
+				// the VAD's 15 s hard cap: wakeListener.Pause() won't do it (the
+				// capture already set paused, so its audioSvc.Stop() is skipped)
+				// and they share one AudioCaptureService. The capture's own
+				// post-mute check then drops whatever PCM it had.
+				if sessionInFlight.Load() {
+					log.Printf("[audio] mute during capture — releasing the device now")
+					_, _, _ = audioSvc.Stop()
+				}
+				if wakeListener != nil {
+					wakeListener.Pause()
+				}
+				_ = c.pebble.SetState(PebbleMuted)
+			} else {
+				if wakeListener != nil {
+					wakeListener.Resume(ctx)
+				}
+				_ = c.pebble.SetState(PebbleIdle)
+			}
+		})
+		defer setTrayApplyMute(func(bool) {})
+
+		// A reconnect rebuilds the pebble, the wake listener and the realtime
+		// controller from scratch, none of which know about a mute set on the
+		// previous connection. Re-apply it through the closure just registered so
+		// the device and the menu agree from the first frame. Through trayCtlQ,
+		// and re-reading the flag inside the queued func: a toggle racing the
+		// reconnect must win, or we'd re-mute a mic the user just unmuted.
+		if micMuted() {
+			trayCtlAsync(func() { trayApplyMute(micMuted()) })
 		}
 
 		// Long-answer overflow — click on the "open full ↗" button emits
@@ -631,18 +975,40 @@ func (c *SidecarClient) connectAndServe(ctx context.Context) error {
 		})
 
 		c.pebble.OnSummon(func() {
+			// When realtime voice is enabled, the summon hotkey toggles a
+			// perpetual speech-to-speech session (press again to end) instead
+			// of the one-shot capture → STT → LLM → TTS loop.
+			rt := c.realtime.Load()
+			rtEnabled := rt != nil && rt.enabled.Load()
+			log.Printf("[pebble] summon (realtime_enabled=%v)", rtEnabled)
+			if rtEnabled {
+				rt.Toggle()
+				return
+			}
 			sessionID := fmt.Sprintf("%d", time.Now().UnixMilli())
+			// The summon event goes out even when muted, because this hotkey is
+			// ALSO the dismiss gesture: the daemon's handler is a toggle, and a
+			// second press cancels an in-flight turn and cuts off TTS. Swallowing
+			// it here would leave a muted user unable to shut JARVIS up. The
+			// `muted` flag tells the daemon not to open a listening cycle it
+			// would then have to wait out.
+			muted := micMuted()
 			summonEvt := SidecarEvent{
 				Type:      "sidecar_event",
 				EventType: "pebble.summon",
 				Timestamp: time.Now().UnixMilli(),
 				Priority:  "normal",
-				Payload:   map[string]any{"session_id": sessionID},
+				Payload:   map[string]any{"session_id": sessionID, "muted": muted},
 			}
 			if err := sendFn(ctx, summonEvt, nil); err != nil {
 				log.Printf("[pebble] failed to emit summon event: %v", err)
 			}
-			go runSessionCapture(sessionID)
+			if muted {
+				log.Printf("[audio] summon refused — microphone muted (session=%s)", sessionID)
+				flashMutedPebble(c.pebble) // the brain is told by the event's muted flag
+				return
+			}
+			go runSessionCapture(sessionID, "summon")
 		})
 
 		// W4 — palette hotkey (Ctrl+K) emits a "pebble.palette" event with
@@ -755,12 +1121,105 @@ func (c *SidecarClient) connectAndServe(ctx context.Context) error {
 		// pebble.summon event). Used by the wake-word path: when a wake
 		// phrase fires with no trailing command, the daemon transitions
 		// the bubble to listening and calls this so the user's next
-		// utterance gets captured + streamed just like Ctrl+Space.
+		// utterance gets captured + streamed just like the summon hotkey.
 		c.mu.Lock()
 		c.handlers["pebble.start_listening"] = func(_ map[string]any) (*RPCResult, error) {
 			sessionID := fmt.Sprintf("listen-%d", time.Now().UnixMilli())
-			go runSessionCapture(sessionID)
+			// Muted: answer the daemon rather than silently dropping the request.
+			// It has already flipped the bubble to "listening" and armed a
+			// fallback timer; told no, it can reset immediately instead of
+			// waiting out audio that will never arrive.
+			if micMuted() {
+				micRefused("start_listening", sessionID)
+				return &RPCResult{Result: map[string]any{
+					"session_id": sessionID,
+					"started":    false,
+					"reason":     "muted",
+				}}, nil
+			}
+			go runSessionCapture(sessionID, "start_listening")
 			return &RPCResult{Result: map[string]any{"session_id": sessionID, "started": true}}, nil
+		}
+
+		// Realtime voice control (daemon → sidecar). pebble.play_pcm (the audio
+		// output stream) is handled inline in readLoop to preserve frame order.
+		c.handlers["pebble.configure_realtime"] = func(params map[string]any) (*RPCResult, error) {
+			enabled, _ := params["enabled"].(bool)
+			log.Printf("[realtime] configure_realtime enabled=%v", enabled)
+			if rt := c.realtime.Load(); rt != nil {
+				rt.enabled.Store(enabled)
+				if !enabled {
+					rt.Stop(true) // disabling mid-session ends it cleanly
+				}
+			}
+			return &RPCResult{Result: map[string]any{"enabled": enabled}}, nil
+		}
+		// Tray menu live data (brain → sidecar): approvals count, recent
+		// activity, pause/mute, brain/sidecar health (design: usejarvis-tray §00).
+		c.handlers["tray.status"] = func(params map[string]any) (*RPCResult, error) {
+			setTrayStatus(trayStatusFromParams(params))
+			return &RPCResult{Result: map[string]any{"ok": true}}, nil
+		}
+		// Outbound OS notification (brain → sidecar): the four reasons Jarvis
+		// interrupts — approval / done / sidecar / update (design: usejarvis-tray
+		// §01). The sidecar raises it natively; the choice comes back via
+		// notify.action (emitted below).
+		c.handlers["notify.show"] = func(params map[string]any) (*RPCResult, error) {
+			showNotification(notificationFromParams(params))
+			return &RPCResult{Result: map[string]any{"ok": true}}, nil
+		}
+		setNotifyEmitAction(func(id, kind, action string) {
+			_ = c.sendEvent(c.obsCtx, SidecarEvent{
+				EventType: "notify.action",
+				Timestamp: time.Now().UnixMilli(),
+				Priority:  "normal",
+				Payload:   map[string]any{"id": id, "kind": kind, "action": action},
+			}, nil)
+		})
+		c.handlers["pebble.realtime_status"] = func(params map[string]any) (*RPCResult, error) {
+			state, _ := params["state"].(string)
+			detail, _ := params["detail"].(string)
+			// Logged, not swallowed: the daemon owns the realtime session, so
+			// this line is the ONLY place its outcome reaches the machine the
+			// user is sitting at. Dropping the detail is what made a refused
+			// session look like a dead hotkey: a pebble that flashed and went
+			// back to idle, with the reason on the other end of the wire.
+			if detail != "" {
+				log.Printf("[realtime] daemon says %s: %s", state, detail)
+			} else {
+				log.Printf("[realtime] daemon says %s", state)
+			}
+			// Daemon-initiated teardown (budget / timeout / error): stop the
+			// local audio without re-emitting realtime_stop (its side is gone).
+			if rt := c.realtime.Load(); rt != nil && (state == "closed" || state == "error") {
+				wasActive := rt.active.Load()
+				rt.Stop(false)
+				// Say it on the pebble too, but only when a press actually went
+				// nowhere: a `closed` for a conversation that ran its course
+				// needs no explanation, and Stop() has already put the pebble
+				// back to idle. AFTER Stop, whose setState would otherwise
+				// paint over the nudge.
+				if state == "error" && wasActive {
+					// "Click the pebble", not a key name: the summon hotkey is
+					// configurable since #563 (pebble.summon_hotkey), and this
+					// code has no access to the spec the overlay was given, so
+					// naming a key here would eventually name the wrong one.
+					// Clicking the disc does the same thing and always works.
+					flashPebbleNudge(c.pebble, PebbleIdle, "Live voice unavailable - click the pebble to talk")
+				}
+			}
+			return &RPCResult{Result: map[string]any{"ok": true}}, nil
+		}
+		// Override stop_audio so barge-in flushes the realtime stream player too
+		// (not just the clip-based TTS queue).
+		c.handlers["pebble.stop_audio"] = func(_ map[string]any) (*RPCResult, error) {
+			if c.playback != nil {
+				c.playback.Stop()
+			}
+			if sp := c.streamPlayer.Load(); sp != nil {
+				sp.Flush()
+			}
+			return &RPCResult{Result: map[string]any{"stopped": true}}, nil
 		}
 		c.mu.Unlock()
 
@@ -837,6 +1296,30 @@ func (c *SidecarClient) connectAndServe(ctx context.Context) error {
 	return c.readLoop(ctx)
 }
 
+// featureBrowserElemGen says this sidecar compares the snapshot generation a
+// reviewed browser element action carries (`elem_gen`, #676) and puts one on
+// every page reply. The brain REFUSES a reviewed remote click, type or hover on
+// a sidecar that does not advertise it: an older sidecar ignores the param it
+// has never heard of, so sending it there would be a guard that never fires.
+const featureBrowserElemGen = "browser_elem_gen"
+
+// protocolFeatures are the features that describe what this build's RPC
+// handlers do, as opposed to what its updater can do.
+//
+// Advertised on EVERY build, dev included. The updater's features are withheld
+// from a dev build because it must never self-update; a protocol feature is a
+// fact about the code that is running, and withholding it would make the brain
+// refuse a reviewed click on exactly the build a developer is testing.
+var protocolFeatures = []string{featureBrowserElemGen}
+
+// registrationFeatures is the register `features` list: the updater's, then the
+// protocol's.
+func registrationFeatures(updater []string) []string {
+	out := make([]string, 0, len(updater)+len(protocolFeatures))
+	out = append(out, updater...)
+	return append(out, protocolFeatures...)
+}
+
 func (c *SidecarClient) sendRegistration(ctx context.Context) error {
 	hostname, _ := os.Hostname()
 	msg := SidecarRegistration{
@@ -845,6 +1328,7 @@ func (c *SidecarClient) sendRegistration(ctx context.Context) error {
 		OS:                      runtime.GOOS,
 		Platform:                runtime.GOARCH,
 		Version:                 sidecarVersion,
+		Features:                registrationFeatures(c.updater.Features()),
 		Capabilities:            c.availableCaps,
 		UnavailableCapabilities: c.unavailableCaps,
 		Timezone:                DetectIANATimezone(),
@@ -855,35 +1339,118 @@ func (c *SidecarClient) sendRegistration(ctx context.Context) error {
 
 // handleRegisterRejected processes a brain `register_rejected` control frame:
 // the connecting sidecar is below the brain's hard MIN floor. We log a loud,
-// actionable message and flag the client so the reconnect loop stops (an
-// incompatible sidecar must not operate, and retrying would only be refused).
+// actionable message and tell the updater. The flag that stops the reconnect
+// loop (an incompatible sidecar must not operate, and retrying would only be
+// refused) is set by runRegisterRejected before this runs, so a panic here
+// cannot lose it.
 func (c *SidecarClient) handleRegisterRejected(data []byte) {
 	var msg struct {
 		Reason      string `json:"reason"`
 		Min         string `json:"min"`
 		YourVersion string `json:"your_version"`
+		// Latest is the sidecar version this brain ships with ("" from brains
+		// that predate self-update).
+		Latest string `json:"latest"`
 	}
 	_ = json.Unmarshal(data, &msg)
-	c.incompatible = true
 	log.Printf("[sidecar] ====================================================================")
 	log.Printf("[sidecar] INCOMPATIBLE: this brain requires sidecar >= %s, but this is %s.", msg.Min, msg.YourVersion)
-	log.Printf("[sidecar] Update the sidecar (e.g. `bun install -g @usejarvis/sidecar` or")
-	log.Printf("[sidecar] grab the latest from GitHub Releases) and restart it.")
+	log.Printf("[sidecar] Update the sidecar and restart it: %s", c.updater.ManualCommand(msg.Latest))
 	log.Printf("[sidecar] ====================================================================")
+	c.updater.OnRejected(msg.Latest)
 }
 
-// handleRegisterAck processes a brain `register_ack`. The brain sends one only
-// when it wants to tell us something (currently: an optional update suggestion
-// when we're between RECOMMENDED and MIN); a plain accept needs no ack.
+// handleRegisterAck processes a brain `register_ack`. Brains with self-update
+// send one on every accepted registration, carrying the sidecar version they
+// ship with (`latest`); older brains send one only for an update suggestion
+// (between RECOMMENDED and MIN), and none on a plain accept.
 func (c *SidecarClient) handleRegisterAck(data []byte) {
 	var msg struct {
 		UpdateSuggested bool   `json:"update_suggested"`
 		Recommended     string `json:"recommended"`
+		Latest          string `json:"latest"`
 	}
 	_ = json.Unmarshal(data, &msg)
 	if msg.UpdateSuggested {
 		log.Printf("[sidecar] An update is available (this brain recommends sidecar >= %s; running %s). Still compatible.", msg.Recommended, sidecarVersion)
 	}
+	c.updater.OnAck(msg.Latest)
+}
+
+// runRegisterRejected handles a `register_rejected` on the read loop. A panic
+// in it FAILS CLOSED (#670): the brain's verdict stands whatever happened to
+// our handling of it.
+//
+// The frame is an authority decision -- this sidecar is too old and must not
+// operate -- so the verdict is recorded BEFORE any of the handling that can
+// fail (logging the update command, telling the updater), and a panic in that
+// handling is contained without touching it. The read loop then returns as it
+// always does, the connection ends, and Start takes the blocked path
+// (blockedRetryInterval) instead of a fast reconnect into the same refusal.
+// The cost is the update prompt this refusal would have shown, logged as
+// missing -- for the rest of the process's life if the panic came from the
+// prompt callback itself, which runs under a sync.Once that counts a panicking
+// call as done. The alternative, before #670, was losing the process.
+//
+// `handle` is the handler body (handleRegisterRejected from the read loop); it
+// is a parameter so a test can panic at its very first line.
+func (c *SidecarClient) runRegisterRejected(data []byte, handle func([]byte)) {
+	c.incompatible = true
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[sidecar] register_rejected handling panicked; the brain's refusal still stands and "+
+				"this sidecar will not reconnect for %s, but no update prompt was shown: %v\n%s",
+				blockedRetryInterval, r, debug.Stack())
+		}
+	}()
+	handle(data)
+}
+
+// runRegisterAck handles a `register_ack` on the read loop. A panic in it is
+// CONTAINED AND THE CONNECTION CARRIES ON, degraded in exactly one respect
+// (#670).
+//
+// Unlike register_rejected, this frame decides nothing about whether the
+// sidecar may operate: the brain sends it after it has already accepted the
+// registration, and every RPC handler was installed before the read loop
+// started. All the ack drives is the updater -- the update offer for this
+// connection, and clearing the marker that proves a fresh self-update healthy
+// (update_pending.go). So a panic leaves the registration fully known and only
+// the update bookkeeping unknown, and the two other choices are both worse:
+//
+//   - Closing the connection to reconnect does not buy integrity (nothing this
+//     frame gates is left half-open), costs every in-flight RPC, and when the
+//     panic is deterministic -- the same brain sends the same `latest` on every
+//     ack -- it becomes a flap loop, because connectAndServe resets the backoff
+//     on every successful dial.
+//   - Exiting (the behaviour before #670) loses the whole sidecar for the same
+//     update bookkeeping.
+//
+// The degraded state is: no update offer from this ack, and a pending
+// self-update not marked proven, until the next accepted registration. A
+// version that panics on every ack therefore still never proves itself, and
+// the start counter in update_pending.go rolls it back as before -- that path
+// does not depend on this process dying. It is slower, though: a supervisor
+// restart loop used to reach the start count in seconds, and now it takes three
+// ordinary restarts.
+//
+// That containment covers only what runs on the read loop. The goroutines the
+// updater starts from an ack (cleanupPrevious, check, and check's retry timer)
+// recover their own panics (#760), each falling back to a state chosen in
+// updater.go: a check that panicked before deciding is a failed check that
+// retries, and a cleanup that panicked is not marked done, so the next
+// accepted registration tries again.
+//
+// `handle` is the handler body (handleRegisterAck from the read loop).
+func (c *SidecarClient) runRegisterAck(data []byte, handle func([]byte)) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[sidecar] register_ack handling panicked; staying connected with RPCs unaffected, but "+
+				"self-update state is unknown until the next accepted registration (no update offer, and a "+
+				"pending update is not marked proven): %v\n%s", r, debug.Stack())
+		}
+	}()
+	handle(data)
 }
 
 func (c *SidecarClient) sendCapabilitiesUpdate(ctx context.Context) error {
@@ -914,15 +1481,38 @@ func (c *SidecarClient) readLoop(ctx context.Context) error {
 		}
 		// Brain-originated control frames (compatibility handshake) arrive on the
 		// same socket. Handle them before the RPC fast-path.
+		//
+		// Neither frame has a pending request to answer, so #623's
+		// runRPCHandler does not apply; each has its own panic policy (#670),
+		// see runRegisterRejected and runRegisterAck.
 		switch req.Type {
 		case "register_rejected":
-			c.handleRegisterRejected(data)
+			c.runRegisterRejected(data, c.handleRegisterRejected)
 			return fmt.Errorf("registration rejected by brain")
 		case "register_ack":
-			c.handleRegisterAck(data)
+			c.runRegisterAck(data, c.handleRegisterAck)
 			continue
 		}
 		if req.Type != "rpc_request" {
+			continue
+		}
+
+		// Realtime audio output fast-path: handle pebble.play_pcm INLINE (not in
+		// a per-RPC goroutine) so frames reach the playback device in receive
+		// order — goroutine reordering would click the audio. Work is just a
+		// base64 decode + a buffered append (microseconds).
+		//
+		// Through `runRPCHandler` all the same, and called SYNCHRONOUSLY so the
+		// ordering above is untouched (#623). Being inline is exactly why it
+		// needs this: a panic here is on the READ LOOP's own goroutine, which no
+		// recover in the per-RPC goroutine below can ever see, so it took the
+		// process down and with it every other request in flight -- the failure
+		// #623 exists to remove, on the one method that had opted out of the
+		// dispatch. `streamPlayer` is a live audio device wrapper fed decoded
+		// wire bytes, which is not a frame to leave unguarded.
+		if req.Method == "pebble.play_pcm" {
+			result, rpcErr := runRPCHandler(req.Method, c.playPCMInline, req.Params)
+			c.sendResult(ctx, req.ID, result, rpcErr)
 			continue
 		}
 
@@ -937,20 +1527,124 @@ func (c *SidecarClient) readLoop(ctx context.Context) error {
 		}
 
 		// Run handler in goroutine to not block the read loop
-		go func(id string, h RPCHandler, params map[string]any) {
-			result, err := h(params)
-			if err != nil {
-				c.sendResult(ctx, id, nil, &rpcError{Code: "HANDLER_ERROR", Message: err.Error()})
-				return
-			}
-			c.sendResult(ctx, id, result, nil)
-		}(req.ID, handler, req.Params)
+		go func(id, method string, h RPCHandler, params map[string]any) {
+			// The REPLY path is the one thing runRPCHandler's own recover
+			// cannot cover, because it is what that recover uses to answer.
+			// Containing it here leaves the request pending rather than
+			// answered -- the brain's RPC timeout then reports it as
+			// `may_have_occurred`, which is the same conclusion and is still
+			// better than taking the process down with every other pending
+			// request on it.
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[sidecar] RPC reply for %s (%s) panicked, request left unanswered: %v\n%s",
+						method, id, r, debug.Stack())
+				}
+			}()
+			result, rpcErr := runRPCHandler(method, h, params)
+			c.sendResult(ctx, id, result, rpcErr)
+		}(req.ID, req.Method, handler, req.Params)
 	}
 }
 
 type rpcError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+// codedError lets a handler choose its RPC error code instead of the generic
+// HANDLER_ERROR, which the daemon reads as "may have taken effect". A code
+// the daemon lists as not-started (e.g. DESKTOP_INVALID_KEYS, see
+// src/actions/tools/sidecar-route.ts) says the request was refused before
+// anything happened.
+type codedError struct {
+	code string
+	err  error
+}
+
+func (e *codedError) Error() string { return e.err.Error() }
+func (e *codedError) Unwrap() error { return e.err }
+
+// handlerRPCError turns a handler's error into its RPC error.
+func handlerRPCError(err error) *rpcError {
+	code := "HANDLER_ERROR"
+	var coded *codedError
+	if errors.As(err, &coded) {
+		code = coded.code
+	}
+	return &rpcError{Code: code, Message: err.Error()}
+}
+
+// handlerPanicCode is the RPC error code for a handler that panicked (#623).
+//
+// It is deliberately NOT one of the daemon's not-started codes
+// (NOT_STARTED_RPC_CODES in src/actions/tools/sidecar-route.ts). A recovered
+// panic cannot claim nothing happened: the handler may have clicked, typed or
+// written a file and then panicked on the next line, so the daemon's generic
+// classification -- `may_have_occurred` -- is the only honest one, and that is
+// what an unlisted code already gets. It is its own code rather than
+// HANDLER_ERROR so that a sidecar bug is distinguishable, in a brain-side log
+// or outcome, from an error a handler chose to return.
+const handlerPanicCode = "HANDLER_PANIC"
+
+// runRPCHandler runs one RPC handler and returns what to reply with.
+//
+// A panic becomes a coded error instead of reaching the goroutine's top frame
+// (#623). Every handler's params arrive over the wire and handlers do a lot of
+// `params["x"].(string)`-style access, so without this a single malformed
+// request was not a refusal but a process-ending panic: the read loop cannot
+// recover from another goroutine's panic, so the whole sidecar went down and
+// the brain saw the socket drop rather than an error it could map. The pending
+// request is answered here because the caller still holds its id.
+//
+// Same containment shape as goSafeObserver (observers.go), and the reason
+// `elementPointClock`'s nil guard exists (browser_element_point.go) -- that
+// guard stays: this makes a panic survivable, not free.
+//
+// The panic VALUE is logged with its stack and is NOT put in the reply. A
+// panic message can quote wire data back (`strconv` and type-assertion panics
+// both do), and the daemon interpolates this message into text a model and a
+// user read. The protocol's own rule for refusals applies: the brain
+// classifies on the code and the sidecar keeps the detail in its log.
+func runRPCHandler(method string, h RPCHandler, params map[string]any) (result *RPCResult, rpcErr *rpcError) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[sidecar] RPC handler %s panicked: %v\n%s", method, r, debug.Stack())
+			result, rpcErr = nil, &rpcError{
+				Code: handlerPanicCode,
+				Message: fmt.Sprintf("the %s handler crashed on this machine; the action may or may not have "+
+					"taken effect - verify the current state before retrying, and report this: the stack is in "+
+					"the sidecar's log", method),
+			}
+		}
+	}()
+	res, err := h(params)
+	if err != nil {
+		return nil, handlerRPCError(err)
+	}
+	return res, nil
+}
+
+// playPCMInline is `pebble.play_pcm`'s body as an ordinary RPCHandler, so the
+// read loop can run it through `runRPCHandler` without giving up its place in
+// the receive order (#623).
+//
+// Every branch is unchanged from when this was written out inline, including
+// the unconditional `ok: true`: a frame that arrives with no player attached,
+// no `data` string or undecodable base64 is DROPPED and still acknowledged.
+// That is deliberate for realtime audio -- the brain streams continuously and
+// has nothing useful to do with a per-frame refusal -- and it is not what this
+// change is about. What changes is only that a panic inside `sp.Write` becomes
+// a `HANDLER_PANIC` reply instead of the end of the process.
+func (c *SidecarClient) playPCMInline(params map[string]any) (*RPCResult, error) {
+	if sp := c.streamPlayer.Load(); sp != nil {
+		if d, ok := params["data"].(string); ok {
+			if pcm, err := base64.StdEncoding.DecodeString(d); err == nil {
+				sp.Write(pcm)
+			}
+		}
+	}
+	return &RPCResult{Result: map[string]any{"ok": true}}, nil
 }
 
 func (c *SidecarClient) sendResult(ctx context.Context, rpcID string, result *RPCResult, rpcErr *rpcError) {

@@ -7,9 +7,13 @@
  */
 
 import type { ScreenContext, AwarenessEvent, Suggestion, SuggestionType } from './types.ts';
-import { createSuggestion, getSuggestionCountSince, getCaptureCountSince } from '../vault/awareness.ts';
+import { createSuggestion, findAutomationSuggestion, getSuggestionCountSince, getActivityInRange, MAX_CAPTURE_GAP_MS } from '../vault/awareness.ts';
 import { searchEntitiesByName } from '../vault/entities.ts';
 import { findFacts } from '../vault/facts.ts';
+import { describeFact } from '../vault/fact-format.ts';
+import { assessOpportunities, opportunitySuggestion, publishOpportunity } from './opportunities.ts';
+import { pruneOpportunityObservations } from '../vault/opportunity-observations.ts';
+import type { JobHypothesis } from './opportunity-types.ts';
 
 const MAX_DEDUP_HASHES = 50;
 
@@ -32,12 +36,12 @@ const TYPE_RATE_LIMITS: Record<string, number> = {
 
 export class SuggestionEngine {
   private defaultRateLimitMs: number;
+  private maxGapMs: number;
   private lastSuggestionByType = new Map<string, number>();
   private recentHashes: Set<string> = new Set();
   private hashQueue: string[] = [];
 
-  // Gap 3: automation detection state
-  private actionHistory: Array<{ appName: string; windowTitle: string; timestamp: number }> = [];
+  private lastOpportunityCheckAt = 0;
 
   // Gap 4: knowledge dedup
   private lastKnowledgeEntityId = '';
@@ -47,9 +51,16 @@ export class SuggestionEngine {
   private lastScheduleCheckAt = 0;
   private lastScheduleEventId = '';
 
-  constructor(rateLimitMs: number = 60000, scheduleDeps?: ScheduleDeps) {
+  /**
+   * @param maxGapMs How much elapsed time one gap between captures may count
+   *   for, derived from the configured capture interval. checkBreak measures
+   *   time this way, so a fixed cap would under-report on a slow sampler and
+   *   the break nudge would never fire.
+   */
+  constructor(rateLimitMs: number = 60000, scheduleDeps?: ScheduleDeps, maxGapMs: number = MAX_CAPTURE_GAP_MS) {
     this.defaultRateLimitMs = rateLimitMs;
     this.scheduleDeps = scheduleDeps ?? null;
+    this.maxGapMs = maxGapMs;
   }
 
   /**
@@ -69,7 +80,7 @@ export class SuggestionEngine {
       this.checkError(context, events),
       this.checkStruggle(context, events, cloudAnalysis),
       this.checkStuck(context, events),
-      this.checkAutomation(context, events),
+      this.checkAutomation(),
       this.checkKnowledge(context, events),
       null, // placeholder for async schedule
       this.checkBreak(context),
@@ -85,6 +96,10 @@ export class SuggestionEngine {
     let suggestion: Suggestion | null = null;
     for (const candidate of candidates) {
       if (!candidate) continue;
+      // Durable opportunity identity survives process restart and changes in
+      // recurrence counts. Independent error/break rhythms retain their scope.
+      const previous = findAutomationSuggestion(candidate);
+      if (previous && (previous.dismissed || previous.acted_on || previous.delivered)) continue;
       const typeLimit = TYPE_RATE_LIMITS[candidate.type] ?? this.defaultRateLimitMs;
       const lastFired = this.lastSuggestionByType.get(candidate.type) ?? 0;
       if (now - lastFired < typeLimit) continue; // rate-limited for this type
@@ -93,6 +108,12 @@ export class SuggestionEngine {
     }
 
     if (!suggestion) return null;
+
+    if (suggestion.type === 'automation') {
+      const published = publishOpportunity(suggestion.context!.opportunity as JobHypothesis);
+      if (published) this.lastSuggestionByType.set('automation', now);
+      return published;
+    }
 
     // Dedup check
     const hash = this.hashSuggestion(suggestion);
@@ -226,60 +247,14 @@ export class SuggestionEngine {
     };
   }
 
-  /**
-   * Detect repetitive app-switching patterns (automation opportunities).
-   * Tracks action history and looks for A→B→A→B patterns (3+ repeats in 5 min).
-   */
-  private checkAutomation(context: ScreenContext, events: AwarenessEvent[]): Suggestion | null {
-    // Track action history
-    this.actionHistory.push({
-      appName: context.appName,
-      windowTitle: context.windowTitle,
-      timestamp: context.timestamp,
-    });
-
-    // Trim to last 5 minutes
-    const fiveMinAgo = Date.now() - 5 * 60 * 1000;
-    this.actionHistory = this.actionHistory.filter(a => a.timestamp > fiveMinAgo);
-
-    // Need a context change and sufficient history
-    if (!events.some(e => e.type === 'context_changed')) return null;
-    if (this.actionHistory.length < 6) return null;
-
-    // Count app-pair transitions
-    const transitions = new Map<string, number>();
-    for (let i = 1; i < this.actionHistory.length; i++) {
-      const from = this.actionHistory[i - 1]!.appName;
-      const to = this.actionHistory[i]!.appName;
-      if (from !== to) {
-        const key = `${from}→${to}`;
-        transitions.set(key, (transitions.get(key) ?? 0) + 1);
-      }
-    }
-
-    // Find most repeated transition
-    let maxTransition = '';
-    let maxCount = 0;
-    for (const [key, count] of transitions) {
-      if (count > maxCount) {
-        maxTransition = key;
-        maxCount = count;
-      }
-    }
-
-    if (maxCount >= 3) {
-      const [fromApp, toApp] = maxTransition.split('→');
-      return {
-        id: '',
-        type: 'automation',
-        title: `Repetitive pattern: ${fromApp} ↔ ${toApp}`,
-        body: `You've switched between ${fromApp} and ${toApp} ${maxCount} times recently. Want me to create a workflow to automate this?`,
-        triggerCaptureId: context.captureId,
-        context: { fromApp, toApp, count: maxCount, pattern: 'app_switch' },
-      };
-    }
-
-    return null;
+  /** Capture persistence supplies evidence even while C1/C2/C3 event fixes are pending. */
+  private checkAutomation(): Suggestion | null {
+    const now = Date.now();
+    if (now - this.lastOpportunityCheckAt < 5 * 60_000) return null;
+    this.lastOpportunityCheckAt = now;
+    pruneOpportunityObservations(now);
+    const hypothesis = assessOpportunities(now).proposals[0];
+    return hypothesis ? opportunitySuggestion(hypothesis) : null;
   }
 
   /**
@@ -309,9 +284,12 @@ export class SuggestionEngine {
 
           this.lastKnowledgeEntityId = entity.id;
 
+          // A person reads this body, so each fact carries its qualification in
+          // words. The machine-readable provenance formatFact emits is for a
+          // prompt; dumped here it would bury the suggestion in JSON.
           const factSummary = facts
             .slice(0, 3)
-            .map(f => `${f.predicate}: ${f.object}`)
+            .map(describeFact)
             .join('; ');
 
           return {
@@ -408,16 +386,25 @@ export class SuggestionEngine {
    */
   private checkBreak(context: ScreenContext): Suggestion | null {
     try {
-      const ninetyMinAgo = Date.now() - 90 * 60 * 1000;
+      const now = Date.now();
+      const ninetyMinAgo = now - 90 * 60 * 1000;
 
       // Don't suggest a break if we already suggested one recently
       const recentBreakSuggestions = getSuggestionCountSince(ninetyMinAgo);
       if (recentBreakSuggestions > 2) return null;
 
-      // Check if user has been continuously active for 90+ minutes
-      // At ~7s per capture, 90 min = ~770 captures
-      const captureCount = getCaptureCountSince(ninetyMinAgo);
-      if (captureCount < 700) return null;
+      // "Continuously active" is elapsed time between captures, not a capture
+      // count: the capture interval is configurable and unchanged screens are
+      // not recorded, so any count threshold silently stops firing the moment
+      // either changes. The bar is 70 of the last 90 minutes, not 90: the
+      // sidecar sends nothing while the screen is static, and each such stretch
+      // is credited only MAX_CAPTURE_GAP_MS, so someone reading at their desk
+      // legitimately loses minutes they never left for.
+      // Aggregated in SQL: this runs on every capture, and the row-fetching
+      // equivalent would re-read 90 minutes of OCR text each time.
+      const { activeMs, captureCount } = getActivityInRange(ninetyMinAgo, now, this.maxGapMs);
+      const activeMinutes = Math.round(activeMs / 60000);
+      if (activeMinutes < 70) return null;
 
       return {
         id: '',
@@ -425,7 +412,7 @@ export class SuggestionEngine {
         title: 'Time for a break?',
         body: `You've been working for over 90 minutes straight. A short break can boost focus and creativity.`,
         triggerCaptureId: context.captureId,
-        context: { captureCount, minutesActive: Math.round((captureCount * 7) / 60) },
+        context: { captureCount, minutesActive: activeMinutes },
       };
     } catch { /* ignore */ }
 

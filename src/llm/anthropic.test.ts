@@ -1,5 +1,5 @@
 import { describe, expect, it, afterEach } from 'bun:test';
-import { AnthropicProvider } from './anthropic.ts';
+import { AnthropicProvider, anthropicMessagesUrl } from './anthropic.ts';
 import type { LLMMessage, LLMStreamEvent } from './provider.ts';
 
 const originalFetch = globalThis.fetch;
@@ -53,6 +53,129 @@ function countCacheControls(body: CapturedBody): number {
   }
   return n;
 }
+
+describe('AnthropicProvider custom endpoint', () => {
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it('normalizes base URLs to the Messages API endpoint', () => {
+    expect(anthropicMessagesUrl('https://gateway.example.com')).toBe('https://gateway.example.com/v1/messages');
+    expect(anthropicMessagesUrl('https://gateway.example.com/v1/')).toBe('https://gateway.example.com/v1/messages');
+    expect(anthropicMessagesUrl('https://gateway.example.com/v1/messages')).toBe('https://gateway.example.com/v1/messages');
+  });
+
+  it('uses bearer authentication for a custom base URL', async () => {
+    let requestUrl = '';
+    let requestHeaders = new Headers();
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = String(input);
+      requestHeaders = new Headers(init?.headers);
+      return new Response(JSON.stringify(anthropicResponse()), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const provider = new AnthropicProvider('custom-token', undefined, {
+      baseUrl: 'https://gateway.example.com',
+    });
+    await provider.chat([{ role: 'user', content: 'hi' }]);
+
+    expect(requestUrl).toBe('https://gateway.example.com/v1/messages');
+    expect(requestHeaders.get('authorization')).toBe('Bearer custom-token');
+    expect(requestHeaders.get('x-api-key')).toBeNull();
+    expect(requestHeaders.get('anthropic-version')).toBe('2023-06-01');
+  });
+
+  it('can use x-api-key authentication with a custom base URL', async () => {
+    let requestHeaders = new Headers();
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestHeaders = new Headers(init?.headers);
+      return new Response(JSON.stringify(anthropicResponse()), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await new AnthropicProvider('gateway-key', undefined, {
+      baseUrl: 'https://gateway.example.com',
+      authHeader: 'x-api-key',
+    }).chat([{ role: 'user', content: 'hi' }]);
+
+    expect(requestHeaders.get('x-api-key')).toBe('gateway-key');
+    expect(requestHeaders.get('authorization')).toBeNull();
+  });
+
+  it('keeps x-api-key authentication on Anthropic by default', async () => {
+    let requestHeaders = new Headers();
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestHeaders = new Headers(init?.headers);
+      return new Response(JSON.stringify(anthropicResponse()), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await new AnthropicProvider('sk-ant-test').chat([{ role: 'user', content: 'hi' }]);
+
+    expect(requestHeaders.get('x-api-key')).toBe('sk-ant-test');
+    expect(requestHeaders.get('authorization')).toBeNull();
+  });
+
+  it('keeps x-api-key authentication when the official URL is entered explicitly', async () => {
+    let requestHeaders = new Headers();
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestHeaders = new Headers(init?.headers);
+      return new Response(JSON.stringify(anthropicResponse()), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await new AnthropicProvider('sk-ant-test', undefined, {
+      baseUrl: 'https://api.anthropic.com',
+    }).chat([{ role: 'user', content: 'hi' }]);
+
+    expect(requestHeaders.get('x-api-key')).toBe('sk-ant-test');
+    expect(requestHeaders.get('authorization')).toBeNull();
+  });
+
+  it('discovers models from a custom endpoint', async () => {
+    let requestUrl = '';
+    let requestHeaders = new Headers();
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = String(input);
+      requestHeaders = new Headers(init?.headers);
+      return new Response(JSON.stringify({
+        data: [{ id: 'claude-custom-large' }, { id: 'claude-custom-fast' }],
+      }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const models = await new AnthropicProvider('custom-token', undefined, {
+      baseUrl: 'https://gateway.example.com',
+    }).listModels();
+
+    expect(requestUrl).toBe('https://gateway.example.com/v1/models');
+    expect(requestHeaders.get('authorization')).toBe('Bearer custom-token');
+    expect(requestHeaders.get('anthropic-version')).toBe('2023-06-01');
+    expect(models).toEqual(['claude-custom-large', 'claude-custom-fast']);
+  });
+
+  it('accepts SSE from a gateway for a non-streaming chat request', async () => {
+    const events = [
+      { type: 'message_start', message: { model: 'gateway-model', usage: { input_tokens: 4, output_tokens: 0 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'O' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'K' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn', usage: { output_tokens: 2 } } },
+      { type: 'message_stop' },
+    ];
+    const sse = `: keepalive\n\n${events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join('')}`;
+    globalThis.fetch = (async () => new Response(sse, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream; charset=utf-8' },
+    })) as unknown as typeof fetch;
+
+    const response = await new AnthropicProvider('token', 'fallback', {
+      baseUrl: 'https://gateway.example.com',
+    }).chat([{ role: 'user', content: 'hi' }]);
+
+    expect(response.content).toBe('OK');
+    expect(response.model).toBe('gateway-model');
+    expect(response.usage).toEqual({ input_tokens: 4, output_tokens: 2 });
+    expect(response.finish_reason).toBe('stop');
+  });
+});
 
 describe('AnthropicProvider cache_control placement', () => {
   afterEach(() => {
@@ -278,5 +401,52 @@ describe('AnthropicProvider cache usage parsing', () => {
       expect(done.response.usage.cache_read_input_tokens).toBe(2048);
       expect(done.response.usage.cache_creation_input_tokens).toBe(64);
     }
+  });
+});
+
+describe('AnthropicProvider SSE chat responses', () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => { globalThis.fetch = realFetch; });
+
+  function sseResponse(events: unknown[]) {
+    return new Response(events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join(''), {
+      status: 200, headers: { 'content-type': 'text/event-stream' },
+    });
+  }
+
+  it('degrades a truncated tool call instead of discarding the whole response', async () => {
+    // Regression: an unguarded JSON.parse threw a bare parser error out of
+    // chat(), while the streaming path absorbs the identical payload.
+    globalThis.fetch = (async () => sseResponse([
+      { type: 'message_start', message: { model: 'gw-model', usage: { input_tokens: 3, output_tokens: 4 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'partial answer' } },
+      { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 't1', name: 'weather', input: {} } },
+      { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"city"' } },
+      { type: 'content_block_stop', index: 1 },
+      { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 4 } },
+    ])) as unknown as typeof fetch;
+
+    const result = await new AnthropicProvider('k', undefined, { baseUrl: 'https://gw.example' })
+      .chat([{ role: 'user', content: 'hi' }]);
+
+    expect(result.tool_calls).toEqual([]);
+    expect(result.content).toContain('partial answer');
+    expect(result.content).toContain('truncated');
+    expect(result.model).toBe('gw-model');
+  });
+
+  it('still assembles a complete tool call from the SSE stream', async () => {
+    globalThis.fetch = (async () => sseResponse([
+      { type: 'message_start', message: { model: 'gw-model', usage: { input_tokens: 1, output_tokens: 1 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 't1', name: 'weather', input: {} } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"city":"Rome"}' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 2 } },
+    ])) as unknown as typeof fetch;
+
+    const result = await new AnthropicProvider('k', undefined, { baseUrl: 'https://gw.example' })
+      .chat([{ role: 'user', content: 'hi' }]);
+
+    expect(result.tool_calls).toEqual([{ id: 't1', name: 'weather', arguments: { city: 'Rome' } }]);
   });
 });

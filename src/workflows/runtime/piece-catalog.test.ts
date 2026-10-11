@@ -9,7 +9,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import {
@@ -18,8 +18,9 @@ import {
   computeCatalogCacheKey,
   discoverPieces,
   metadataToCatalogEntry,
+  pieceContentHash,
   propsToInputSchema,
-  readCachedCatalog,
+  readCachedEntries,
   type CacheFileShape,
   type PieceLookup,
 } from "./piece-catalog";
@@ -63,6 +64,7 @@ describe("PieceCatalog (unit)", () => {
       description: "x desc",
       actions: {
         do_thing: {
+          requireAuth: false,
           name: "do_thing",
           displayName: "Do Thing",
           description: "does",
@@ -83,6 +85,8 @@ describe("PieceCatalog (unit)", () => {
     expect(entry.name).toBe("@jarvispieces/piece-x");
     const goal = entry.actions["do_thing"]?.inputSchema?.fields[0];
     expect(goal?.name).toBe("goal");
+    expect(entry.actions.do_thing?.requireAuth).toBe(false);
+    expect(goal?.sourceType).toBe('SHORT_TEXT');
     expect(goal?.required).toBe(true);
     expect(goal?.placeholder).toBe("what to do");
     expect(entry.triggers?.["on_event"]?.displayName).toBe("On");
@@ -383,56 +387,135 @@ describe("PieceCatalog (unit)", () => {
     }
   });
 
-  test("computeCatalogCacheKey changes when bundle or piece source changes", () => {
+  test("computeCatalogCacheKey tracks the bundle; piece source moves pieceContentHash instead", () => {
     const { path: root, cleanup } = tmp("cache-key");
     const bundlePath = resolve(root, "engine.js");
     writeFileSync(bundlePath, "v1");
-    mkdirSync(resolve(root, "pieces/p/dist/src"), { recursive: true });
+    const pieceDir = resolve(root, "pieces/p");
+    mkdirSync(resolve(pieceDir, "dist/src"), { recursive: true });
     writeFileSync(
-      resolve(root, "pieces/p/package.json"),
+      resolve(pieceDir, "package.json"),
       JSON.stringify({ name: "@scope/piece-p", version: "0.0.1" }),
     );
-    writeFileSync(resolve(root, "pieces/p/dist/src/index.js"), "v1");
+    writeFileSync(resolve(pieceDir, "dist/src/index.js"), "v1");
     try {
-      const k1 = computeCatalogCacheKey({ bundlePath, pieceRoots: [resolve(root, "pieces")] });
-      // Bundle change -> new key.
+      const k1 = computeCatalogCacheKey({ bundlePath });
+      // Bundle change -> new GLOBAL key (invalidates everything).
       writeFileSync(bundlePath, "v2");
-      const k2 = computeCatalogCacheKey({ bundlePath, pieceRoots: [resolve(root, "pieces")] });
+      const k2 = computeCatalogCacheKey({ bundlePath });
       expect(k2).not.toBe(k1);
-      // Piece source change without bundle change -> new key (the bug we fixed in review #2).
-      writeFileSync(resolve(root, "pieces/p/dist/src/index.js"), "edited");
-      const k3 = computeCatalogCacheKey({ bundlePath, pieceRoots: [resolve(root, "pieces")] });
-      expect(k3).not.toBe(k2);
+      // Piece source change is PER-ENTRY now: the global key must NOT move
+      // (that's what keeps one changed piece from invalidating 650 others),
+      // the piece's own content hash must.
+      const h1 = pieceContentHash(pieceDir);
+      writeFileSync(resolve(pieceDir, "dist/src/index.js"), "edited");
+      expect(computeCatalogCacheKey({ bundlePath })).toBe(k2);
+      expect(pieceContentHash(pieceDir)).not.toBe(h1);
     } finally {
       cleanup();
     }
   });
 
-  test("readCachedCatalog returns null when cacheKey doesn't match", () => {
+  test("readCachedEntries: key mismatch, malformed file, and the PRE-per-entry shape all read as a miss", () => {
     const { path: dir, cleanup } = tmp("cache-mismatch");
     const file = resolve(dir, "cache.json");
+    const entry = { name: "p", displayName: "P", description: "", actions: {} };
     const payload: CacheFileShape = {
       cacheKey: "v1",
-      entries: [{ name: "p", displayName: "P", description: "", actions: {} }],
+      pieces: { "p@0.0.1": { contentHash: "h", entry } },
     };
     writeFileSync(file, JSON.stringify(payload));
     try {
-      expect(readCachedCatalog(file, "v1")?.list().length).toBe(1);
-      expect(readCachedCatalog(file, "v2")).toBeNull();
+      expect(readCachedEntries(file, "v1")?.get("p@0.0.1")?.entry.name).toBe("p");
+      expect(readCachedEntries(file, "v2")).toBeNull();
+      expect(readCachedEntries("/no/such/path", "v1")).toBeNull();
+      // Old array-shaped cache (pre-per-entry): a clean one-time miss, not a crash.
+      writeFileSync(file, JSON.stringify({ cacheKey: "v1", entries: [entry] }));
+      expect(readCachedEntries(file, "v1")).toBeNull();
+      writeFileSync(file, "{not json");
+      expect(readCachedEntries(file, "v1")).toBeNull();
     } finally {
       cleanup();
     }
   });
 
-  test("readCachedCatalog returns null when file is missing or malformed", () => {
-    expect(readCachedCatalog("/no/such/path", "v1")).toBeNull();
-    const { path: dir, cleanup } = tmp("cache-bad");
-    const file = resolve(dir, "cache.json");
-    writeFileSync(file, "{not json");
+  test("per-entry cache: shared file serves hits without an engine spawn; only misses extract; user file excludes shared-served entries", async () => {
+    const { path: root, cleanup } = tmp("shared-cache");
+    const { path: cacheDir, cleanup: cleanupCache } = tmp("shared-cache-files");
+    const userFile = resolve(cacheDir, "user.json");
+    const sharedFile = resolve(cacheDir, "shared.json");
+    // Two pieces on disk: "shared" (covered by the shared cache) and "mine"
+    // (a user install the shared cache knows nothing about).
+    for (const [sub, name] of [
+      ["shared", "@scope/piece-shared"],
+      ["mine", "@scope/piece-mine"],
+    ] as const) {
+      mkdirSync(resolve(root, sub), { recursive: true });
+      writeFileSync(
+        resolve(root, sub, "package.json"),
+        JSON.stringify({ name, version: "0.0.1" }),
+      );
+    }
+    const sharedEntry = {
+      name: "@scope/piece-shared", displayName: "Shared", description: "", actions: {},
+    };
+    writeFileSync(
+      sharedFile,
+      JSON.stringify({
+        cacheKey: "v1",
+        pieces: {
+          "@scope/piece-shared@0.0.1": {
+            contentHash: pieceContentHash(resolve(root, "shared")),
+            entry: sharedEntry,
+          },
+        },
+      } satisfies CacheFileShape),
+    );
+    let acquires = 0;
+    const extractedNames: string[] = [];
+    const fakeHandle = {
+      async extractPieceMetadata(o: { pieceName: string }) {
+        extractedNames.push(o.pieceName);
+        return { name: o.pieceName, displayName: "Mine", description: "", actions: {} };
+      },
+      async release() { /* noop */ },
+    } as unknown as EngineHandle;
+    const fakeRuntime = {
+      acquire: async () => (acquires++, fakeHandle),
+    } as unknown as EngineRuntime;
     try {
-      expect(readCachedCatalog(file, "v1")).toBeNull();
+      const { catalog, failures } = await buildPieceCatalog({
+        runtime: fakeRuntime,
+        pieceRoots: [root],
+        cacheFile: userFile,
+        cacheKey: "v1",
+        sharedCacheFiles: [sharedFile],
+        reporter: () => {},
+      });
+      expect(failures).toEqual([]);
+      expect(catalog.list().length).toBe(2);
+      // Only the user's own piece was extracted.
+      expect(extractedNames).toEqual(["@scope/piece-mine"]);
+      expect(acquires).toBe(1);
+      // The user cache holds ONLY the user's piece (shared-served entries are
+      // not copied — per-user files stay small).
+      const written = JSON.parse(readFileSync(userFile, "utf8")) as CacheFileShape;
+      expect(Object.keys(written.pieces)).toEqual(["@scope/piece-mine@0.0.1"]);
+
+      // Second build: everything is a cache hit — the engine is NEVER acquired.
+      const second = await buildPieceCatalog({
+        runtime: fakeRuntime,
+        pieceRoots: [root],
+        cacheFile: userFile,
+        cacheKey: "v1",
+        sharedCacheFiles: [sharedFile],
+        reporter: () => {},
+      });
+      expect(second.catalog.list().length).toBe(2);
+      expect(acquires).toBe(1);
     } finally {
       cleanup();
+      cleanupCache();
     }
   });
 
@@ -479,6 +562,254 @@ describe("PieceCatalog (unit)", () => {
       expect(failures[0]?.pieceName).toBe("@scope/piece-bad");
       expect(failures[0]?.reason).toContain("boom");
       expect(reports.some((r) => r.includes("@scope/piece-bad"))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  /**
+   * The engine-replacement contract.
+   *
+   * A failed extraction leaves the engine in one of two states, and they need
+   * OPPOSITE handling:
+   *
+   *  - NO ANSWER (timeout): our own race gave up; nothing cancelled the
+   *    operation, so the engine is still working on that piece and every
+   *    later one would queue behind it. Destroy it. This is the shape the
+   *    hosted build hit -- one failure, then 658 timeouts on a process still
+   *    alive at 486MB.
+   *  - AN ERROR REPLY: the engine answered, so it is alive and idle. Keep it.
+   *    Destroying it here would be pure churn, and under `pool: true` the
+   *    release would park the process and hand the same one back anyway.
+   */
+  /** Pieces are discovered in DIRECTORY order (p0, p1, ...), not by package
+   * name, so keep these under ten entries or p10 sorts before p2. */
+  function pieceTree(prefix: string, names: readonly string[]) {
+    const { path: root, cleanup } = tmp(prefix);
+    names.forEach((name, i) => {
+      mkdirSync(resolve(root, `p${i}`), { recursive: true });
+      writeFileSync(
+        resolve(root, `p${i}`, "package.json"),
+        JSON.stringify({ name, version: "0.0.1" }),
+      );
+    });
+    return { root, cleanup };
+  }
+
+  const okMetadata = (pieceName: string) => ({
+    name: pieceName,
+    displayName: "OK",
+    description: "ok",
+    actions: { ping: { name: "ping", displayName: "Ping", description: "", props: {} } },
+  });
+
+  /** Never resolves, so the loop's own `withTimeout` is what fires. */
+  const hangForever = () => new Promise<never>(() => {});
+
+  /** A runtime whose engines answer per `behaviour`, counting acquires and
+   * releases so a leaked or double-freed engine is visible. */
+  function countingRuntime(behaviour: (pieceName: string) => Promise<unknown>) {
+    const counts = { acquires: 0, releases: 0 };
+    const runtime = {
+      acquire: async () => {
+        counts.acquires++;
+        return {
+          extractPieceMetadata: (o: { pieceName: string }) => behaviour(o.pieceName),
+          async release() {
+            counts.releases++;
+          },
+        } as unknown as EngineHandle;
+      },
+    } as unknown as EngineRuntime;
+    return { runtime, counts };
+  }
+
+  test("a TIMEOUT destroys the engine, and the next piece gets a fresh one", async () => {
+    const { root, cleanup } = pieceTree("build-replace", [
+      "@scope/piece-hang",
+      "@scope/piece-a",
+      "@scope/piece-b",
+    ]);
+    const { runtime, counts } = countingRuntime(async (name) =>
+      name === "@scope/piece-hang" ? hangForever() : okMetadata(name),
+    );
+    try {
+      const { catalog, failures } = await buildPieceCatalog({
+        runtime,
+        pieceRoots: [root],
+        pieceTimeoutMs: 20,
+        reporter: () => {},
+      });
+      // One engine to start, one more after the piece that never answered.
+      expect(counts.acquires).toBe(2);
+      // Every engine handed out is released exactly once: the replacement path
+      // must not leak the old one, and the `finally` must not free the new one
+      // twice.
+      expect(counts.releases).toBe(counts.acquires);
+      // And the pieces after it still extract, on the fresh engine.
+      expect(catalog.list().length).toBe(2);
+      expect(failures.length).toBe(1);
+      expect(failures[0]?.reason).toContain("timed out");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("an ERROR REPLY keeps the engine, because the engine answered", async () => {
+    // The other half of the contract. Replacing here would cost a kill plus a
+    // cold spawn per broken piece, and under a pooled runtime it would not
+    // even be a replacement.
+    const { root, cleanup } = pieceTree("build-keep", [
+      "@scope/piece-bad",
+      "@scope/piece-a",
+      "@scope/piece-b",
+    ]);
+    const { runtime, counts } = countingRuntime(async (name) => {
+      if (name === "@scope/piece-bad") throw new Error("boom");
+      return okMetadata(name);
+    });
+    try {
+      const { catalog, failures } = await buildPieceCatalog({
+        runtime,
+        pieceRoots: [root],
+        reporter: () => {},
+      });
+      expect(counts.acquires).toBe(1);
+      expect(counts.releases).toBe(1);
+      expect(catalog.list().length).toBe(2);
+      expect(failures.length).toBe(1);
+      expect(failures[0]?.reason).toContain("boom");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("gives up after N consecutive TIMEOUTS instead of paying the budget on every piece", async () => {
+    // The cost this bounds: on the hosted build a wedged engine meant 659
+    // pieces x 30s, about five and a half hours, inside an install op that
+    // gives up at thirty minutes -- so the build was killed and reported
+    // nothing at all.
+    const names = Array.from({ length: 9 }, (_, i) => `@scope/piece-${i}`);
+    const { root, cleanup } = pieceTree("build-giveup", names);
+    let attempts = 0;
+    const { runtime, counts } = countingRuntime(() => {
+      attempts++;
+      return hangForever();
+    });
+    const reports: string[] = [];
+    try {
+      const { catalog, failures } = await buildPieceCatalog({
+        runtime,
+        pieceRoots: [root],
+        pieceTimeoutMs: 20,
+        maxConsecutiveTimeouts: 3,
+        reporter: (m) => reports.push(m),
+      });
+      expect(attempts).toBe(3);
+      expect(catalog.list().length).toBe(0);
+      // No engine left running behind us, and none freed twice.
+      expect(counts.releases).toBe(counts.acquires);
+      // Every piece is still ACCOUNTED FOR: the ones tried and the ones the
+      // build declined to try. Silence about the remainder is what made this
+      // undiagnosable from the outside.
+      expect(failures.length).toBe(names.length);
+      expect(failures.filter((f) => /not attempted/.test(f.reason)).length).toBe(names.length - 3);
+      expect(reports.some((m) => m.includes("no answer from the engine"))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("error replies NEVER trip the give-up, however many land in a row", async () => {
+    // Discovery is sorted, so piece families cluster; one broken shared
+    // dependency across piece-google-* yields a long run of error replies from
+    // engines that answered promptly every time. Ending the build there would
+    // abandon hundreds of healthy pieces over a handful of bad ones.
+    const names = Array.from({ length: 8 }, (_, i) => `@scope/piece-bad-${i}`);
+    const { root, cleanup } = pieceTree("build-errors", names);
+    const { runtime } = countingRuntime(async () => {
+      throw new Error("nope");
+    });
+    try {
+      const { failures } = await buildPieceCatalog({
+        runtime,
+        pieceRoots: [root],
+        maxConsecutiveTimeouts: 3,
+        reporter: () => {},
+      });
+      expect(failures.length).toBe(names.length);
+      expect(failures.every((f) => !/not attempted/.test(f.reason))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a success resets the timeout streak", async () => {
+    // Consecutive, not total. The trailing OK piece is the point: without the
+    // reset the three timeouts accumulate across the whole run, the build
+    // gives up at the last one, and that final piece is never attempted.
+    const names = [
+      "@scope/piece-hang-a",
+      "@scope/piece-ok-a",
+      "@scope/piece-hang-b",
+      "@scope/piece-ok-b",
+      "@scope/piece-hang-c",
+      "@scope/piece-ok-c",
+    ];
+    const { root, cleanup } = pieceTree("build-streak", names);
+    const { runtime } = countingRuntime(async (name) =>
+      name.includes("hang") ? hangForever() : okMetadata(name),
+    );
+    try {
+      const { catalog, failures } = await buildPieceCatalog({
+        runtime,
+        pieceRoots: [root],
+        pieceTimeoutMs: 20,
+        maxConsecutiveTimeouts: 3,
+        reporter: () => {},
+      });
+      expect(catalog.list().length).toBe(3);
+      expect(failures.length).toBe(3);
+      expect(failures.every((f) => !/not attempted/.test(f.reason))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a replacement engine that cannot start ends the build with the rest reported, not thrown", async () => {
+    // Losing the engine must not throw away the entries that already
+    // extracted, and must not surface as an unhandled rejection.
+    const { root, cleanup } = pieceTree("build-nospawn", [
+      "@scope/piece-a",
+      "@scope/piece-hang",
+      "@scope/piece-c",
+    ]);
+    let acquires = 0;
+    const fakeRuntime = {
+      acquire: async () => {
+        acquires++;
+        if (acquires > 1) throw new Error("no engine for you");
+        return {
+          async extractPieceMetadata(o: { pieceName: string }) {
+            if (o.pieceName === "@scope/piece-hang") return hangForever();
+            return okMetadata(o.pieceName);
+          },
+          async release() { /* noop */ },
+        } as unknown as EngineHandle;
+      },
+    } as unknown as EngineRuntime;
+    const reports: string[] = [];
+    try {
+      const { catalog, failures } = await buildPieceCatalog({
+        runtime: fakeRuntime,
+        pieceRoots: [root],
+        pieceTimeoutMs: 20,
+        reporter: (m) => reports.push(m),
+      });
+      expect(catalog.list().length).toBe(1);
+      expect(failures.length).toBe(2);
+      expect(failures.some((f) => /replacement engine could not start/.test(f.reason))).toBe(true);
+      expect(reports.some((m) => m.includes("could not start a replacement engine"))).toBe(true);
     } finally {
       cleanup();
     }
@@ -637,10 +968,13 @@ describe("PieceCatalog (engine end-to-end)", () => {
     if (!cached && buildOptIn) cached = await buildEngineBundle();
     if (!cached) return;
     if (!piecesAlreadyBuilt && buildOptIn) await buildAllJarvisPieces();
-    runtime = new EngineRuntime({ api, bundlePath: cached.bundlePath });
+    runtime = new EngineRuntime({ api, bundlePath: cached.bundlePath, expectedDigest: cached.digest });
   });
 
   afterAll(async () => {
+    // Engines first: reclaim anything this runtime spawned while the
+    // SandboxApi it talks to is still up (#491).
+    await runtime?.shutdown();
     await api.stop();
   });
 

@@ -15,20 +15,99 @@ export type SystemCronConfig = {
 };
 
 export type GoogleConfig = {
-  client_id: string;
-  client_secret: string;
+  /**
+   * SELF-HOSTED ONLY. Absent on a control-plane managed instance, which holds no
+   * Google client credentials at all — see `refresh_url`. Optional so the
+   * compiler makes every reader face that case instead of trusting a `''`.
+   */
+  client_id?: string;
+  client_secret?: string;
+  /**
+   * HOSTED ONLY (usejarvis, GOOGLE.md "Push bridging"). Present when the control
+   * plane runs a push bridge: Google notifies it, and it rings this instance's
+   * doorbell so a change reflects in seconds instead of on the next poll.
+   *
+   * All three absent = self-hosted, or a deployment with no bridge. Polling then
+   * covers everything, which is the designed fallback rather than a degraded
+   * mode — so nothing here is required and nothing fails without it.
+   */
+  /** HMAC key the inbound doorbell is verified with (per instance). */
+  notify_secret?: string;
+  /** Pub/Sub topic to point Gmail's users.watch at. */
+  pubsub_topic?: string;
+  /** The bridge's public URL, for Calendar's events.watch callback. */
+  push_callback?: string;
+  /**
+   * The token to set on the Calendar watch, which Google echoes back to the
+   * bridge so it can tell which instance a notification belongs to. Rendered
+   * whole by the control plane rather than built here from notify_secret — the
+   * derivation would then live in two codebases, and a drifted token is a
+   * notification the bridge refuses without anything looking wrong.
+   */
+  channel_token?: string;
+  /**
+   * Where the user connects Google, on the hosted account page.
+   *
+   * Its PRESENCE means this instance is control-plane MANAGED: there are no
+   * client credentials in this file at all, the tokens are delivered rather than
+   * obtained here, and this daemon's own OAuth flow must not run — its redirect
+   * URI is this instance's own hostname, which is not registered with Google and
+   * cannot be (there is one registered URI, on the control plane, precisely so a
+   * VPS move does not break it).
+   */
+  connect_url?: string;
+  /**
+   * HMAC key this instance SIGNS its refresh requests with (hosted only).
+   *
+   * A different key from notify_secret, which the DOORBELL is verified with. The
+   * two travel in opposite directions, and while one key served both, the same
+   * signature was valid at either endpoint — safe only because the two body
+   * shapes happen to be disjoint. Both are rendered whole by the control plane.
+   */
+  refresh_secret?: string;
+  /**
+   * Where this instance asks the control plane to refresh its access token.
+   *
+   * Present INSTEAD of client_id/client_secret on a managed instance: the
+   * control plane holds those and applies them on our behalf, so no shared
+   * credential sits in a file this daemon's own (tenant-owned) user can read.
+   */
+  refresh_url?: string;
+  /** This instance's control-plane id, used to name itself when refreshing. */
+  instance_id?: string;
 };
 
+/**
+ * `allowed_users` is a list of user ids: positive integers for Telegram,
+ * snowflake strings for Discord. Any other entry is ignored with a warning, and
+ * a value that names nobody (a string, `["042"]`) lets nobody in rather than
+ * everyone (#883, comms/channels/allow-list.ts).
+ *
+ * `allowed_users` means two different things when it is EMPTY (#811):
+ *   - chat: everyone who can reach the bot may talk to Jarvis (any Telegram
+ *     user who finds it, any member of a Discord guild it is in), each in a
+ *     conversation of their own (#884), though with the owner's tools;
+ *   - approvals: nobody may approve or deny from that channel. An
+ *     `approve <id>` or `deny <id>` reply is refused, and the decision has to
+ *     be made in the dashboard. A gated action is the one place "allow all"
+ *     is the wrong default.
+ *   - notifications: nothing is sent proactively (#852). Approval cards and
+ *     other broadcasts go to the private chat of the last sender the list
+ *     names (never a group or server channel), so an empty list has no
+ *     recipient; a stranger who messages the bot gets replies, never the
+ *     owner's cards.
+ * A non-empty list admits only the users it names, for all three.
+ */
 export type ChannelConfig = {
   telegram?: {
     enabled: boolean;
     bot_token: string;
-    allowed_users: number[];  // Telegram user IDs
+    allowed_users: number[];  // Telegram user IDs; empty = anyone may chat, nobody may approve
   };
   discord?: {
     enabled: boolean;
     bot_token: string;
-    allowed_users: string[];  // Discord user IDs
+    allowed_users: string[];  // Discord user IDs; empty = anyone may chat, nobody may approve
     guild_id?: string;        // restrict to single guild
   };
 };
@@ -90,7 +169,21 @@ export type VoiceConfig = {
 };
 
 export type STTConfig = {
-  provider: 'openai' | 'groq' | 'local' | 'sarvam';
+  /**
+   * `usejarvis` is a pure string choice: the hosted "Usejarvis AI" STT rides
+   * the system-owned `usejarvis_ai` credentials, which are threaded to
+   * createSTTProvider as a separate argument and NEVER stored here (this
+   * section persists as plaintext JSON in the DB settings store).
+   */
+  provider: 'openai' | 'groq' | 'local' | 'sarvam' | 'usejarvis';
+  /**
+   * ISO-639-1 hint sent to the Whisper-shaped providers (openai / groq /
+   * local / usejarvis). Unset = auto-detect (the `language` param is omitted
+   * from the request entirely) — a hosted product cannot assume its users
+   * speak English, and Whisper detects reliably. Sarvam keeps its own
+   * `sarvam.language` (different API, different codes).
+   */
+  language?: string;
   openai?: { api_key: string; model?: string };
   groq?: { api_key: string; model?: string };
   local?: { endpoint: string; model?: string; server_type?: 'whisper_cpp' | 'openai_compatible' };
@@ -99,7 +192,12 @@ export type STTConfig = {
 
 export type TTSConfig = {
   enabled: boolean;
-  provider?: 'edge' | 'elevenlabs' | 'sarvam';  // default: 'edge'
+  /**
+   * Default: 'edge'. `usejarvis` is a pure string choice like the STT one:
+   * the hosted credentials ride the factory's separate `hosted` argument
+   * (never this persisted section).
+   */
+  provider?: 'edge' | 'elevenlabs' | 'sarvam' | 'usejarvis';
   voice?: string;       // e.g. 'en-US-AriaNeural' (edge)
   rate?: string;        // e.g. '+0%', '+10%' (edge)
   volume?: string;      // e.g. '+0%' (edge)
@@ -119,13 +217,45 @@ export type TTSConfig = {
   };
 };
 
+/**
+ * The pebble overlay's global hotkeys (#563).
+ *
+ * SYSTEM-owned: read from config.yaml and deliberately NOT in
+ * USER_OWNED_SECTIONS, so the file is authoritative (loadConfig deep-merges the
+ * file over DEFAULT_CONFIG and discards only the listed user-owned sections; an
+ * unlisted top-level section survives, the same way the system-owned `tools:`
+ * section does). There is no DEFAULT_CONFIG entry either, on the
+ * `daemon.drain_deadline_ms` precedent: absent must stay distinguishable from
+ * "set to the default", and the defaults are applied where the value is
+ * consumed - PEBBLE_DEFAULT_SUMMON_HOTKEY / PEBBLE_DEFAULT_PALETTE_HOTKEY in
+ * src/config/pebble-hotkeys.ts, which is the ONE place the shipped pair is
+ * decided.
+ *
+ * Both are read through `resolvePebbleHotkeys`, never as `config.pebble?.x`:
+ * a value that is set to something unusable has to be distinguishable from one
+ * that is not set, or a typo silently becomes the default with nothing said.
+ *
+ * `unknown` rather than `string` on purpose. These come straight out of YAML,
+ * where `summon_hotkey: 3` and `summon_hotkey: [a, b]` are as legal as a
+ * string, and the reader is what turns any of that into a verdict.
+ */
+export type PebbleConfig = {
+  /** Keyspec for the summon hotkey, e.g. "ctrl+shift+space". "", "none" or "off" registers none. */
+  summon_hotkey?: unknown;
+  /** Keyspec for the palette hotkey, e.g. "ctrl+shift+k". "", "none" or "off" registers none. */
+  palette_hotkey?: unknown;
+};
+
+/**
+ * The `desktop` settings section. #897 removed `sidecar_port`, `sidecar_path`,
+ * `auto_launch`, `tree_depth` and `snapshot_max_elements`: nothing read them
+ * (the legacy desktop bridge their names described used hard-coded constants,
+ * and #799 deleted it), so setting one changed nothing and said nothing. A
+ * stored row or file that still carries them loads as before: deepMerge keeps
+ * unknown keys, and nothing reads them.
+ */
 export type DesktopConfig = {
   enabled: boolean;
-  sidecar_port: number;
-  sidecar_path?: string;
-  auto_launch: boolean;
-  tree_depth: number;
-  snapshot_max_elements: number;
 };
 
 export type AwarenessConfig = {
@@ -133,7 +263,10 @@ export type AwarenessConfig = {
   capture_interval_ms: number;
   min_change_threshold: number;       // 0.0-1.0 pixel diff percentage
   cloud_vision_enabled: boolean;
+  /** Min gap between vision calls backed by a local signal (error/stuck/struggle). */
   cloud_vision_cooldown_ms: number;
+  /** Min gap between signal-less "what's on screen now" vision calls. */
+  cloud_vision_ambient_cooldown_ms: number;
   stuck_threshold_ms: number;
   struggle_grace_ms: number;          // min time before struggle fires
   struggle_cooldown_ms: number;       // min gap between struggle detections
@@ -161,6 +294,34 @@ export type ContextRule = {
   description: string;
 };
 
+/**
+ * Extra restrictions for the background agent: the one that reacts to
+ * observer events, screen struggles and commitments with no user turn. Its
+ * prompts are built from ambient input (screen text, email snippets,
+ * clipboard), so it gets the shared authority config PLUS these. They can
+ * only tighten: a category listed here needs approval even when the main
+ * agent may run it outright, and level_cap denies anything above it.
+ */
+export type BackgroundAuthorityConfig = {
+  /** Ceiling on the background agent's effective level. Unset = no cap. */
+  level_cap?: number;
+  /** Categories that always require approval for the background agent. */
+  governed_categories?: string[];      // ActionCategory[]
+};
+
+/**
+ * Taint gating for the chat agent: within a turn in which it read outside
+ * content (web page, clipboard, file, screen text, sub-agent report), the
+ * listed categories require approval. The agent's level is unchanged; a new
+ * user message clears the taint. See src/authority/taint-gating.ts.
+ */
+export type TaintGatingConfig = {
+  /** Default true. */
+  enabled?: boolean;
+  /** Categories gated while tainted. Explicit [] disables the list. */
+  governed_categories?: string[];      // ActionCategory[]
+};
+
 export type AuthorityConfig = {
   default_level: number;
   governed_categories: string[];       // ActionCategory[]
@@ -171,6 +332,8 @@ export type AuthorityConfig = {
     suggest_threshold: number;
   };
   emergency_state: 'normal' | 'paused' | 'killed';
+  background?: BackgroundAuthorityConfig;
+  taint_gating?: TaintGatingConfig;
 };
 
 export type WorkflowConfig = {
@@ -180,6 +343,77 @@ export type WorkflowConfig = {
   defaultTimeoutMs: number;
   selfHealEnabled: boolean;
   autoSuggestEnabled: boolean;
+  /**
+   * How long an idle warm engine subprocess stays parked before being
+   * killed, in ms. The parked engine holds ~100MB RSS; hosts that prefer
+   * RAM over the respawn cost can lower this. Default 5 minutes. Must be
+   * positive — non-positive values are ignored with a warning. The
+   * JARVIS_ENGINE_IDLE_TTL_MS env var overrides this setting (workflows is
+   * a user-owned section, so fleet operators tune via env instead).
+   */
+  engineIdleTtlMs?: number;
+  /**
+   * How many engine bundles `~/.jarvis/cache/engine` may hold, newest first.
+   * Each distinct engine source state builds its own ~7MB content-addressed
+   * bundle and nothing used to remove the old ones (13 bundles / 93MB when
+   * this was reported). Default 3. 0 means "never prune by count". The
+   * bundle in use and any bundle a running engine is executing are always
+   * kept, whatever this says. Overridden by JARVIS_ENGINE_CACHE_MAX_BUNDLES.
+   *
+   * Like `engineIdleTtlMs`, this is USER-owned: it comes from the dashboard /
+   * user settings, not from `config.yaml` (the loader keeps only
+   * WORKFLOW_SYSTEM_KEYS from the file). Fleet operators use the env var.
+   */
+  engineCacheMaxBundles?: number;
+  /**
+   * Delete engine bundles untouched for this many days. Default 14. 0 means
+   * "never prune by age". Same protections as above apply. Overridden by
+   * JARVIS_ENGINE_CACHE_MAX_AGE_DAYS.
+   */
+  engineCacheMaxAgeDays?: number;
+  /**
+   * Where the workflow runtime finds READY-MADE artifacts instead of
+   * building/installing its own. All optional; each path may contain a
+   * `${version}` placeholder expanded from the `JARVIS_VERSION` env var
+   * (useful when one machine keeps artifacts per installed version). Any
+   * unset/missing path just means jarvis does the work itself, as usual.
+   * The JARVIS_ENGINE_CACHE_ROOT / JARVIS_SHARED_PIECES_DIR /
+   * JARVIS_PIECE_METADATA_CACHE env vars are honored as fallbacks; config
+   * wins when both are set.
+   */
+  /** Dir holding prebuilt engine bundles as `<hash>/main.js` — consulted
+   * before building into `~/.jarvis/cache/engine`.
+   *
+   * EACH BUNDLE MUST SHIP ITS `main.js.sha256` (#624). `main.js` from here is
+   * spawned as the workflow engine with the daemon's authority, and the
+   * directory name hashes build INPUTS, not output, so the digest beside it is
+   * the only thing that makes the store content-addressed in fact rather than
+   * in name. A bundle with no manifest, or one whose bytes do not match it, is
+   * refused: the daemon logs `[engine] shared bundle REFUSED reason=...` and
+   * builds its own copy instead. Both of jarvis's own publishers
+   * (`scripts/build-shared-runtime.ts`, the Docker image) write it
+   * unconditionally; a host publishing these trees by other means (rsync,
+   * tarball, a fleet builder) has to carry the `.sha256` files too, or every
+   * tenant on the host silently stops using the shared bundle and pays a
+   * ~47 MB staging install -- which in a container with no egress means
+   * workflow features start disabled.
+   *
+   * THE FORMAT, stated because getting it wrong is reported the same way as
+   * corrupt bytes and is the likelier mistake: the file's first
+   * whitespace-delimited token must be the bundle's sha256 as hex, case
+   * ignored. So all of `sha256sum main.js > main.js.sha256` (which writes
+   * `<hash>  main.js`), `sha256sum main.js | cut -d' ' -f1 > ...` and
+   * `shasum -a 256` are accepted as they come. Anything else -- a truncated
+   * digest, several digests, a digest of the wrong file -- is a
+   * `reason=digest_mismatch` refusal. */
+  engine_dir?: string;
+  /** Dir with a ready-made pieces catalog (`node_modules/@activepieces/...`).
+   * Pieces here are usable without installing; a piece installed via the
+   * Library into `~/.jarvis/pieces` shadows the copy found here. */
+  pieces_dir?: string;
+  /** A prebuilt piece-metadata cache FILE (the per-entry JSON the catalog
+   * builder writes) — boots skip extraction for every piece it covers. */
+  piece_metadata_cache?: string;
 };
 
 export type GoalConfig = {
@@ -256,7 +490,11 @@ export type LLMProviderKind =
   | 'openrouter'
   | 'nvidia'
   | 'openai_compatible'
-  | 'litellm';
+  | 'litellm'
+  | 'omniroute'
+  // Hosted "Usejarvis AI": the platform's LLM proxy, configured exclusively
+  // by the root-owned config.yaml `usejarvis_ai` block (never the dashboard).
+  | 'usejarvis_ai';
 
 /**
  * Credentials + endpoint for one provider instance. The `kind` field is
@@ -270,8 +508,17 @@ export type LLMProviderEntry = {
   kind?: LLMProviderKind;
   /** API key for cloud providers. */
   api_key?: string;
-  /** Base URL for self-hosted / local providers (ollama, openai-compatible, litellm). */
+  /** Base URL for local providers and compatible API gateways. */
   base_url?: string;
+  /** Header used to send api_key. Authorization values are prefixed with Bearer. */
+  auth_header?: string;
+  /**
+   * usejarvis_ai entries only: the system-block prompt-cache opt-in,
+   * carried through by applyUsejarvisAi so the binding layer can see it.
+   * Unlike the user-level `llm.prompt_cache` toggle (default ON), this
+   * defaults OFF — see the `usejarvis_ai.prompt_cache` block comment.
+   */
+  prompt_cache?: boolean;
 };
 
 /**
@@ -325,7 +572,113 @@ export type LLMConfig = {
   prompt_cache?: boolean;
 };
 
+/**
+ * Tool-relevance filtering (docs/tool-relevance-filtering.md).
+ *
+ * SYSTEM-owned and file-authoritative: `tools` is deliberately NOT in
+ * USER_OWNED_SECTIONS, so a block in config.yaml survives loadConfig and the
+ * dashboard cannot turn this on. It is a safety-relevant switch, not a
+ * preference.
+ *
+ * Absent means off. `JARVIS_TOOL_FILTER=off` forces it off regardless of what
+ * is written here, and is the kill switch an operator reaches for.
+ */
+export type ToolsConfig = {
+  relevance_filter?: {
+    /**
+     * Master switch. Absent or false means no call site ever filters, which
+     * is the shipped default: #483 requires a benchmark on real small models
+     * before this can be turned on by default.
+     */
+    enabled?: boolean;
+    /**
+     * Parameter-count ceiling, in billions, for the ollama auto-eligibility
+     * rule. A model whose id carries no anchored parameter tag is never
+     * auto-eligible. Default 20.
+     */
+    max_params_b?: number;
+    /**
+     * Explicit "provider:model" refs to treat as eligible regardless of the
+     * heuristics. This is the deterministic mechanism and the only one the
+     * benchmark needs; the heuristics exist so an ordinary ollama install
+     * does not have to enumerate its models.
+     */
+    models?: string[];
+  };
+};
+
 export type JarvisConfig = {
+  /**
+   * Hosted-LLM access (SYSTEM-owned, file-authoritative): written by the
+   * hosting provisioner into the root-owned config.yaml, never by the brain
+   * or dashboard. Survives the user-section discard (not listed in
+   * USER_OWNED_SECTIONS) and is re-applied over every DB merge by
+   * applyUsejarvisAi (daemon/usejarvis-ai.ts). Absent on self-hosted installs.
+   */
+  usejarvis_ai?: {
+    base_url?: string;
+    api_key?: string;
+    /**
+     * Where this instance reads its OWN usage meter, and how it proves it is
+     * itself (control plane: POST /api/llm/instance-usage).
+     *
+     * In THIS block rather than under `google` — where `instance_id` also
+     * appears — because the meter is hosted-only and this block is exactly the
+     * hosted marker, while the google fields exist only when Google is
+     * configured. A hosted tenant who never connects Google still has a meter.
+     *
+     * All three or none: a partial set cannot authenticate, and treating it as
+     * present would poll a control plane that answers 401 on a timer.
+     */
+    usage_url?: string;
+    instance_id?: string;
+    usage_secret?: string;
+    /**
+     * OPT-IN for Anthropic prompt-cache breakpoints on hosted LLM calls
+     * (margin-critical when on: cached reads bill at ~0.1x fresh input).
+     * Absent/false means OFF.
+     *
+     * MUST REMAIN false FLEET-WIDE until the platform ships per-tenant
+     * upstream credentials. Platform-verified 2026-08-19: the prompt cache
+     * namespace follows the single upstream api_key shared by every tenant
+     * — a cross-tenant cache_read on a never-sent prefix was measured. A
+     * shared namespace is a byte-level confirmation oracle on other
+     * tenants' prompt prefixes (plus a 1.25x-write/0.1x-read billing
+     * asymmetry), and no client-side mitigation exists. The fix is
+     * platform-side; do not write `true` before it lands.
+     *
+     * Also verified 2026-08-19: cache_control forwarding is per-provider
+     * (openai/ upstreams receive the marker VERBATIM — 400 risk — while
+     * gemini/ drops it and anthropic/ translates and keeps it), so this
+     * gate stays required even after the namespace fix unless emission
+     * becomes vendor-aware; markers on tool-role messages ARE translated
+     * and honoured (cached at tool_result.content depth), so the
+     * last-user-message breakpoint anchor is safe.
+     */
+    prompt_cache?: boolean;
+  };
+  /**
+   * Hosted billing read (SYSTEM-owned, file-authoritative): written by the
+   * hosting control plane into the root-owned config.yaml, re-read on SIGHUP,
+   * never written by the brain. Absent on self-hosted installs, and on hosted
+   * ones whose control plane has no origin an instance can reach.
+   *
+   * Its own block rather than inside `usejarvis_ai`: that block is only
+   * rendered when hosted LLM is on, and a hosting-only customer still has a
+   * bill.
+   *
+   * All four or none (see daemon/hosted-billing.ts). The secret authenticates
+   * a READ of the owner's billing summary and nothing else; every change goes
+   * through `page_url`, opened in the system browser.
+   */
+  usejarvis_billing?: {
+    /** POST endpoint on the control plane (https). */
+    url?: string;
+    instance_id?: string;
+    secret?: string;
+    /** The account billing page a person opens. */
+    page_url?: string;
+  };
   user?: UserConfig;
   onboarding?: OnboardingConfig;
   telemetry?: TelemetryConfig;
@@ -355,7 +708,8 @@ export type JarvisConfig = {
      * (`brain.example.com`, `10.0.0.5:3142`). Bare local hosts default to
      * ws/http; everything else defaults to wss/https.
      *
-     * Precedence: `JARVIS_BRAIN_DOMAIN` env var > this field > internal
+     * Legacy alias for `public_url`. Precedence is `JARVIS_PUBLIC_URL` /
+     * `public_url`, then `JARVIS_BRAIN_DOMAIN` / this field, then the internal
      * `localhost:<port>` fallback (with a startup warning).
      *
      * Sidecars must be able to reach both derived endpoints from the
@@ -363,6 +717,93 @@ export type JarvisConfig = {
      * the token is re-issued with a reachable origin.
      */
     brain_domain?: string;
+    /**
+     * Canonical public HTTP(S) origin for OAuth callbacks, webhooks, dashboard
+     * links, and sidecar enrollment. Prefer this clearer name for new
+     * deployments; `brain_domain` remains a backwards-compatible alias.
+     * Must be an origin with no path, query, fragment, or credentials.
+     */
+    public_url?: string;
+    /**
+     * Graceful-drain deadline (ms). On SIGTERM the daemon quiesces (stops
+     * accepting new work) and waits up to this long for in-flight agent turns
+     * and workflow runs to reach a safe point before tearing down. Kept UNDER
+     * the supervisor's kill grace (hosted: systemd `TimeoutStopSec=90`) so the
+     * drain finishes before SIGKILL. Default 75s.
+     *
+     * Applies to a DELIBERATE shutdown only. A crash (uncaught exception or
+     * unhandled rejection) tears down on a fixed 10s budget and exits non-zero
+     * so the supervisor restarts it, however high this is set: the process is
+     * already in an undefined state, and in-flight turns cannot be resumed
+     * anyway (src/daemon/index.ts, FATAL_DRAIN_DEADLINE_MS).
+     */
+    drain_deadline_ms?: number;
+    /**
+     * Where to mirror this daemon's stdout/stderr as a size-capped, redacted
+     * file. Unset (the default) means no file is written.
+     *
+     * Under systemd - how the hosted fleet runs it, and `jarvis@.service`
+     * carries no `StandardOutput=` - and under Docker there is no log file at
+     * all, so the only record is journald or the container runtime and the
+     * hosting control plane has nothing per instance to read (docs/LOGS.md,
+     * "The brain's side"). Hosted instances get
+     * `/home/u_<id>/.jarvis/logs/jarvis.log` rendered by the control plane; it
+     * has to sit under the instance's home because the unit is
+     * `ProtectSystem=strict` with `ReadWritePaths=/home/%i /run/jarvis`.
+     *
+     * Lives under `daemon:` (rather than a `logging:` section of its own)
+     * because loadConfig REPLACES every section listed in USER_OWNED_SECTIONS
+     * with its default, and a `logging:` section would have been a user-owned
+     * one. Note the narrower rule: it is only the LISTED sections that are
+     * discarded. An unlisted top-level key survives, because loadConfig
+     * deep-merges the parsed file over DEFAULT_CONFIG and deepMerge copies
+     * unknown keys through - which is how the system-owned `tools:` section
+     * (see ToolsConfig) reaches the runtime. `~/` is expanded by loadConfig.
+     *
+     * No DEFAULT_CONFIG entry, on the drain_deadline_ms precedent: absent must
+     * stay distinguishable from "set to the default", and the fallback is
+     * applied where the value is consumed (src/util/log-file.ts).
+     */
+    log_file_path?: string;
+    /**
+     * Ring size for `log_file_path`, in bytes. Default 1 MiB, which is also
+     * the control plane's per-read cap. Once the file passes the cap the
+     * oldest lines are dropped from the top, so it settles at roughly this
+     * size and never grows without bound.
+     *
+     * The ring is held IN MEMORY - that is what the file is rewritten from -
+     * so this is an RSS budget as much as a disk budget. Clamped to
+     * 4 KiB..64 MiB at the point of use: below the floor a rewrite costs more
+     * than it saves, and above the ceiling the daemon pays for a window nobody
+     * reads. Non-finite values fall back to the default, because
+     * `log_file_max_bytes: .inf` is legal YAML and used to mean "never
+     * compact, grow until the OOM killer arrives".
+     */
+    log_file_max_bytes?: number;
+    /**
+     * SYSTEM-owned escape hatch for #546. Let other processes running as this
+     * user inspect the daemon: read `/proc/<pid>/environ` (every secret it
+     * started with), list `/proc/<pid>/fd`, attach strace or gdb, and get a
+     * core dump out of it.
+     *
+     * Unset or false -- the default, and Linux only -- means the daemon calls
+     * `prctl(PR_SET_DUMPABLE, 0)` at startup and none of that is possible
+     * without root. Set it to true when you need to debug the daemon itself.
+     * macOS and Windows get nothing either way; prctl is Linux-only.
+     *
+     * Applied at startup, so changing it needs a restart. Read through
+     * src/config/process-inspection.ts, which is also where the accepted
+     * spellings live (`yes`/`no`/`on`/`off`/`1`/`0` as well as booleans) --
+     * anything else is reported and treated as false, because a typo must never
+     * silently switch a security control off.
+     *
+     * No DEFAULT_CONFIG entry: there is nothing to default TO here, since the
+     * loader resolves this key to a real boolean on every load (absent and an
+     * explicit false both come out false, which is all the `=== true` reader
+     * needs). Optional on the type because the raw parsed file may not carry
+     * it and because a caller constructing a config by hand should not have to.
+     */
+    allow_process_inspection?: boolean;
   };
   auth?: AuthConfig;
   /**
@@ -374,6 +815,20 @@ export type JarvisConfig = {
    */
   browser?: {
     local?: boolean;
+    /**
+     * SYSTEM-owned: extra folders `browser_upload_file` may send a file from,
+     * on top of the user's document folders (`~/Documents`, `~/Downloads`,
+     * `~/Desktop`, `~/Pictures`, or wherever the XDG user dirs put them), the
+     * site projects dir and `<data dir>/uploads` (#527).
+     *
+     * Absolute paths, `~` allowed. This can only NARROW what is sent: the
+     * denylist floor (hidden entries, the Jarvis data dir, /proc, /etc, AppData,
+     * credential locations) runs first and underneath, so a root set to `/` or a
+     * home directory still cannot reach a credential. A root that IS the home
+     * directory, an ancestor of it, or the filesystem root is dropped, since it
+     * would turn the allowed-roots rule back into the denylist it replaces.
+     */
+    upload_roots?: string[];
   };
   google?: GoogleConfig;
   channels?: ChannelConfig;
@@ -382,6 +837,8 @@ export type JarvisConfig = {
   voice?: VoiceConfig;
   desktop?: DesktopConfig;
   awareness?: AwarenessConfig;
+  /** Pebble overlay hotkeys. SYSTEM-owned; absent means the shipped defaults. */
+  pebble?: PebbleConfig;
   llm: LLMConfig;
   personality: {
     core_traits: string[];
@@ -397,6 +854,8 @@ export type JarvisConfig = {
     auto_commit: boolean;
     max_concurrent_servers: number;
   };
+  /** Tool-relevance filtering. SYSTEM-owned; absent means off. */
+  tools?: ToolsConfig;
   authority: AuthorityConfig;
   heartbeat: HeartbeatConfig;
   cron?: SystemCronConfig;
@@ -451,17 +910,14 @@ export const DEFAULT_CONFIG: JarvisConfig = {
   },
   desktop: {
     enabled: true,
-    sidecar_port: 9224,
-    auto_launch: true,
-    tree_depth: 5,
-    snapshot_max_elements: 60,
   },
   awareness: {
     enabled: true,
-    capture_interval_ms: 7000,
+    capture_interval_ms: 15000,
     min_change_threshold: 0.02,
     cloud_vision_enabled: true,
     cloud_vision_cooldown_ms: 30000,
+    cloud_vision_ambient_cooldown_ms: 900000,
     stuck_threshold_ms: 120000,
     struggle_grace_ms: 45000,
     struggle_cooldown_ms: 90000,
@@ -504,6 +960,21 @@ export const DEFAULT_CONFIG: JarvisConfig = {
       suggest_threshold: 5,
     },
     emergency_state: 'normal',
+    background: {
+      governed_categories: [
+        'execute_command', 'write_data', 'control_app',
+        'delete_data', 'install_software', 'modify_settings',
+        'send_email', 'send_message', 'make_payment',
+      ],
+    },
+    taint_gating: {
+      enabled: true,
+      governed_categories: [
+        'execute_command', 'write_data', 'control_app',
+        'delete_data', 'install_software', 'modify_settings',
+        'send_email', 'send_message', 'make_payment', 'spawn_agent',
+      ],
+    },
   },
   heartbeat: {
     interval_minutes: 15,
@@ -542,3 +1013,12 @@ export const USER_OWNED_SECTIONS = [
 ] as const satisfies readonly (keyof JarvisConfig)[];
 
 export type UserOwnedSection = (typeof USER_OWNED_SECTIONS)[number];
+
+/**
+ * The SYSTEM-owned keys of the otherwise user-owned `workflows` section:
+ * ready-made artifact paths a deployment (e.g. a managed host) writes into
+ * config.yaml. The FILE wins for these — loadConfig preserves them through
+ * the user-section discard and the DB merge re-applies them on top, so a
+ * dashboard save of the user-tunable workflow fields can never strip them.
+ */
+export const WORKFLOW_SYSTEM_KEYS = ["engine_dir", "pieces_dir", "piece_metadata_cache"] as const;

@@ -23,6 +23,20 @@ export interface Flow {
   status: FlowStatus;
   publishedVersionId: string | null;
   metadata: Record<string, unknown> | null;
+  /**
+   * Per-flow CODE-step permission. A flow containing a CODE step cannot be
+   * published, enabled or run until this is on, because a CODE step runs
+   * arbitrary JavaScript with the machine's full privileges. `grantedBy` is
+   * `upgrade` when the permission was inherited from a flow that was already
+   * running a CODE step before the gate existed, rather than chosen. Granted
+   * and revoked through `POST /api/workflows/:id/code-steps`; see
+   * `docs/WORKFLOW_AUTOMATION.md`.
+   */
+  codeSteps?: {
+    enabled: boolean;
+    grantedBy: "user" | "upgrade" | null;
+    grantedAt: number | null;
+  };
   created: number;
   updated: number;
   /** Filled in by the hook from /workflows/:id (latestDraft.displayName). */
@@ -30,6 +44,7 @@ export interface Flow {
 }
 
 export interface FlowRun {
+  cancellation?: { acknowledgedAt: number; inFlightMayHaveCompleted: boolean } | null;
   id: string;
   flowId: string;
   flowVersionId: string;
@@ -39,15 +54,34 @@ export interface FlowRun {
   finishTime: number | null;
   stepsCount: number | null;
   steps: Record<string, unknown> | null;
-  failedStep: { name: string; displayName: string } | null;
+  failedStep: { name: string; displayName: string; errorMessage?: string } | null;
   triggeredBy: string | null;
   created: number;
   updated: number;
 }
 
+/**
+ * `GET /api/workflows/:id/runs`, one page of a flow's runs, newest first.
+ * `nextOffset` is the `offset` of the next page when this one came back full,
+ * and null when it did not (#652). Neither hook pages yet: both show the
+ * newest page only.
+ */
+export interface FlowRunsPage {
+  items: FlowRun[];
+  nextOffset: number | null;
+}
+
 interface ActionResult {
   ok: boolean;
   message: string;
+}
+
+export const CANCELED_EFFECT_WARNING = "An action already started may have completed. Check its result before running again.";
+
+export function cancellationMessage(result: { accepted?: boolean; cancellation?: FlowRun["cancellation"] }): string {
+  if (result.accepted === false) return "Run already finished; its outcome is unchanged.";
+  if (result.accepted !== true) return "Cancellation requested.";
+  return result.cancellation?.inFlightMayHaveCompleted ? `Run stopped. ${CANCELED_EFFECT_WARNING}` : "Run stopped.";
 }
 
 /**
@@ -166,8 +200,8 @@ export function useWorkflowsData() {
     try {
       const res = await fetch(`/api/workflows/${flowId}/runs?limit=50`);
       if (!res.ok) throw new Error(`GET /api/workflows/${flowId}/runs -> ${res.status}`);
-      const list = (await res.json()) as FlowRun[];
-      setRuns((prev) => ({ ...prev, [flowId]: list }));
+      const page = (await res.json()) as FlowRunsPage;
+      setRuns((prev) => ({ ...prev, [flowId]: page.items }));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -285,7 +319,7 @@ export function useWorkflowsData() {
         return { ok: false, message: body?.error ?? `cancel failed: ${res.status}` };
       }
       if (selectedFlowId) void refreshRuns(selectedFlowId);
-      return { ok: true, message: "Run canceled" };
+      return { ok: true, message: cancellationMessage(await res.json()) };
     } catch (e) {
       return { ok: false, message: e instanceof Error ? e.message : String(e) };
     }

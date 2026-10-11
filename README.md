@@ -37,6 +37,7 @@ JARVIS is not a chatbot with tools. It is a persistent daemon that sees your scr
     - [One-liner](#one-liner)
     - [Manual](#manual)
   - [🚀 Usage](#-usage)
+    - [Keeping JARVIS running](#keeping-jarvis-running)
     - [Updating](#updating)
     - [Removing JARVIS](#removing-jarvis)
   - [🖥️ Sidecar Setup](#️-sidecar-setup)
@@ -69,7 +70,7 @@ JARVIS is not a chatbot with tools. It is a persistent daemon that sees your scr
 | Voice with wake word | No | Yes — streaming TTS + openwakeword |
 | Goal pursuit (OKRs) | No | Yes — drill sergeant accountability |
 | Authority gating | No | Yes — runtime enforcement + audit trail |
-| LLM provider choice | Usually locked to one | 5 providers: Anthropic, OpenAI, Gemini, Ollama, Groq |
+| LLM provider choice | Usually locked to one | Anthropic, OpenAI, Gemini, Ollama, Groq, OpenRouter, OmniRoute, and more |
 
 ---
 
@@ -94,8 +95,10 @@ bun run start
 
 What you get:
 
-- **Pebble** — a small paper-toned disc that follows your cursor. Wake-word ("Hey Jarvis"), `Ctrl+Space`, or click summons it. Long-press the disc to blind awareness instantly (privacy toggle); the eye glyph next to it shows when JARVIS is actively reading your screen.
-- **Native windows** — every dashboard room (workflows, memory, settings, …) opens as a real Windows window via voice ("open settings", "show me workflows") or `Ctrl+K`. No browser tab.
+- **Pebble** — a small paper-toned disc that follows your cursor. Wake-word ("Hey Jarvis"), `Ctrl+Shift+Space`, or click summons it. Long-press the disc to blind awareness instantly (privacy toggle); the eye glyph next to it shows when JARVIS is actively reading your screen.
+- **Native windows** — every dashboard room (workflows, memory, settings, …) opens as a real Windows window via voice ("open settings", "show me workflows") or `Ctrl+Shift+K`. No browser tab.
+
+  Both hotkeys changed in #563: they used to be `Ctrl+Space` and `Ctrl+K`, which collide with macOS's "select the previous input source" and with the system-wide Emacs kill-line binding that every text field honours. Set `pebble.summon_hotkey` / `pebble.palette_hotkey` in `~/.jarvis/config.yaml` to change them, or to `off` to have none. One cost worth knowing on **Windows and Linux**, where a hotkey is grabbed exclusively: while Jarvis runs it takes `Ctrl+Shift+K` away from Firefox's Web Console and VS Code's delete-line, and `Ctrl+Shift+Space` away from VS Code's parameter hints and Word's non-breaking space. On macOS those apps use Cmd for all four, so nothing is taken. See [docs/PEBBLE_HOTKEYS.md](docs/PEBBLE_HOTKEYS.md).
 - **Sub-pebble rail** — say "in the background, research X" and a colored sub-pebble flies to the right edge of your screen. Click it to see what the agent is doing; "open full ↗" pops a dedicated result panel.
 - **Voice-first** — "what's on my screen?", "close all background agents", "open the workflows window", "in the background, summarize today's meeting notes" — all routed inline, no LLM round-trip for the common verbs.
 
@@ -213,9 +216,86 @@ jarvis stop             # Stop the daemon
 jarvis status           # Check if running
 jarvis doctor           # Verify environment & connectivity
 jarvis logs -f          # Follow live logs
+jarvis autostart        # Keep it running across logins (and boots, on Linux)
 ```
 
 The dashboard is available at `http://localhost:3142` once the daemon is running.
+
+### Logs
+
+`jarvis start -d` writes the daemon's output to `~/.jarvis/logs/jarvis.log`, and
+`jarvis logs -f` follows it. Started any other way - in the foreground, under
+systemd, in Docker - there is no file: output goes to the terminal, `journalctl`
+or `docker logs`. To get the same file in every launch mode, add to
+`~/.jarvis/config.yaml`:
+
+```yaml
+daemon:
+  log_file_path: "~/.jarvis/logs/jarvis.log"
+  log_file_max_bytes: 1048576   # optional, defaults to 1 MiB
+```
+
+The daemon mirrors its output there in addition to wherever it already goes.
+Lines are timestamped, stripped of terminal colour codes, and run through the
+credential redactor, so the file is safe to hand to someone debugging. It is
+capped: past `log_file_max_bytes` the oldest lines are dropped, so it settles at
+roughly that size instead of filling the disk. Unset means no file.
+
+The cap is an in-memory ring as well as a file size, so `log_file_max_bytes` is
+an RSS budget too - 1 MiB of log is 1 MiB of daemon memory. It is clamped to
+4 KiB..64 MiB.
+
+One thing to expect from `jarvis logs -f`: it runs `tail -F`, and every time the
+cap is enforced the file is replaced, so `tail` reopens it and reprints the
+whole window. At the default size that is ~1 MiB of already-seen lines about
+every 256 KiB of new output. That is inherent to capping one file in place, not
+a bug.
+
+### Keeping JARVIS running
+
+`jarvis autostart` installs the service that starts JARVIS at login and brings it
+back after a crash: a **systemd user service** on Linux, a **launchd user agent**
+on macOS. Nothing else in JARVIS installs one, so until you run it the daemon
+only runs for as long as you keep it running yourself.
+
+```bash
+jarvis autostart              # install or refresh the definition, and start it
+jarvis autostart --status     # what is installed, and whether it is current
+jarvis autostart --uninstall  # stop the service and remove the definition
+```
+
+What it will and will not do:
+
+- **It never overwrites a definition that differs from the one this version
+  writes.** It prints the differences and writes nothing; `jarvis autostart
+  --force` applies them. An install from an older JARVIS and an edit of your own
+  look the same from here, and even the `bun` path differs between shells. On
+  Linux, `systemctl --user edit jarvis.service` is the way to keep your changes:
+  a drop-in survives a reinstall.
+- **It starts the service only when no daemon is running already.** The service
+  starts the daemon itself, so a second one would fail on the lock file. Pass
+  `--no-start` to install the definition without starting anything.
+- **A refresh does not restart a running daemon.** It keeps the definition it was
+  started with until it restarts, and the command prints the one line that
+  applies the new one.
+- **`jarvis stop` stays stopped.** Both definitions bring JARVIS back after a
+  failure only, never after a clean exit. The exception is a stop whose drain
+  overruns its deadline and escalates to `SIGKILL`: that is not a clean exit, so
+  it is relaunched. Remove autostart first if you need such a daemon to stay
+  down.
+- **A crash loop is bounded on Linux only.** systemd gives up after five starts
+  in two minutes and leaves the unit failed, which `jarvis status` explains.
+  launchd has no equivalent, so on macOS a daemon that cannot boot is retried
+  about every ten seconds for as long as you are logged in. A `jarvis restart`
+  there also leaves the new daemon outside the agent until your next login, and
+  says so.
+
+`jarvis status` names a definition that still has what this version fixed - a
+browser opening on every start, an unbounded restart loop, a `jarvis stop` that
+gets undone - whenever it can tell, and `jarvis uninstall` removes autostart for
+you, in the order that does not get the daemon relaunched mid-uninstall. See
+[Running under systemd](docs/SELF_HOSTING.md#running-under-systemd) for what
+changes once JARVIS is a unit's main process.
 
 ### Updating
 
@@ -229,6 +309,11 @@ The dashboard is available at `http://localhost:3142` once the daemon is running
 | Developer checkout | Refused — run `git pull` yourself |
 
 Run `jarvis doctor` to see what was detected and the exact commands for your install.
+
+**Under a systemd user service** (JARVIS is the main process of a unit such as `jarvis.service`), `jarvis update` and `jarvis restart` go through systemd instead of stopping and starting the daemon themselves. See [Running under systemd](docs/SELF_HOSTING.md#running-under-systemd) for the details. In short:
+
+- The update runs as a separate transient unit named `<unit>-update`, for example `jarvis-update`. It stops the service, installs, and starts the service again. From a terminal, `jarvis update` follows it until it finishes or hits its time limit. From anywhere else, including the assistant's own shell, it returns straight away. Follow it with `journalctl --user -u jarvis-update -f`, and `jarvis status` shows the last result.
+- `jarvis restart` asks systemd to restart the unit and ignores `-d`, `--port` and the other start flags.
 
 ### Removing JARVIS
 
@@ -293,15 +378,16 @@ Once connected, the sidecar appears as online in the Settings page where you can
 
 ### Versioning & updates
 
-The sidecar is versioned **independently of the brain** (`bun update -g @usejarvis/sidecar`, or grab a newer binary from [GitHub Releases](https://github.com/vierisid/jarvis/releases) -- the `sidecar-vX.Y.Z` releases). Run `jarvis --version` to see what you have.
+The sidecar is versioned **independently of the brain**, and every brain release ships with a specific sidecar version. Run `jarvis --version` to see what you have.
 
-On connect, the brain checks the sidecar's version against its compatibility floors and surfaces the result in **Settings -> Sidecar**:
+The sidecar updates itself to the version your brain ships with (never to anything newer than your brain knows about):
 
-- **OK** -- up to date enough; nothing to do.
-- **Update available** -- still compatible, but the brain recommends a newer sidecar; update when convenient.
-- **Update required** -- too old for this brain; the connection is refused and the sidecar logs an "update required" message. Update the sidecar and restart it.
+- **At startup**, if an update is available, the sidecar shows a prompt: *Update now*, *Later*, or *Skip this version* (Windows and macOS).
+- **While running**, the tray menu gets an *Update to vX.Y.Z* item, and the dashboard shows a *sidecar update* hint in the top bar and an *Update* button in **Settings -> Sidecar**. On Windows and macOS these open the same prompt on that machine; on Linux the dashboard installs the update directly after asking you.
+- The update is downloaded from npm, checked (sha512, plus the code signature on Windows and macOS) and swapped in place, and the sidecar restarts in a few seconds; the brain keeps working meanwhile. If the new version keeps failing to start, the previous one is restored.
+- A sidecar installed with bun or npm is updated with that package manager. If it cannot be updated automatically, you get the exact command to run instead (`bun add -g @usejarvis/sidecar@X.Y.Z`, or the installer from [GitHub Releases](https://github.com/vierisid/jarvis/releases/tag/installer-latest)).
 
-Local development builds report `dev` and are never blocked.
+If a sidecar is too old for the brain (**Update required**), the brain refuses the connection; the sidecar stays running, shows its update prompt (or a desktop notification on Linux) and tries the brain again every 30 minutes. Local development builds report `dev` and are never updated or blocked.
 
 ---
 
@@ -480,7 +566,7 @@ Full details: [docs/TELEMETRY.md](docs/TELEMETRY.md).
 
 ## 🔒 Security
 
-JARVIS includes a built-in authority engine that gates every action at runtime. All tool executions are logged in an audit trail, and sensitive operations require explicit approval via the dashboard, Telegram, or Discord. Emergency pause and kill controls are always available.
+JARVIS includes a built-in authority engine that gates every action at runtime. All tool executions are logged in an audit trail, and sensitive operations require explicit approval via the dashboard, Telegram, or Discord. Emergency pause and kill controls are always available. An approved action that a restart interrupted before its receipt shows up in Authority as unresolved: it is never rerun on its own, and you decide whether to run it once or close it.
 
 If you discover a security vulnerability, please report it privately by emailing the maintainer rather than opening a public issue.
 

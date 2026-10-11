@@ -7,7 +7,7 @@ import type {
   LLMTool,
   LLMToolCall,
 } from './provider.ts';
-import { classifyHttpStatus } from './provider.ts';
+import { classifyHttpStatus, LLMProviderError, parseRetryAfterMs } from './provider.ts';
 import { compactHistory, calculateHistoryBudget } from './history.ts';
 
 /**
@@ -29,11 +29,15 @@ export function modelRejectsCustomTemperature(model: string): boolean {
   return false;
 }
 
-type OpenAIContentPart =
-  | { type: 'text'; text: string }
+export type OpenAIContentPart =
+  // `cache_control` is the Anthropic prompt-cache breakpoint. It is only ever
+  // set by the hosted provider (src/llm/usejarvis.ts): LiteLLM forwards the
+  // marker to Anthropic when it rides on a content part, and every other
+  // upstream ignores the extra key.
+  | { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }
   | { type: 'image_url'; image_url: { url: string; detail?: 'auto' | 'low' | 'high' } };
 
-type OpenAIMessage = {
+export type OpenAIMessage = {
   role: 'system' | 'user' | 'assistant' | 'tool';
   // GPT-4o + later vision models accept an array of content parts on
   // user messages so images can travel inline. System / assistant /
@@ -80,6 +84,10 @@ type OpenAIResponse = {
     completion_tokens: number;
     total_tokens: number;
     prompt_tokens_details?: { cached_tokens?: number };
+    /** LiteLLM surfaces Anthropic's cache WRITE count here when proxying an
+     * Anthropic upstream. Folded into prompt_tokens, so it must be subtracted
+     * out of input_tokens the same way cached_tokens is. */
+    cache_creation_input_tokens?: number;
   };
 };
 
@@ -105,13 +113,31 @@ type OpenAIStreamChunk = {
     };
     finish_reason: 'stop' | 'length' | 'tool_calls' | 'content_filter' | null;
   }>;
+  /** Present (non-null) on at most one chunk when the request set
+   * stream_options.include_usage. WHERE it appears differs by backend:
+   * OpenAI sends a terminal chunk with an EMPTY choices array; the hosted
+   * LiteLLM proxy rides it on the LAST CONTENT chunk (choices=1) with no
+   * empty-choices terminal at all (platform-verified 2026-08-19). It must
+   * therefore be read on every chunk, outside the choices guard. */
+  usage?: OpenAIResponse['usage'] | null;
 };
+
+export function formatOpenAIHttpError(status: number, contentType: string | null, body: string): string {
+  const trimmed = body.trim();
+  if (contentType?.toLowerCase().includes('text/html') || /^<!doctype html|^<html/i.test(trimmed)) {
+    const title = trimmed.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1]?.trim();
+    return `HTTP ${status}: ${title || 'the server returned an HTML page instead of an OpenAI-compatible API response'}`;
+  }
+  const compact = trimmed.replace(/\s+/g, ' ');
+  return `HTTP ${status}${compact ? `: ${compact.slice(0, 500)}${compact.length > 500 ? '…' : ''}` : ''}`;
+}
 
 export class OpenAIProvider implements LLMProvider {
   name = 'openai';
   protected apiKey: string;
   protected defaultModel: string;
   protected baseUrl: string;
+  protected authHeader: string;
   protected get apiUrl(): string {
     return `${this.baseUrl}/chat/completions`;
   }
@@ -121,15 +147,63 @@ export class OpenAIProvider implements LLMProvider {
   protected get errorLabel(): string {
     return 'OpenAI';
   }
+  /** Whether stream() asks for stream_options.include_usage. Default false:
+   * only endpoints known to accept the field opt in (the hosted proxy
+   * overrides this) — an unknown property is a 400 on stricter backends. */
+  protected get streamIncludeUsage(): boolean {
+    return false;
+  }
 
-  constructor(apiKey: string, defaultModel = 'gpt-4o', baseUrl = 'https://api.openai.com/v1') {
+  /** Whether to omit a caller-supplied `temperature` for this model. Delegates
+   * to the by-name check by default; overridable because a provider whose model
+   * ids are OPAQUE (the hosted proxy's `uj-*` aliases) cannot tell from the name
+   * that the alias resolves to a reasoning model, so the name check never fires
+   * and every request 400s with "temperature does not support …". */
+  protected rejectsCustomTemperature(model: string): boolean {
+    return modelRejectsCustomTemperature(model);
+  }
+
+  constructor(apiKey: string, defaultModel = 'gpt-4o', baseUrl = 'https://api.openai.com/v1', authHeader = 'Authorization') {
     this.apiKey = apiKey;
     this.defaultModel = defaultModel;
     this.baseUrl = baseUrl.replace(/\/$/, '');
+    // `||` not the default param alone: a stored empty string would otherwise
+    // survive and produce a nameless header that fetch rejects at runtime.
+    this.authHeader = authHeader || 'Authorization';
+  }
+
+  protected requestHeaders(includeContentType = true): Record<string, string> {
+    const headers: Record<string, string> = includeContentType ? { 'Content-Type': 'application/json' } : {};
+    if (this.apiKey) {
+      headers[this.authHeader] = this.authHeader.toLowerCase() === 'authorization'
+        ? `Bearer ${this.apiKey}`
+        : this.apiKey;
+    }
+    return headers;
+  }
+
+  /**
+   * `base` lets a subclass aim one request at an alternate root without
+   * touching shared state. Passing it explicitly (rather than swapping
+   * `this.baseUrl` around the call) is what keeps concurrent requests from
+   * reading each other's root.
+   */
+  protected postChat(body: Record<string, unknown>, base = this.baseUrl, signal?: AbortSignal, checkDeadline?: () => void): Promise<Response> {
+    const serializedBody = JSON.stringify(body);
+    checkDeadline?.();
+    signal?.throwIfAborted();
+    return fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: this.requestHeaders(),
+      body: serializedBody,
+      // Only when the caller set one: aborting is what frees the provider-side
+      // slot of a request the manager has already timed out and retried.
+      ...(signal ? { signal } : {}),
+    });
   }
 
   async chat(messages: LLMMessage[], options: LLMOptions = {}): Promise<LLMResponse> {
-    const { model = this.defaultModel, temperature, max_tokens, tools, tool_choice } = options;
+    const { model = this.defaultModel, temperature, max_tokens, tools, tool_choice, signal } = options;
 
     // Compact history for large contexts (128k token limit)
     const budget = calculateHistoryBudget(128000);
@@ -140,7 +214,7 @@ export class OpenAIProvider implements LLMProvider {
       messages: this.convertMessages(compactedMessages),
     };
 
-    if (temperature !== undefined && !modelRejectsCustomTemperature(model)) {
+    if (temperature !== undefined && !this.rejectsCustomTemperature(model)) {
       body.temperature = temperature;
     }
     if (max_tokens !== undefined) body.max_completion_tokens = max_tokens;
@@ -149,20 +223,18 @@ export class OpenAIProvider implements LLMProvider {
       body.tool_choice = tool_choice || 'auto';  // Enable tool calling
     }
 
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-    if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
-
-    const response = await fetch(this.apiUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    });
+    const response = await this.postChat(body, undefined, signal, options.checkDeadline);
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`${this.errorLabel} API error (${response.status}): ${errorText}`);
+      // Typed, with the server's Retry-After: the manager keys retry, pause and
+      // failover on these. A plain Error left it guessing from the text, and a
+      // 429 was retried three times with no pause at all.
+      throw new LLMProviderError(
+        `${this.errorLabel} API error: ${formatOpenAIHttpError(response.status, response.headers.get('content-type'), errorText)}`,
+        classifyHttpStatus(response.status),
+        parseRetryAfterMs(response.headers),
+      );
     }
 
     const data = await response.json() as OpenAIResponse;
@@ -170,7 +242,7 @@ export class OpenAIProvider implements LLMProvider {
   }
 
   async *stream(messages: LLMMessage[], options: LLMOptions = {}): AsyncIterable<LLMStreamEvent> {
-    const { model = this.defaultModel, temperature, max_tokens, tools, tool_choice } = options;
+    const { model = this.defaultModel, temperature, max_tokens, tools, tool_choice, signal } = options;
 
     // Compact history for large contexts (128k token limit)
     const budget = calculateHistoryBudget(128000);
@@ -181,8 +253,9 @@ export class OpenAIProvider implements LLMProvider {
       messages: this.convertMessages(compactedMessages),
       stream: true,
     };
+    if (this.streamIncludeUsage) body.stream_options = { include_usage: true };
 
-    if (temperature !== undefined && !modelRejectsCustomTemperature(model)) {
+    if (temperature !== undefined && !this.rejectsCustomTemperature(model)) {
       body.temperature = temperature;
     }
     if (max_tokens !== undefined) body.max_completion_tokens = max_tokens;
@@ -191,23 +264,16 @@ export class OpenAIProvider implements LLMProvider {
       body.tool_choice = tool_choice || 'auto';  // Enable tool calling
     }
 
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-    if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
-
-    const response = await fetch(this.apiUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    });
+    const response = await this.postChat(body, undefined, signal);
 
     if (!response.ok) {
       const errorText = await response.text();
+      const retryAfterMs = parseRetryAfterMs(response.headers);
       yield {
         type: 'error',
-        error: `${this.errorLabel} API error (${response.status}): ${errorText}`,
+        error: `${this.errorLabel} API error: ${formatOpenAIHttpError(response.status, response.headers.get('content-type'), errorText)}`,
         code: classifyHttpStatus(response.status),
+        ...(retryAfterMs !== undefined ? { retry_after_ms: retryAfterMs } : {}),
       };
       return;
     }
@@ -222,6 +288,7 @@ export class OpenAIProvider implements LLMProvider {
     const toolCallBuilders: Map<number, { id: string; name: string; arguments: string }> = new Map();
     let finishReason: string | null = null;
     let responseModel = model;
+    let streamUsage: OpenAIResponse['usage'] | null = null;
 
     try {
       const reader = response.body.getReader();
@@ -244,6 +311,10 @@ export class OpenAIProvider implements LLMProvider {
 
           try {
             const chunk = JSON.parse(data) as OpenAIStreamChunk;
+            // Capture usage from WHICHEVER chunk carries it (last one wins),
+            // before the choices guard: OpenAI attaches it to an empty-choices
+            // terminal chunk, the hosted proxy to the last content chunk.
+            if (chunk.usage) streamUsage = chunk.usage;
             if (chunk.choices && chunk.choices.length > 0) {
               const choice = chunk.choices[0];
               responseModel = chunk.model;
@@ -307,7 +378,11 @@ export class OpenAIProvider implements LLMProvider {
         response: {
           content: accumulatedText,
           tool_calls: toolCalls,
-          usage: { input_tokens: 0, output_tokens: 0 }, // OpenAI doesn't provide usage in stream
+          // Real usage when the endpoint honoured include_usage (the hosted
+          // proxy does); zeros only where usage genuinely isn't streamed.
+          usage: streamUsage
+            ? this.normalizeUsage(streamUsage)
+            : { input_tokens: 0, output_tokens: 0 },
           model: responseModel,
           finish_reason: mappedFinishReason,
         },
@@ -319,8 +394,7 @@ export class OpenAIProvider implements LLMProvider {
 
   async listModels(): Promise<string[]> {
     try {
-      const headers: Record<string, string> = {};
-      if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
+      const headers = this.requestHeaders(false);
       const response = await fetch(this.modelsUrl, { headers });
 
       if (!response.ok) {
@@ -330,21 +404,23 @@ export class OpenAIProvider implements LLMProvider {
       const data = await response.json() as { data: Array<{ id: string }> };
       return data.data
         .map(m => m.id)
-        .filter(id => id.startsWith('gpt-'))
+        .filter(id => id.startsWith('gpt-') || /^o\d/.test(id)) // gpt-* + the o-series (o1/o3/o4-mini…)
         .sort();
     } catch (err) {
-      // Fallback to known models if API call fails
+      // Fallback to known models if the live /models call fails.
       return [
-        'gpt-4o',
-        'gpt-4o-mini',
-        'gpt-4-turbo',
-        'gpt-4',
-        'gpt-3.5-turbo',
+        'gpt-5.5',
+        'gpt-5.5-pro',
+        'gpt-5.4',
+        'gpt-5-mini',
+        'o4-mini',
       ];
     }
   }
 
-  private convertMessages(messages: LLMMessage[]): OpenAIMessage[] {
+  /** protected so subclasses can decorate the wire messages — the hosted
+   * provider attaches Anthropic cache breakpoints here (src/llm/usejarvis.ts). */
+  protected convertMessages(messages: LLMMessage[]): OpenAIMessage[] {
     return messages.map(m => {
       // Multi-modal user messages (T19 region capture) need the image to
       // ride alongside the text. OpenAI's vision API takes a content
@@ -419,19 +495,36 @@ export class OpenAIProvider implements LLMProvider {
     return {
       content,
       tool_calls,
-      usage: {
-        // Normalized semantics (see LLMResponse.usage): input_tokens counts
-        // only UNCACHED prompt tokens. OpenAI's prompt_tokens includes cached
-        // tokens, so subtract them out; Anthropic already reports cache
-        // tokens separately from input_tokens.
-        input_tokens: response.usage.prompt_tokens
-          - (response.usage.prompt_tokens_details?.cached_tokens ?? 0),
-        output_tokens: response.usage.completion_tokens,
-        ...(response.usage.prompt_tokens_details?.cached_tokens !== undefined
-          ? { cache_read_input_tokens: response.usage.prompt_tokens_details.cached_tokens } : {}),
-      },
+      usage: this.normalizeUsage(response.usage),
       model: response.model,
       finish_reason: this.mapFinishReason(choice!.finish_reason),
+    };
+  }
+
+  /** Wire usage → LLMResponse usage. Normalized semantics (see
+   * LLMResponse.usage): input_tokens counts only UNCACHED prompt tokens.
+   * OpenAI's prompt_tokens includes cached tokens, so subtract them out;
+   * Anthropic already reports cache tokens separately from input_tokens.
+   *
+   * Clamped at zero: the subtraction assumes the proxy folds
+   * cache_creation_input_tokens into prompt_tokens (true for current LiteLLM
+   * Anthropic mappings, not guaranteed across versions/routes) — an unfolded
+   * report would otherwise persist a NEGATIVE count into llm_usage and skew
+   * /api/usage totals downward.
+   *
+   * cache_creation_input_tokens passes through when present: `0` is exactly
+   * the signal that Anthropic silently declined to cache — the one field
+   * that distinguishes "working" from "declined every time". */
+  protected normalizeUsage(usage: OpenAIResponse['usage']): LLMResponse['usage'] {
+    return {
+      input_tokens: Math.max(0, usage.prompt_tokens
+        - (usage.prompt_tokens_details?.cached_tokens ?? 0)
+        - (usage.cache_creation_input_tokens ?? 0)),
+      output_tokens: usage.completion_tokens,
+      ...(usage.prompt_tokens_details?.cached_tokens !== undefined
+        ? { cache_read_input_tokens: usage.prompt_tokens_details.cached_tokens } : {}),
+      ...(usage.cache_creation_input_tokens !== undefined
+        ? { cache_creation_input_tokens: usage.cache_creation_input_tokens } : {}),
     };
   }
 

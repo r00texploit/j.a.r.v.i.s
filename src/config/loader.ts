@@ -2,13 +2,92 @@ import YAML from 'yaml';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { JarvisConfig } from './types.ts';
-import { DEFAULT_CONFIG, USER_OWNED_SECTIONS } from './types.ts';
+import { DEFAULT_CONFIG, USER_OWNED_SECTIONS, WORKFLOW_SYSTEM_KEYS } from './types.ts';
+import { requirePort } from './port.ts';
+import { resolveAllowProcessInspection } from './process-inspection.ts';
 
 function expandTilde(filepath: string): string {
+  // YAML happily produces a boolean, a number or null for a key that LOOKS
+  // like a path (`log_file_path: true`, `log_file_path: 42`), and this used to
+  // throw `filepath.startsWith is not a function` from inside loadConfig - so
+  // the daemon died reporting "Failed to parse config file", which is not what
+  // went wrong. Hand a non-string straight back and let the caller decide.
+  if (typeof filepath !== 'string') return filepath;
   if (filepath.startsWith('~/')) {
     return join(homedir(), filepath.slice(2));
   }
   return filepath;
+}
+
+/**
+ * Drop `daemon.log_file_path` unless it is actually a string. Everything
+ * downstream calls `.trim()` and `openSync()` on it, and a YAML `true` or `42`
+ * would take the daemon down at boot with a misleading parse error.
+ */
+function normalizeLogFilePath(config: JarvisConfig): void {
+  const value = config.daemon.log_file_path as unknown;
+  if (value === undefined || value === null) {
+    config.daemon.log_file_path = undefined;
+    return;
+  }
+  if (typeof value !== 'string') {
+    console.warn(`daemon.log_file_path must be a string, got ${typeof value}; ignoring it (no log file will be written)`);
+    config.daemon.log_file_path = undefined;
+    return;
+  }
+  // The sink opens this with openSync, which does not understand `~`.
+  config.daemon.log_file_path = expandTilde(value);
+}
+
+/**
+ * Make `daemon.port` a number, or refuse to load the config.
+ *
+ * Here rather than at each call site because there is no single call site: the
+ * daemon binds this value and `jarvis stop` reads the same key out of the YAML
+ * separately (src/cli/lifecycle.ts). Both now go through `readPortSetting`, so
+ * `port: "8080"` and `port: 8080` resolve to the same 8080 on both paths -- a
+ * quoted port used to bind 8080 while `jarvis stop` targeted 3142 (#550).
+ *
+ * A value that is not a port at all throws, which makes `jarvis start` fail
+ * with the reason instead of binding somewhere unexpected. The file existing at
+ * all already makes its problems fatal (see the YAML errors above), and unlike
+ * `JARVIS_PORT` -- ignored when invalid, because a stale shell export must not
+ * stop the daemon -- a config file is edited on purpose.
+ *
+ * This runs BEFORE applyEnvOverrides: a broken `daemon.port` is reported even
+ * when `JARVIS_PORT` would have overridden it, so the typo gets fixed rather
+ * than lurking until the env var is gone. It applies in unix-socket mode too,
+ * where the port is never bound; a port-shaped key that is not a port is worth
+ * the same message wherever it is read from.
+ */
+function normalizeDaemonPort(config: JarvisConfig, path: string): void {
+  const port = requirePort(config.daemon.port as unknown, `daemon.port in ${path}`);
+  // `absent` cannot happen once DEFAULT_CONFIG has merged in its 3142, but an
+  // explicit `port:` with no value parses as null and lands here.
+  if (port === undefined) config.daemon.port = DEFAULT_CONFIG.daemon.port;
+  else config.daemon.port = port;
+}
+
+/**
+ * Make `daemon.allow_process_inspection` a real boolean, or leave the daemon
+ * hardened (#546).
+ *
+ * Written BACK into the config, not merely validated: the startup path tests
+ * the value with `=== true`, so `allow_process_inspection: yes` -- a STRING in
+ * the YAML 1.2 core schema the parser uses -- would otherwise leave the hatch
+ * silently shut for exactly the spelling the coercion exists to accept.
+ *
+ * Unlike normalizeDaemonPort this does not throw for a value it cannot read.
+ * There is one reader of this key and a malformed value has a safe reading
+ * (harden, which is the default), so a typo here warns rather than taking
+ * `jarvis devices`, `jarvis export` and the setup script down with it. See
+ * src/config/process-inspection.ts for the full reasoning.
+ */
+function normalizeAllowProcessInspection(config: JarvisConfig, path: string): void {
+  config.daemon.allow_process_inspection = resolveAllowProcessInspection(
+    config.daemon.allow_process_inspection as unknown,
+    `daemon.allow_process_inspection in ${path}`,
+  );
 }
 
 export function deepMerge(target: any, source: any): any {
@@ -55,7 +134,12 @@ export function applyEnvOverrides(config: JarvisConfig): void {
 
   if (env.JARVIS_PORT) {
     const port = parseInt(env.JARVIS_PORT, 10);
-    if (!isNaN(port)) config.daemon.port = port;
+    // Range-checked, so the CLI and the daemon cannot disagree about the port:
+    // src/cli/lifecycle.ts resolves the dashboard URL in this same precedence
+    // and rejects anything outside 1..65535, and a JARVIS_PORT of 0 (bind
+    // anywhere) or 70000 (bind nothing) accepted only here would have the daemon
+    // on one port and every printed URL on another (#544).
+    if (Number.isInteger(port) && port >= 1 && port <= 65535) config.daemon.port = port;
   }
 
   if (env.JARVIS_HOME) {
@@ -71,6 +155,10 @@ export function applyEnvOverrides(config: JarvisConfig): void {
 
   if (env.JARVIS_BRAIN_DOMAIN) {
     config.daemon.brain_domain = env.JARVIS_BRAIN_DOMAIN;
+  }
+
+  if (env.JARVIS_PUBLIC_URL) {
+    config.daemon.public_url = env.JARVIS_PUBLIC_URL;
   }
 
   if (env.JARVIS_WAKE_ENGINE) {
@@ -91,6 +179,28 @@ export function applyEnvOverrides(config: JarvisConfig): void {
     const v = env.JARVIS_REALTIME_VOICE.trim().toLowerCase();
     config.voice.realtime.enabled = v !== '' && v !== '0' && v !== 'false' && v !== 'no';
   }
+
+  // Tool relevance filtering (docs/tool-relevance-filtering.md). The kill
+  // switch: `off` wins over the config file, which is what an operator
+  // reaches for when the filter misbehaves. Applied here so it survives the
+  // user-section discard the same way JARVIS_WAKE_ENGINE does -- although
+  // `tools` is not a user-owned section, so it would survive anyway.
+  //
+  // An unrecognised value is ignored rather than guessed at; the policy
+  // resolver (actions/tools/tool-relevance/policy.ts) re-reads the same env
+  // var and owns the precedence rules.
+  if (env.JARVIS_TOOL_FILTER !== undefined) {
+    const v = env.JARVIS_TOOL_FILTER.trim().toLowerCase();
+    const on = v === 'on' || v === '1' || v === 'true' || v === 'yes';
+    const off = v === 'off' || v === '0' || v === 'false' || v === 'no';
+    if (on || off) {
+      if (!config.tools) config.tools = {};
+      if (!config.tools.relevance_filter) config.tools.relevance_filter = {};
+      config.tools.relevance_filter.enabled = on;
+    } else {
+      console.warn(`[Config] Invalid JARVIS_TOOL_FILTER="${env.JARVIS_TOOL_FILTER}" - must be on|off; ignoring.`);
+    }
+  }
 }
 
 export async function loadConfig(configPath?: string): Promise<JarvisConfig> {
@@ -104,6 +214,12 @@ export async function loadConfig(configPath?: string): Promise<JarvisConfig> {
     const config = structuredClone(DEFAULT_CONFIG);
     config.daemon.data_dir = expandTilde(config.daemon.data_dir);
     config.daemon.db_path = expandTilde(config.daemon.db_path);
+    // log_file_path has no default, so there is nothing to expand here - but
+    // the two branches must stay symmetrical or the next key added to one of
+    // them gets expanded in only half the cases.
+    normalizeLogFilePath(config);
+    normalizeDaemonPort(config, path);
+    normalizeAllowProcessInspection(config, path);
     applyEnvOverrides(config);
     return config;
   }
@@ -130,6 +246,9 @@ export async function loadConfig(configPath?: string): Promise<JarvisConfig> {
   // Expand tilde in paths
   config.daemon.data_dir = expandTilde(config.daemon.data_dir);
   config.daemon.db_path = expandTilde(config.daemon.db_path);
+  normalizeLogFilePath(config);
+  normalizeDaemonPort(config, path);
+  normalizeAllowProcessInspection(config, path);
 
   // Apply environment variable overrides
   applyEnvOverrides(config);
@@ -150,10 +269,31 @@ export async function loadConfig(configPath?: string): Promise<JarvisConfig> {
   // daemon after the DB merge.
   for (const section of USER_OWNED_SECTIONS) {
     const def = (DEFAULT_CONFIG as Record<string, unknown>)[section];
+    // `workflows` is user-owned EXCEPT its system path keys (ready-made
+    // artifact locations a deployment writes into the file): those survive
+    // the discard, and user-settings' merge keeps them file-authoritative.
+    let preserved: Record<string, unknown> | null = null;
+    if (section === "workflows") {
+      const current = (config as Record<string, unknown>)[section];
+      if (current && typeof current === "object") {
+        for (const key of WORKFLOW_SYSTEM_KEYS) {
+          const v = (current as Record<string, unknown>)[key];
+          if (typeof v === "string" && v.trim()) {
+            (preserved ??= {})[key] = v;
+          }
+        }
+      }
+    }
     if (def === undefined) {
       delete (config as Record<string, unknown>)[section];
     } else {
       (config as Record<string, unknown>)[section] = structuredClone(def);
+    }
+    if (preserved) {
+      (config as Record<string, unknown>)[section] = {
+        ...((config as Record<string, unknown>)[section] as object | undefined),
+        ...preserved,
+      };
     }
   }
   applyEnvOverrides(config); // env wins over the discard (e.g. JARVIS_WAKE_ENGINE)
@@ -182,6 +322,56 @@ export async function readRawConfigFile(
   return (doc.toJS() ?? {}) as Record<string, unknown>;
 }
 
+
+/**
+ * Re-read ONLY the SYSTEM-owned `usejarvis_ai` block from config.yaml into
+ * the live config. Backs SIGHUP / POST /api/config/reload so a provisioner
+ * key rotation (or un-hosting) takes effect without a daemon restart.
+ *
+ * File-authoritative semantics: a missing file or absent block clears the
+ * block (the install is no longer hosted). An unreadable/corrupt file keeps
+ * the current in-memory value and warns — a transient write race must not
+ * un-host a running install.
+ */
+export async function reloadUsejarvisAiBlock(
+  config: JarvisConfig,
+  configPath?: string,
+): Promise<void> {
+  await reloadSystemBlock(config, 'usejarvis_ai', configPath);
+}
+
+/**
+ * Re-read ONLY the SYSTEM-owned `usejarvis_billing` block, with exactly the
+ * semantics of `reloadUsejarvisAiBlock`: a converge that rotates the billing
+ * secret or moves the endpoint lands on SIGHUP without a restart.
+ */
+export async function reloadUsejarvisBillingBlock(
+  config: JarvisConfig,
+  configPath?: string,
+): Promise<void> {
+  await reloadSystemBlock(config, 'usejarvis_billing', configPath);
+}
+
+async function reloadSystemBlock(
+  config: JarvisConfig,
+  key: 'usejarvis_ai' | 'usejarvis_billing',
+  configPath?: string,
+): Promise<void> {
+  try {
+    const raw = await readRawConfigFile(configPath);
+    const block = raw?.[key];
+    if (block && typeof block === 'object' && !Array.isArray(block)) {
+      (config as Record<string, unknown>)[key] = block;
+    } else {
+      delete config[key];
+    }
+  } catch (err) {
+    console.warn(
+      `[Config] Could not re-read the ${key} block from config.yaml; keeping the current value:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
 
 // NOTE: there is intentionally no saveConfig here. The brain treats
 // config.yaml as READ-ONLY system configuration (network/hosting keys,

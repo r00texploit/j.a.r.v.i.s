@@ -25,10 +25,10 @@ describe('NON_BROWSER_TOOLS', () => {
 });
 
 describe('createBrowserTools', () => {
-  test('returns 7 browser tools', () => {
+  test('returns 9 browser tools', () => {
     const ctrl = new BrowserController(9999);
     const tools = createBrowserTools(ctrl);
-    expect(tools).toHaveLength(7);
+    expect(tools).toHaveLength(9);
   });
 
   test('all tools have browser category', () => {
@@ -46,7 +46,9 @@ describe('createBrowserTools', () => {
     expect(names).toEqual([
       'browser_click',
       'browser_evaluate',
+      'browser_hover',
       'browser_navigate',
+      'browser_press_key',
       'browser_screenshot',
       'browser_scroll',
       'browser_snapshot',
@@ -54,12 +56,80 @@ describe('createBrowserTools', () => {
     ]);
   });
 
-  test('BUILTIN_TOOLS = NON_BROWSER_TOOLS + 8 browser + 9 desktop tools', () => {
-    expect(BUILTIN_TOOLS).toHaveLength(NON_BROWSER_TOOLS.length + 8 + 9);
+  test('BUILTIN_TOOLS = NON_BROWSER_TOOLS + 10 browser + 9 desktop + 2 ui + 3 skill tools', () => {
+    expect(BUILTIN_TOOLS).toHaveLength(NON_BROWSER_TOOLS.length + 10 + 9 + 2 + 3);
   });
 });
 
 describe('BrowserController parameterization', () => {
+  test('approval guards reject a disconnected or replaced CDP session', async () => {
+    let peer: { close(): void } | undefined;
+    let browserPeer: { close(): void } | undefined;
+    const server = Bun.serve<{ path: string }>({
+      port: 0,
+      fetch(req, server) {
+        const path = new URL(req.url).pathname;
+        // /browser is the browser-level socket the request guard (#521)
+        // attaches to before the page; only the page socket is `peer`.
+        if (path === '/page' || path === '/browser') {
+          if (server.upgrade(req, { data: { path } })) return;
+          return new Response('upgrade failed', { status: 400 });
+        }
+        if (path === '/json/version') {
+          return Response.json({ webSocketDebuggerUrl: `ws://127.0.0.1:${server.port}/browser` });
+        }
+        return Response.json(path === '/json/list'
+          ? [{ type: 'page', url: 'about:blank', webSocketDebuggerUrl: `ws://127.0.0.1:${server.port}/page` }]
+          : {});
+      },
+      websocket: {
+        open(ws) {
+          if (ws.data.path === '/page') peer = ws;
+          else browserPeer = ws;
+        },
+        message(ws, message) {
+          const request = JSON.parse(String(message));
+          ws.send(JSON.stringify({ id: request.id, result: {} }));
+        },
+      },
+    });
+    const ctrl = new BrowserController(server.port!);
+    try {
+      const initialNavigation = ctrl.captureApprovalGuard(true);
+      expect(initialNavigation()).toBe(true);
+      expect(ctrl.captureApprovalGuard()()).toBe(false);
+      await ctrl.connect();
+      expect(initialNavigation()).toBe(false);
+      const original = ctrl.captureApprovalGuard();
+      expect(original()).toBe(true);
+      await ctrl.disconnect();
+      expect(original()).toBe(false);
+      await ctrl.connect();
+      expect(original()).toBe(false);
+      const replacement = ctrl.captureApprovalGuard();
+      expect(replacement()).toBe(true);
+      peer!.close();
+      for (let i = 0; i < 100 && replacement(); i++) await Bun.sleep(5);
+      expect(replacement()).toBe(false);
+      await ctrl.disconnect();
+      // Losing the request guard's socket ends Chrome's interception, so it
+      // invalidates an approval exactly like losing the page socket.
+      await ctrl.connect();
+      const guarded = ctrl.captureApprovalGuard();
+      expect(guarded()).toBe(true);
+      browserPeer!.close();
+      for (let i = 0; i < 100 && guarded(); i++) await Bun.sleep(5);
+      expect(guarded()).toBe(false);
+      await ctrl.disconnect();
+      const lazy = ctrl.captureApprovalGuard(true);
+      await ctrl.disconnect();
+      expect(lazy()).toBe(false);
+    } finally {
+      await ctrl.disconnect();
+      server.stop(true);
+    }
+  });
+
   test('accepts custom port', () => {
     const ctrl = new BrowserController(9223);
     // Should not throw — port is stored internally

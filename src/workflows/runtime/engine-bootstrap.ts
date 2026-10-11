@@ -27,6 +27,10 @@ import {
   findCachedBundle,
 } from "../runner/engine-runtime/build";
 import { buildAllJarvisPieces } from "../runner/engine-runtime/build-pieces";
+import {
+  pruneEngineBundleCache,
+  reapOrphanedEngines,
+} from "../runner/engine-runtime/engine-reaper";
 import { EngineRuntime } from "../runner/engine-runtime/engine-runtime";
 import {
   SandboxApi,
@@ -35,6 +39,7 @@ import {
 import {
   buildPieceCatalog,
   computeCatalogCacheKey,
+  readCachedEntries,
   PieceCatalog,
   type PieceExtractionFailure,
 } from "./piece-catalog";
@@ -65,6 +70,37 @@ export interface BootstrapWorkflowEngineOptions {
    * will be added here.
    */
   pieceRoots?: string[];
+  /**
+   * Idle TTL for the warm engine subprocess (see EngineRuntimeOptions.
+   * poolIdleTtlMs). Default: EngineRuntime's own 5-minute default.
+   */
+  engineIdleTtlMs?: number;
+  /**
+   * Shared-runtime paths, config-resolved by the daemon (see
+   * shared-runtime-paths.ts). `undefined` = fall back to the bare env vars;
+   * `null` = definitively none. config.yaml is the hosting-owned source of
+   * truth; the env vars are the fallback for unmanaged deployments.
+   */
+  sharedPiecesDir?: string | null;
+  sharedCacheFile?: string | null;
+  engineCacheRoot?: string | null;
+  /**
+   * Engine bundle cache retention (see `pruneEngineBundleCache`). Omitted
+   * fields take the pruner's defaults; `{ keep: 0, maxAgeMs: 0 }` disables
+   * pruning entirely.
+   */
+  engineCacheRetention?: { keep?: number; maxAgeMs?: number };
+  /**
+   * Skip the start-up reap + prune.
+   *
+   * Defaults to TRUE under `bun test` (NODE_ENV=test), because both halves
+   * reach outside the process: one signals other processes on the machine,
+   * the other deletes from the developer's real `~/.jarvis/cache`. A test
+   * that boots the daemon should not do either by accident -- same reasoning
+   * as the key guard in `src/workflows/db/encryption.ts`. Pass `false`
+   * explicitly to exercise maintenance from a test (with a temp cache dir).
+   */
+  skipEngineMaintenance?: boolean;
 }
 
 export interface BootstrapWorkflowEngineResult {
@@ -80,11 +116,11 @@ export interface BootstrapWorkflowEngineResult {
    */
   bundleHash: string;
   /**
-   * Content-hash key used to invalidate the on-disk piece-catalog
-   * cache. Combines the bundle hash with every piece's compiled
-   * output, so any source-level edit forces a fresh extraction. Logged
-   * alongside `bundleHash` so users can confirm cache freshness from
-   * the daemon log alone.
+   * GLOBAL cache-invalidation key for the piece-metadata cache: projection
+   * schema + engine bundle + event-type registry. Per-piece source changes
+   * invalidate their own cache ENTRY (content hash), not this key. Logged
+   * alongside `bundleHash` so users can confirm cache freshness from the
+   * daemon log alone.
    */
   catalogCacheKey: string;
   /** Tear down the SandboxApi server. Call after the worker has stopped. */
@@ -140,10 +176,10 @@ export async function bootstrapWorkflowEngine(
     labelled(
       "bundle-build",
       (async () => {
-        let c = findCachedBundle();
+        let c = findCachedBundle({ sharedRoot: opts.engineCacheRoot });
         if (!c) {
           log("engine bundle not in cache; building (one-time cost ~700ms)");
-          c = await buildEngineBundle();
+          c = await buildEngineBundle({ sharedRoot: opts.engineCacheRoot });
         }
         return c;
       })(),
@@ -152,6 +188,44 @@ export async function bootstrapWorkflowEngine(
     labelled("sandbox-api-start", api.start({ host: opts.host ?? "127.0.0.1", port: 0 })),
   ]);
   log(`bundle + pieces + sandbox api ready in ${Date.now() - t0}ms (${api.baseUrl})`);
+
+  // 3b. Reclaim what previous runs left behind (#491). Deliberately AFTER the
+  // bundle is resolved: the pruner protects the bundle we are about to use,
+  // and the reaper's grace window must not sit in front of the boot path.
+  // Both are best-effort -- neither is worth failing a daemon start over --
+  // and both are no-ops on a machine with nothing to clean.
+  const skipMaintenance =
+    opts.skipEngineMaintenance ?? process.env["NODE_ENV"] === "test";
+  if (!skipMaintenance) {
+    void (async () => {
+      // Null (not empty) until the reap succeeds: an empty list would tell
+      // the pruner "nothing is running, and I checked", when in fact nobody
+      // checked. It falls back to scanning for itself.
+      let liveElsewhere: string[] | null = null;
+      try {
+        const { reaped, live } = await reapOrphanedEngines({ log: (m) => log(m) });
+        if (reaped.length === 0) log("no orphaned engine subprocesses found");
+        liveElsewhere = live.map((e) => resolve(e.bundlePath, ".."));
+      } catch (e) {
+        log(`engine reap failed (continuing): ${(e as Error).message}`);
+      }
+      try {
+        pruneEngineBundleCache({
+          ...(opts.engineCacheRetention ?? {}),
+          protect: [resolve(cached.bundlePath, "..")],
+          // The reap above already walked /proc; hand its answer over rather
+          // than paying for a second walk on the boot path.
+          ...(liveElsewhere ? { inUseBundleDirs: liveElsewhere } : {}),
+          log: (m) => log(m),
+        });
+      } catch (e) {
+        log(`engine bundle cache prune failed (continuing): ${(e as Error).message}`);
+      }
+    })().catch(() => {
+      // Even the log sink can throw. Startup maintenance is never worth an
+      // unhandled rejection.
+    });
+  }
 
   // 4. Build the EngineRuntime against the bundle. One runtime is shared
   // across all RUN_FLOW jobs + trigger hook calls. Pooling is enabled so
@@ -166,13 +240,28 @@ export async function bootstrapWorkflowEngine(
   // both at runtime: vendored pieces resolve via the standard upstream
   // layout, user-installed pieces via our patched shared-node_modules
   // shape (see piece-loader.ts).
+  //
+  // JARVIS_SHARED_PIECES_DIR (multi-tenant hosting): a root-owned READ-ONLY
+  // catalog tree built once per installed version. Appended AFTER the user's
+  // own dir so a user-installed piece shadows the shared copy (both the
+  // loader walk and discoverPieces are first-wins). The installer/reconciler
+  // never touch it — they operate solely on `~/.jarvis/pieces`.
+  const sharedPiecesDir =
+    opts.sharedPiecesDir !== undefined
+      ? opts.sharedPiecesDir
+      : process.env.JARVIS_SHARED_PIECES_DIR?.trim() || null;
   const runtime = new EngineRuntime({
     api,
     bundlePath: cached.bundlePath,
+    // What the lookup or build verified, re-checked at every spawn for this
+    // runtime's whole life (#671, #762); null for an adopted per-user bundle.
+    expectedDigest: cached.digest,
     pool: true,
+    poolIdleTtlMs: opts.engineIdleTtlMs,
     customPiecesPaths: [
       resolve(ENGINE_BUILD_PATHS.VENDOR_PACKAGES, "pieces"),
       piecesBaseDir(),
+      ...(sharedPiecesDir ? [sharedPiecesDir] : []),
     ],
   });
 
@@ -188,19 +277,45 @@ export async function bootstrapWorkflowEngine(
   const pieceRoots = opts.pieceRoots ?? [
     resolve(ENGINE_BUILD_PATHS.VENDOR_PACKAGES, "pieces/jarvis"),
     resolve(piecesNodeModulesDir(), "@activepieces"),
+    // Shared catalog last: discoverPieces is first-wins, so a user install
+    // of the same piece shadows the shared copy here too.
+    ...(sharedPiecesDir ? [resolve(sharedPiecesDir, "node_modules/@activepieces")] : []),
   ];
-  const cacheKey = computeCatalogCacheKey({
-    bundlePath: cached.bundlePath,
-    pieceRoots,
-  });
+  const cacheKey = computeCatalogCacheKey({ bundlePath: cached.bundlePath });
   const cacheFile = opts.cacheFile ?? DEFAULT_CACHE_FILE;
+  // JARVIS_PIECE_METADATA_CACHE: a READ-ONLY prebuilt metadata cache for the
+  // shared tree (generated at version-install time). With it, first boot is
+  // a cache hit for every shared piece — no 650-piece extraction spike.
+  const sharedCacheFile =
+    opts.sharedCacheFile !== undefined
+      ? opts.sharedCacheFile
+      : process.env.JARVIS_PIECE_METADATA_CACHE?.trim() || null;
+  // A CONFIGURED shared cache that exists but fails the global-key gate means
+  // the host's artifacts don't match this daemon (a bundle rebuilt locally,
+  // or shared artifacts not regenerated for a daemon change). The fallback —
+  // every tenant re-extracting the whole shared catalog — is a fleet-wide
+  // storm, so say so LOUDLY instead of silently filtering to nothing.
+  if (sharedCacheFile && existsSync(sharedCacheFile)) {
+    if (readCachedEntries(sharedCacheFile, cacheKey) === null) {
+      log(
+        `WARNING: shared piece-metadata cache ${sharedCacheFile} does not match this daemon's ` +
+          `catalog key — falling back to per-tenant extraction (were the shared artifacts ` +
+          `rebuilt for this version?)`,
+      );
+    }
+  }
   const t2 = Date.now();
-  const cacheHitBeforeBuild = existsSync(cacheFile);
+  const cacheFilePresent = existsSync(cacheFile);
   const { catalog, failures } = await buildPieceCatalog({
     runtime,
     pieceRoots,
     cacheFile,
     cacheKey,
+    sharedCacheFiles: sharedCacheFile ? [sharedCacheFile] : [],
+    // A shared tree can hold the whole 650-piece catalog; if its prebuilt
+    // cache was rejected (warning above) the default 60s deadline would mark
+    // hundreds of pieces failed. Give the recovery path room instead.
+    ...(sharedPiecesDir ? { overallTimeoutMs: 15 * 60_000 } : {}),
     reporter: (m) => log(m),
   });
   const extractMs = Date.now() - t2;
@@ -208,7 +323,7 @@ export async function bootstrapWorkflowEngine(
     log(`catalog built with ${failures.length} extraction failure(s); pieces still available: ${catalog.list().length} (${extractMs}ms)`);
   } else {
     log(
-      `catalog built (${catalog.list().length} pieces, cache: ${cacheHitBeforeBuild ? "hit" : "miss"}, ${extractMs}ms)`,
+      `catalog built (${catalog.list().length} pieces, cache file ${cacheFilePresent ? "present" : "absent"}, ${extractMs}ms)`,
     );
   }
 

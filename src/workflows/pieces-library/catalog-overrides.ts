@@ -17,6 +17,8 @@
  *                        broken. Overrides the generated versionRange +
  *                        vettedVersion. Drop the entry once the next upstream
  *                        release fixes the issue.
+ *   - `VERIFIED_UPGRADE_REVIEWED` Sign-offs for verified bumps the sync held
+ *                        for a raised classification or removed props.
  *   - `SIZE_OVERRIDE`    Hand-measured `estimatedSizeMb`. The sync script
  *                        can't probe sizes without doing a real bun install
  *                        per piece (slow + flaky in CI), so verified pieces
@@ -45,6 +47,10 @@
  *      gmail.send_email) through the engine via /api/workflows/:id/run.
  *   4. Land the id here + add a vettedAt entry in VERIFIED_METADATA below
  *      with the date you ran the checks.
+ *   5. Land a governed adapter for it in
+ *      `src/workflows/runtime/piece-effects.ts`, so its actions carry an
+ *      Authority category and a reviewable target. Verified means vetted AND
+ *      governed; every id below has one.
  */
 export const VERIFIED: ReadonlySet<string> = new Set<string>([
   "gmail",
@@ -86,6 +92,23 @@ export const EXCLUDED: ReadonlySet<string> = new Set<string>([
 ]);
 
 /**
+ * Verified upgrades a person has read and signed off, as id -> version.
+ *
+ * The catalog sync bumps a verified piece by itself when its governed adapter
+ * still covers the new version (see `scripts/lib/verified-upgrade.ts`). Two
+ * findings hold a bump for a person instead: an existing action whose upstream
+ * classification got more severe, and an existing action that lost props. Once
+ * you have checked the adapter still fits, add the version here and the next
+ * sync run takes it. Unmapped actions are NOT cleared by this: map them.
+ *
+ * Example:
+ *   gmail: "0.18.0",
+ */
+export const VERIFIED_UPGRADE_REVIEWED: Record<string, string> = {
+  // (empty -- add entries when the review issue asks for one)
+};
+
+/**
  * Hold-back pins. Each entry forces a specific versionRange + vettedVersion
  * regardless of what the sync script discovered on npm. Use sparingly --
  * pinning means you're now responsible for unpinning when the upstream fix
@@ -100,14 +123,17 @@ export const VERSION_PIN: Record<
 > = {
   // github 0.6 line never made it to npm even though it was in the
   // monorepo's package.json; npm tops out at 0.6.7. Force the working 0.7.
+  // Both are verified pieces, so the range is the exact vetted version like
+  // every other verified entry; the pin only exists to move off the
+  // unpublished line.
   github: {
-    versionRange: "^0.7.0",
+    versionRange: "0.7.3",
     vettedVersion: "0.7.3",
     reason: "0.6.x in monorepo never published to npm",
   },
   // telegram-bot's 0.6.x line never reached npm; latest there is 0.5.7.
   "telegram-bot": {
-    versionRange: "^0.5.0",
+    versionRange: "0.5.7",
     vettedVersion: "0.5.7",
     reason: "0.6.x not published to npm",
   },

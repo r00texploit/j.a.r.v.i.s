@@ -201,12 +201,13 @@ async function evalInScope(js: string, contextAsScope: Record<string, unknown>, 
             scriptContext: contextAsScope,
             functions,
         })
-        return result ?? ''
+        if (result === undefined) throw new Error('Workflow reference resolved to an absent value; supply a value or an explicit fallback')
+        return result
     }))
 
     if (resultError) {
-        console.warn('[evalInScope] Error evaluating variable', resultError)
-        return ''
+        // Jarvis: an unsupported expression must stop the step before any effect.
+        throw resultError
     }
     return result ?? ''
 }

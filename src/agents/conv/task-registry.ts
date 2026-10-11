@@ -22,7 +22,7 @@
 import type { Database } from 'bun:sqlite';
 import type { LLMMessage } from '../../llm/provider.ts';
 import type { TaskRecord, TaskRequest, TaskResultEnvelope, TaskStatus } from './task-envelope.ts';
-import { newTaskId } from './task-envelope.ts';
+import { isTaskTemplate, isTaskTier, newTaskId } from './task-envelope.ts';
 
 type Listener = (record: TaskRecord) => void;
 type DbResolver = () => Database | null;
@@ -32,6 +32,27 @@ export class TaskRegistry {
   private listeners: Set<Listener> = new Set();
   private readonly maxKeepCompleted: number;
   private resolveDb: DbResolver;
+  /**
+   * Whether each database's `tasks` table has the `context_key` column (#571).
+   *
+   * Keyed on the resolved handle, not a single flag on this registry: the DB
+   * resolver is lazy precisely so it can tolerate a re-open between hot
+   * reloads, and a flag memoized against the old handle would be applied to
+   * the new one. Memoized `true` onto a database without the column makes
+   * EVERY insert throw into the swallowing catch -- the "durability stops for
+   * the whole product with one log line" failure this probe exists to prevent,
+   * relocated to the re-open case.
+   *
+   * Resolved from `PRAGMA table_info` rather than assumed, because the
+   * migration is an `ALTER TABLE` in a swallowing try/catch
+   * (vault/schema.ts). If the ALTER were skipped on an older database while
+   * `persist` still named the column, EVERY insert would throw and be
+   * warned-and-dropped -- task durability, the only reason this table
+   * exists, would stop for the whole product with one log line as the
+   * signal. Branching the statement instead degrades to "scope not
+   * persisted", which `resume` then treats as a mismatch and refuses.
+   */
+  private readonly contextColumn = new WeakMap<Database, boolean>();
 
   constructor(opts?: { maxKeepCompleted?: number; db?: DbResolver | Database | null }) {
     // How many completed/failed/cancelled tasks to retain in-memory for the
@@ -98,11 +119,15 @@ export class TaskRegistry {
    * Create a fresh task record in `queued` state. Caller should attach an
    * AbortController and transition to `running` when the task tier starts.
    */
-  create(request: TaskRequest, subsystem: string): TaskRecord {
+  create(request: TaskRequest, subsystem: string, contextKey?: string): TaskRecord {
     const now = Date.now();
     const record: TaskRecord = {
       id: newTaskId(),
       request,
+      // Which chat this came from. Set here, from the dispatcher's turn
+      // context, so it never passes through the model-shaped request object
+      // (#571; see TaskRecord.contextKey).
+      ...(contextKey ? { contextKey } : {}),
       subsystem,
       status: 'queued',
       startedAt: now,
@@ -125,10 +150,21 @@ export class TaskRegistry {
     );
   }
 
-  /** Most recently updated completed/failed/cancelled tasks (newest first). */
-  recentResults(limit: number = 5): TaskRecord[] {
+  /**
+   * Most recently updated completed/failed/cancelled tasks (newest first).
+   *
+   * `where` is applied BEFORE the limit, which matters because this registry is
+   * process-global and shared by every chat. The conv orchestrator asks for the
+   * five most recent results from ITS OWN chat context (#571); filtering after
+   * the slice let a busy site chat evict the main chat's own results from the
+   * main chat's router prompt, whereupon the router -- per its own instruction
+   * that the dialogue shows what was discussed, not what is true -- re-delegates
+   * work it had just done.
+   */
+  recentResults(limit: number = 5, where?: (record: TaskRecord) => boolean): TaskRecord[] {
     const done = Array.from(this.tasks.values()).filter(t =>
-      t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled',
+      (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled')
+      && (where ? where(t) : true),
     );
     return done.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, limit);
   }
@@ -236,6 +272,29 @@ export class TaskRegistry {
     }
   }
 
+  /** Whether this database's `tasks` table carries `context_key`. Memoized. */
+  private contextColumnPresent(db: Database): boolean {
+    const cached = this.contextColumn.get(db);
+    if (cached !== undefined) return cached;
+    let present: boolean;
+    try {
+      const cols = db.query<{ name: string }, []>('PRAGMA table_info(tasks)').all();
+      present = cols.some((c) => c.name === 'context_key');
+    } catch {
+      // Unknown means do not name the column: a persist that works without
+      // the scope beats a persist that throws with it.
+      present = false;
+    }
+    this.contextColumn.set(db, present);
+    if (!present) {
+      // Once per database rather than once per process, so a re-open onto a
+      // migrated database is not silently judged by the old one's answer.
+      console.warn('[TaskRegistry] tasks.context_key is missing; a paused task will not '
+        + 'remember which chat created it and will refuse to resume in a scoped one (#571)');
+    }
+    return present;
+  }
+
   /**
    * Mirror a record to the `tasks` table. Best-effort: persistence failures
    * never break the live registry (caller has already mutated the cache).
@@ -243,12 +302,13 @@ export class TaskRegistry {
   private persist(record: TaskRecord): void {
     const db = this.resolveDb();
     if (!db) return;
+    const withContext = this.contextColumnPresent(db);
     try {
       db.run(
         `INSERT INTO tasks (
           id, status, tier, template, intent, original_message, subsystem,
-          started_at, updated_at, result_json, question, paused_conversation
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          started_at, updated_at, result_json, question, paused_conversation${withContext ? ',\n          context_key' : ''}
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${withContext ? ', ?' : ''})
         ON CONFLICT(id) DO UPDATE SET
           status = excluded.status,
           tier = excluded.tier,
@@ -259,7 +319,7 @@ export class TaskRegistry {
           updated_at = excluded.updated_at,
           result_json = excluded.result_json,
           question = excluded.question,
-          paused_conversation = excluded.paused_conversation`,
+          paused_conversation = excluded.paused_conversation${withContext ? ',\n          context_key = excluded.context_key' : ''}`,
         [
           record.id,
           record.status,
@@ -273,6 +333,7 @@ export class TaskRegistry {
           record.result ? JSON.stringify(record.result) : null,
           record.question ?? null,
           record.pausedConversation ? JSON.stringify(record.pausedConversation) : null,
+          ...(withContext ? [record.contextKey ?? null] : []),
         ],
       );
     } catch (err) {
@@ -294,17 +355,31 @@ type TaskRow = {
   result_json: string | null;
   question: string | null;
   paused_conversation: string | null;
+  /** Absent on a pre-migration database; see TaskRegistry.contextColumnPresent. */
+  context_key?: string | null;
 };
 
 function rowToRecord(row: TaskRow): TaskRecord {
   const record: TaskRecord = {
     id: row.id,
     request: {
-      tier: row.tier as TaskRecord['request']['tier'],
-      template: row.template as TaskRecord['request']['template'],
+      // Validated, not cast. A row from another build, a downgraded build or a
+      // tampered database otherwise reaches `TEMPLATE_PROMPTS[template]` on
+      // resume and puts the literal string "undefined" into the task tier's
+      // system prompt -- the same defect the `delegate` validators close on the
+      // live path (#571). Falling back keeps the task resumable with a sane
+      // prompt instead of dropping the user's paused work.
+      tier: isTaskTier(row.tier) ? row.tier : 'medium',
+      template: isTaskTemplate(row.template) ? row.template : 'general',
       intent: row.intent,
       ...(row.original_message ? { original_message: row.original_message } : {}),
     },
+    // Restored so a task resumed after a restart is still recognised as
+    // belonging to the chat that created it (#571). Kept as the RAW key and
+    // never resolved into a policy: `resume` compares keys, so a key this
+    // build no longer produces fails closed (it matches no live turn) instead
+    // of reading as "no scope" and running with the full registry.
+    ...(row.context_key ? { contextKey: row.context_key } : {}),
     subsystem: row.subsystem,
     status: row.status as TaskStatus,
     startedAt: row.started_at,

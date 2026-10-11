@@ -8,8 +8,72 @@
 
 import type { SidecarManager } from '../../sidecar/manager.ts';
 import type { SidecarCapability, SidecarInfo } from '../../sidecar/types.ts';
+import {
+  familyLabel,
+  hostTarget,
+  osFamily,
+  type ExecutionTarget,
+} from '../../util/execution-environment.ts';
+import { isNoLocalTools } from './local-tools-guard.ts';
+import { ActionOutcomeError, type ActionFailure } from '../action-outcome.ts';
+import { SidecarRPCError } from '../../sidecar/rpc.ts';
+import { compareSemver, parseSemver } from '../../sidecar/compat.ts';
+import { getMachineScope } from '../machine-scope.ts';
+import type { ToolResult } from './registry.ts';
+import { currentReviewedExecution, type ReviewedExecution } from './reviewed-call-scope.ts';
+import { currentTemplateDeliveryScope } from './template-delivery-scope.ts';
+import { currentLoopSnapshotReadLog, type SnapshotReadLog } from './snapshot-read-log.ts';
+import { guardImageSize, type ContentBlock } from '../../llm/provider.ts';
+import { SCREENSHOT_COMPACT } from '../app-control/image-compact.ts';
 
 let sidecarManager: SidecarManager | null = null;
+
+/**
+ * RPC error codes a sidecar sends for a request it refused before acting
+ * (codedError in sidecar/client.go). Every other handler error may follow a
+ * partial effect.
+ *
+ * MEMBERSHIP IS A CLAIM, not a label. Listing a code here asserts that the
+ * handler had not acted yet when it produced that code, and the model is
+ * entitled to retry or reword without checking the machine first. So the set
+ * stays a short allow-list and the DEFAULT -- for a code this brain has never
+ * heard of as much as for one it has -- is `may_have_occurred`.
+ *
+ * `HANDLER_PANIC` (#623) is the code that makes the default load-bearing, and
+ * it is deliberately ABSENT here. A recovered panic cannot establish that
+ * nothing happened: `runRPCHandler` (sidecar/client.go) wraps the WHOLE
+ * handler, so the panic may be the type assertion on the first line or the line
+ * after a click, a keystroke or a file write, and the recover sees no
+ * difference. Adding it would turn a crash of unknown effect into a promise
+ * that the machine is untouched -- the one inference the sidecar cannot support
+ * and the one a model acts on. It is not listed, and `sidecar-route.test.ts`
+ * fails if it becomes listed; `rpc_handler_panic_test.go` pins the other half,
+ * that the sidecar's own message carries the uncertainty rather than claiming a
+ * refusal, but it knows nothing about this set.
+ *
+ * `DESKTOP_STALE_ELEMENT` (#661) is every refusal of a desktop element id the
+ * sidecar could not confirm is still the element its snapshot listed -- never
+ * minted, gone, moved, re-pointed, superseded by a newer snapshot, or a window
+ * it could not re-read. Each is returned before the first click, keystroke or
+ * pattern call, which `desktop_element_stale_linux_test.go` pins by checking
+ * that no pointer or keyboard command ran.
+ *
+ * `DESKTOP_TARGET_OBSCURED` (#705) is a click refused because the window under
+ * the element's centre is not the element's own: covered, minimised, on another
+ * workspace. Returned before any button goes down; on Linux the pointer has
+ * moved to look (`desktop_pointer_target_linux_test.go` pins that nothing was
+ * clicked), on Windows it has not (uia_element_guard_windows_test.go).
+ *
+ * `BROWSER_SNAPSHOT_SUPERSEDED` (#676) is a reviewed browser click, type or
+ * hover refused because the element map is no longer on the generation the
+ * call was reviewed against, or because the generation it carried was
+ * unreadable. `refuseStaleElement` (sidecar/browser_snapshot.go) returns it
+ * before its first CDP command; `browser_elem_gen_test.go` pins that nothing
+ * reached the browser.
+ */
+const NOT_STARTED_RPC_CODES = new Set([
+  'DESKTOP_INVALID_KEYS', 'DESKTOP_STALE_ELEMENT', 'DESKTOP_TARGET_OBSCURED', 'BROWSER_SNAPSHOT_SUPERSEDED',
+]);
 
 /**
  * Inject the sidecar manager at startup. Called once from the daemon.
@@ -30,6 +94,12 @@ export function getSidecarManager(): SidecarManager | null {
  * connected, instead of falling back to legacy local controllers.
  */
 export function autoTargetForCapability(cap: SidecarCapability): string | null {
+  const scope = getMachineScope();
+  if (scope) {
+    const target = scope.resolveTarget(undefined, cap);
+    scope.assertDispatch(target, cap);
+    return target;
+  }
   if (!sidecarManager) return null;
   for (const s of sidecarManager.listSidecars()) {
     if (!s.connected) continue;
@@ -40,10 +110,93 @@ export function autoTargetForCapability(cap: SidecarCapability): string | null {
 }
 
 /**
+ * The live execution inventory: every enrolled sidecar plus the brain's own
+ * host, each with the OS it runs. Feeds the workflow composer's prompts and
+ * the agent's tool guide, so both write commands for the machine a step
+ * actually lands on instead of whichever OS the model's priors favour.
+ *
+ * Offline sidecars stay in the list: a workflow composed today runs on a
+ * schedule tomorrow, and the laptop asleep right now is still the machine the
+ * user means. Dropping it would leave the composer writing commands for the
+ * Linux server the brain happens to live on.
+ *
+ * The host is omitted under --no-local-tools, where it refuses every call --
+ * counting it would let a hosted brain's own OS excuse commands that can only
+ * ever run on the user's sidecar.
+ */
+export function collectExecutionTargets(): ExecutionTarget[] {
+  const targets: ExecutionTarget[] = [];
+  try {
+    for (const s of sidecarManager?.listSidecars() ?? []) {
+      targets.push({
+        id: s.id,
+        name: s.name,
+        os: s.os ?? null,
+        // SidecarInfo.platform carries GOARCH, not an OS. See ExecutionTarget.
+        arch: s.platform ?? null,
+        connected: s.connected,
+        ...(s.capabilities ? { capabilities: [...s.capabilities] } : {}),
+      });
+    }
+  } catch {
+    // Registry unavailable (DB not open yet, sidecars disabled). Report what
+    // we can rather than nothing.
+  }
+  if (!isNoLocalTools()) targets.push(hostTarget());
+  return targets;
+}
+
+/** A machine's name plus its OS, for an error a human has to act on. */
+function describeMachine(sidecar: SidecarInfo): string {
+  const fam = osFamily(sidecar.os);
+  return fam ? `${sidecar.name}, ${familyLabel(fam)}` : sidecar.name;
+}
+
+/**
+ * Pick the stack that will serve one tool call, and say which it was.
+ *
+ * Two implementations back every desktop_* and browser_* tool: the Go
+ * sidecar, and the daemon's own local controllers. Which one runs depends on
+ * whether a sidecar is connected, and the choice used to be made in silence,
+ * so "it works sometimes" was untraceable after the fact. One line per call
+ * names the stack that answered.
+ *
+ * An explicit target is passed through verbatim; findSidecar trims before
+ * matching, so there is nothing to gain by doing it twice, and the log line
+ * then shows exactly what the caller asked for. A blank string counts as no
+ * target at all and falls through to auto-selection.
+ *
+ * `quiet` drops the line and nothing else (#675). It is for a caller that
+ * resolves only to COMPARE routes -- `browserCallGuard`, at review and again
+ * at approval -- where the line would announce a dispatch that never
+ * happened. Resolution, the machine scope's fence included, is identical
+ * either way. Every call that actually dispatches leaves it unset, so the
+ * default is the loud one.
+ */
+export function resolveToolTarget(
+  explicit: unknown,
+  capability: SidecarCapability,
+  tool: string,
+  opts: { quiet?: boolean } = {},
+): string | null {
+  const named = typeof explicit === 'string' && explicit.trim() ? explicit : null;
+  const scope = getMachineScope();
+  const target = scope ? scope.resolveTarget(named, capability) : named ?? autoTargetForCapability(capability);
+  scope?.assertDispatch(target, capability);
+  if (opts.quiet) return target;
+  console.log(
+    target
+      ? `[${capability}] ${tool} -> sidecar stack (target=${target}, ${named ? 'explicit' : 'auto'})`
+      : `[${capability}] ${tool} -> local stack`,
+  );
+  return target;
+}
+
+/**
  * Find a sidecar by name or ID.
  * Priority: exact ID → exact name (case-insensitive) → contains match.
  */
-function findSidecar(nameOrId: string, sidecars: SidecarInfo[]): SidecarInfo | null {
+export function findSidecar(nameOrId: string, sidecars: SidecarInfo[]): SidecarInfo | null {
   const query = nameOrId.trim();
   if (!query) return null;
 
@@ -62,6 +215,395 @@ function findSidecar(nameOrId: string, sidecars: SidecarInfo[]): SidecarInfo | n
 }
 
 /**
+ * What a dispatch produced: either the sidecar's own reply, or a message this
+ * module wrote about why there is no reply.
+ *
+ * The split exists so a caller can tell the two apart (#583). Collapsing both to
+ * a string is right for a tool whose result is text, and wrong for one that must
+ * also read a STRUCTURAL field off the reply: "no sidecar found" and "the
+ * sidecar replied" would then be the same kind of value, and the caller would
+ * have to tell them apart by parsing the very text it was trying not to parse.
+ */
+type SidecarDispatch =
+  | { readonly kind: 'reply'; readonly result: unknown; readonly sidecarId: string }
+  | {
+      readonly kind: 'message';
+      readonly text: string;
+      /**
+       * Which refusal this was, for a caller that must tell them apart (#591),
+       * and why it is not read off the text.
+       *
+       * `METHOD_NOT_FOUND` is the case that forces it. The code means the
+       * sidecar does not HAVE the method, which in practice means it is older
+       * than this brain -- a different condition from a capability the operator
+       * turned off, and since #605 the two carry different messages naming
+       * different remedies. The text is still not what a caller classifies on:
+       * display text is written for the model and may be reworded, while a
+       * caller like #591's coordinate probe needs the condition itself.
+       *
+       * OPTIONAL because not every message has one: the still-running
+       * `run_command` note and a rethrown `ActionOutcomeError` are written as
+       * literals rather than through `fail`. A consumer must DEFAULT its reason
+       * rather than assume a code is present.
+       *
+       * NOT a complete classification on its own. The catch below also matches
+       * `METHOD_NOT_FOUND` as a SUBSTRING of the error message when
+       * `typedErrors` is false, which predates typed codes and is left alone --
+       * so a remote sidecar whose message happens to contain that literal can
+       * have its own coded refusal relabelled. Both outcomes are still "no
+       * answer", so it costs a diagnosis and never a wrong answer.
+       *
+       * `routeToSidecar` and `routeBrowserReadToSidecar` read only `.text`, so
+       * adding this changes nothing for either.
+       */
+      readonly code?: string;
+    };
+
+/**
+ * Where a sidecar's version sits against the newest one this brain ships, for
+ * the refusals whose remedy depends on it (#605), plus the parenthetical that
+ * says so in the message.
+ *
+ * THREE-WAY, and ORDERED rather than compared for identity. Both obligations
+ * matter and they are mirrors of each other: an absent version must read as
+ * absent and never as current, and a current version must never read as skew.
+ * Getting the second wrong is #605's own bug inverted -- telling the user to
+ * update a sidecar that is already the newest one available is exactly as
+ * unactionable as telling them to check a config file that is fine. A sidecar
+ * AHEAD of the brain is a supported configuration (src/sidecar/compat.ts: "a
+ * new sidecar release needs no brain change to be considered ok"), so it counts
+ * as 'current', not as a mismatch.
+ *
+ * `latest_version` is the sidecar version THIS BRAIN SHIPS
+ * (SIDECAR_LATEST_VERSION), which is the number the user can actually reach.
+ * The daemon's own version is deliberately not used: it is a different series,
+ * and naming it would send the user looking for a sidecar release that does not
+ * exist.
+ *
+ * 'unknown' covers a dev build, an unparseable stamp and a sidecar that
+ * reported nothing. `parseSemver` is used rather than `isUpdateAvailable`
+ * because the latter answers a different question -- it refuses a
+ * non-canonical stamp like `0.10.0+local` outright, where for a diagnosis that
+ * build is perfectly comparable.
+ *
+ * Versions are printed as stored, with no "v" prefix added, because some are
+ * already prefixed and some carry a `+local` suffix.
+ */
+function sidecarStanding(sidecar: SidecarInfo): {
+  readonly age: 'behind' | 'current' | 'unknown';
+  readonly note: string;
+} {
+  const reported = sidecar.version;
+  if (!reported) return { age: 'unknown', note: '' };
+  const v = parseSemver(reported);
+  const latest = sidecar.latest_version ? parseSemver(sidecar.latest_version) : null;
+  if (!v || !latest) return { age: 'unknown', note: ` (it reports ${reported})` };
+  return compareSemver(v, latest) < 0
+    ? { age: 'behind', note: ` (it reports ${reported}; this brain ships ${sidecar.latest_version})` }
+    : { age: 'current', note: ` (it reports ${reported}, the newest sidecar this brain knows of)` };
+}
+
+/**
+ * Fields a sidecar handler uses to say what went wrong, most specific first.
+ *
+ * A CLOSED list in a fixed order, because the handlers are not uniform: Linux
+ * `focus_window` reports `{success:false, pid, error: <the error Go returned>}`
+ * while `launch_app`'s negative probes report `{success:false, pid, note: <why
+ * no window appeared>}` (sidecar/desktop_linux.go). `message` sits between them
+ * for a handler that spells it the third way.
+ *
+ * How much of this is really the REMOTE machine's words varies, and the
+ * difference is worth knowing before trusting a field: `runWithTimeout` builds
+ * its error with `cmd.Output()` and never reads `ExitError.Stderr`, so
+ * `focus_window`'s `error` is "exit status 1" rather than anything xdotool
+ * said. `runProbe` keeps stderr deliberately, which is why `launch_app`'s note
+ * genuinely does quote another process. Treated alike regardless: which handler
+ * on which OS answered is not something this function can see.
+ *
+ * Order, not a search for the longest value: `error` is the field a handler
+ * uses when it has a cause to report, and a reply carrying both should be read
+ * for that rather than for a note explaining what to do next. A sidecar can
+ * therefore demote a real cause into `note` by also sending a bland `error` --
+ * which is no worse than before, since one that lies in a field could equally
+ * have lied in the whole blob, and the `note` is still carried in the tail. The
+ * three known sentence fields get the full budget there for that reason.
+ */
+const REPLY_FAILURE_FIELDS = ['error', 'message', 'note'] as const;
+
+/** Longest remote string carried into one of these messages. */
+const MAX_REPLY_FIELD_CHARS = 600;
+
+/** Longest remote string carried as an incidental trailing `key=value` pair. */
+const MAX_REPLY_TAIL_CHARS = 120;
+
+/** Longest key NAME rendered in the tail; a key is a label, not a payload. */
+const MAX_REPLY_KEY_CHARS = 40;
+
+/** Most trailing pairs rendered, so the field count cannot be the payload. */
+const MAX_REPLY_TAIL_PAIRS = 12;
+
+/** Longest whole description this builds, tail and all. */
+const MAX_REPLY_DESCRIPTION_CHARS = 1200;
+
+/** Cut a remote string to a budget, saying so rather than cutting silently. */
+function boundRemote(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, max)}... (truncated, was ${s.length} chars)` : s;
+}
+
+/**
+ * What a negative reply says failed, in prose, with its remaining fields after
+ * it (#627).
+ *
+ * The old spelling was `JSON.stringify(reply)`, which is correct about losing
+ * nothing and wrong about everything else: a `{success:false, error:"..."}`
+ * reached the model as a serialised struct with the one field it needed buried
+ * inside it. So the handler's own sentence leads, and the rest of the reply
+ * follows as `[pid=7]` instead of being dropped -- the issue asks only for the
+ * readable field, but the pid and the note surviving together was a deliberate
+ * earlier decision on this path and prose keeps both.
+ *
+ * TYPE-CHECKED, not cast, for the reason `readSidecarPageReply` states below:
+ * the value came from `JSON.parse` on another machine, through a validator that
+ * preserves arrays and objects verbatim (sidecar/validator.ts), so an
+ * `{error: ["..."]}` would coerce into a sentence under a `string` annotation
+ * TypeScript erases at runtime. A non-string `error` is therefore not read as
+ * the sentence; it goes in the tail as the value it is.
+ *
+ * BOUNDED IN TOTAL, not per field. Every remote string is cut, AND so are the
+ * key names, the number of pairs and the finished sentence -- because each of
+ * those is separately attacker-chosen: a reply of five thousand small keys, one
+ * twenty-thousand-element array value, or one twenty-thousand-character key
+ * name each produced tens of kilobytes from per-field caps alone. The reply
+ * itself is only soft-limited, by the websocket's payload ceiling.
+ *
+ * Downstream caps exist but are not a substitute: `markUntrustedToolFailure`
+ * cuts the model-facing copy at `MAX_TOOL_RESULT_CHARS`, and nothing cuts the
+ * copies that get logged or stored. (It would also be the wrong cut to rely on
+ * here -- `describeMachine` is at the START of this message and there is no
+ * remedy clause after the interpolation, so an end-truncation would take this
+ * text rather than the sentence around it.)
+ *
+ * NOT a machine-readable rendering, and not pretending to be one. A remote
+ * machine can put `[pid=1]` or a truncation marker inside its own `error`
+ * string and have it render indistinguishably from the real tail, and a key
+ * name containing `=` can manufacture a pair. `JSON.stringify` was unambiguous
+ * by construction and this is not. Accepted because the consumer is a model
+ * reading a framed block for a sentence, the worst outcome is a misattributed
+ * field, and the thing actually acted on -- the code, status and effect triple
+ * -- is not built from this string at all.
+ *
+ * Still only a READABILITY change: the caller's triple is untouched, which is
+ * what #605 established and #620 verified. The try/catch is what makes that
+ * structural rather than circumstantial -- this runs inside `dispatchToSidecar`'s
+ * `try`, so a throw here would be relabelled `SIDECAR_OUTCOME_UNKNOWN` by the
+ * catch below and silently change the outcome. `JSON.stringify` cannot throw on
+ * a `JSON.parse` product, so this is a guard against a future caller rather than
+ * a live bug.
+ *
+ * And it does NOT frame the text -- framing this path is #629's subject, and it
+ * happens at the model boundary. Which means this helper must not be reused in
+ * front of a PERSON without a `forCard`-style reduction: dropping the old
+ * `JSON.stringify` also dropped its incidental escaping, so newlines, C0 and
+ * bidi characters now reach the string as themselves.
+ */
+function describeReplyFailure(reply: Record<string, unknown>): string {
+  try {
+    return boundRemote(replyFailureSentence(reply), MAX_REPLY_DESCRIPTION_CHARS);
+  } catch {
+    return '(the reply could not be rendered)';
+  }
+}
+
+function replyFailureSentence(reply: Record<string, unknown>): string {
+  const field = REPLY_FAILURE_FIELDS.find((f) => typeof reply[f] === 'string' && (reply[f] as string).trim().length > 0);
+  // No sentence to read: carry the struct, with the budget the sentence would
+  // have had rather than the tail's, since it is now the whole diagnosis.
+  if (!field) return boundRemote(JSON.stringify(reply), MAX_REPLY_DESCRIPTION_CHARS);
+  const said = boundRemote((reply[field] as string).trim(), MAX_REPLY_FIELD_CHARS);
+  // `success` is the flag that selected this branch, so repeating it says
+  // nothing; the consumed field is already the sentence.
+  const entries = Object.entries(reply).filter(([k]) => k !== field && k !== 'success');
+  const rest = entries.slice(0, MAX_REPLY_TAIL_PAIRS).map(([k, v]) => {
+    // A field the issue is about keeps the sentence budget even when it lost
+    // the sentence; anything else is incidental context and gets the short one.
+    const budget = (REPLY_FAILURE_FIELDS as readonly string[]).includes(k)
+      ? MAX_REPLY_FIELD_CHARS : MAX_REPLY_TAIL_CHARS;
+    const rendered = typeof v === 'string' ? boundRemote(v, budget) : boundRemote(JSON.stringify(v), budget);
+    return `${boundRemote(k, MAX_REPLY_KEY_CHARS)}=${rendered}`;
+  });
+  if (entries.length > rest.length) rest.push(`(+${entries.length - rest.length} more fields)`);
+  return rest.length > 0 ? `${said} [${rest.join(', ')}]` : said;
+}
+
+/**
+ * One dispatch, with every check and every refusal the two public wrappers
+ * share. Only the success path yields `kind: 'reply'`, so a caller that reads a
+ * field off the reply is looking at something a sidecar actually sent.
+ *
+ * The refusals below are the ones a tool called DIRECTLY gets. Inside a
+ * workflow, `scope.assertDispatch` refuses first and more coarsely:
+ * `WORKFLOW_CAPABILITY_UNAVAILABLE` covers "the operator turned it off" and
+ * "the host cannot provide it" with one code and one message
+ * (src/workflows/runtime/machine-binding.ts), so the distinctions this function
+ * draws do not reach a model running a bound flow. Noted because it is easy to
+ * read the list below as the whole story.
+ */
+async function dispatchToSidecar(
+  target: string,
+  method: string,
+  params: Record<string, unknown>,
+  requiredCapability: SidecarCapability,
+  typedErrors: boolean,
+  preflight?: (sidecar: SidecarInfo) =>
+    | { readonly kind: 'refuse'; readonly code: string; readonly message: string }
+    | { readonly kind: 'send'; readonly extra: Record<string, unknown> },
+): Promise<SidecarDispatch> {
+  // Ahead of the typed/legacy split: a workflow binding failure must stay an
+  // exception even for tools that have not adopted typed outcomes.
+  const scope = getMachineScope();
+  if (scope) {
+    target = scope.resolveTarget(target, requiredCapability)!;
+    scope.assertDispatch(target, requiredCapability);
+  }
+  // Keep legacy text callers stable while desktop tools adopt the typed
+  // contract. Classification happens here, never by parsing display text.
+  const fail = (status: ActionFailure['status'], code: string, message: string,
+    effect: ActionFailure['effect'] = 'not_started'): SidecarDispatch => {
+    if (typedErrors) throw new ActionOutcomeError({ status, code, message, effect });
+    return { kind: 'message', text: message, code };
+  };
+  if (!sidecarManager) {
+    return fail('blocked', 'SIDECAR_UNINITIALIZED', 'Error: Sidecar system not initialized.');
+  }
+
+  const sidecars = sidecarManager.listSidecars();
+  const sidecar = findSidecar(target, sidecars);
+
+  if (!sidecar) {
+    const available = sidecars.map((s) => s.name).join(', ') || 'none';
+    return fail('blocked', 'SIDECAR_NOT_FOUND', `Error: No sidecar found matching "${target}". Available: ${available}`);
+  }
+
+  if (!sidecar.connected) {
+    return fail('blocked', 'SIDECAR_OFFLINE', `Error: Sidecar "${describeMachine(sidecar)}" is offline.`);
+  }
+
+  // A capability the operator ENABLED that the host cannot provide. Named as
+  // neither of the other two so the three cannot be read for each other: not a
+  // setting to flip, and not a version to raise.
+  const unavail = sidecar.unavailable_capabilities?.find(u => u.name === requiredCapability);
+  if (unavail) {
+    return fail('blocked', 'CAPABILITY_UNAVAILABLE', `Error: Sidecar "${sidecar.name}" has "${requiredCapability}" enabled but it is unavailable: ${unavail.reason}. That is something missing on that machine, not a capability setting - ask the user to install what the reason names. Do NOT retry.`);
+  }
+
+  if (sidecar.capabilities && !sidecar.capabilities.includes(requiredCapability)) {
+    // #605's neighbour. An operator who turned the capability off and a sidecar
+    // too old to have heard of the name BOTH leave it out of this list, and the
+    // remedies are opposites. A sidecar that is not behind rules age out, so
+    // only the setting is named; otherwise both are, and the message says so
+    // rather than picking one and being confidently wrong half the time.
+    const standing = sidecarStanding(sidecar);
+    const remedy = standing.age === 'current'
+      ? `Do NOT retry - ask the user to enable it in the sidecar's config.`
+      : `Do NOT retry. Either the operator turned it off, in which case ask the user to enable it in the sidecar's config, or this sidecar is too old to offer it at all${standing.note}, in which case ask the user to update it.`;
+    return fail('blocked', 'CAPABILITY_DISABLED', `Error: Sidecar "${sidecar.name}" does not advertise the "${requiredCapability}" capability. Available capabilities: ${sidecar.capabilities.join(', ') || 'none'}. ${remedy}`);
+  }
+
+  // A caller's own refusal about THIS sidecar, after the generic ones and
+  // before anything is sent: nothing has been dispatched, so `not_started`.
+  const pre = preflight?.(sidecar);
+  if (pre?.kind === 'refuse') return fail('blocked', pre.code, pre.message);
+  const sent = pre?.kind === 'send' ? { ...params, ...pre.extra } : params;
+
+  try {
+    const result = await sidecarManager.dispatchRPC(sidecar.id, method, sent);
+
+    if (result === 'detached') {
+      // The RPC outlived the initial timeout. Detached completions are only
+      // console-logged (manager.ts onDetachedComplete) — the result never
+      // reaches the model — so claiming background success would be a lie
+      // for anything interactive. Only run_command keeps fire-and-forget
+      // semantics; everything else reports an honest timeout.
+      if (method === 'run_command' && !typedErrors) {
+        return { kind: 'message', text: `Command dispatched to "${describeMachine(sidecar)}" and still running in the background. Its output will NOT be reported back — verify its effect yourself if it matters.` };
+      }
+      return fail('unknown', 'SIDECAR_TIMEOUT', `Error [${describeMachine(sidecar)}]: "${method}" did not complete within the timeout. The action may or may not have taken effect — do NOT assume it succeeded; verify the current state (e.g. take a snapshot) before continuing.`, 'may_have_occurred');
+    }
+
+    // A structured negative receipt is a failure the handler reported about
+    // itself, so it is an outcome rather than a value -- and nothing in the
+    // reply is lost: what the handler SAID leads the sentence and every other
+    // field follows it, so the pid and the handler's own note both survive
+    // without the model having to read a failure out of a struct (#627).
+    //
+    // `window_visible: null` is deliberately NOT one of these. The sidecar
+    // sets it alongside `success: true` for "the process is alive and I could
+    // not look for its window" (Wayland, no xdotool, an unprompted Mac), and
+    // its handlers exist to stop that being reported as a failure: called one,
+    // the model relaunches an app that is already open. See
+    // launchResultLinux / launchResultDarwin.
+    if (typedErrors && result && typeof result === 'object') {
+      const reply = result as Record<string, unknown>;
+      if (reply.success === false) {
+        return fail('error', 'SIDECAR_ACTION_FAILED', `Error [${describeMachine(sidecar)}]: "${method}" reported failure: ${describeReplyFailure(reply)}`, 'may_have_occurred');
+      }
+    }
+
+    return { kind: 'reply', result, sidecarId: sidecar.id };
+  } catch (err) {
+    if (err instanceof ActionOutcomeError) {
+      if (typedErrors) throw err;
+      return { kind: 'message', text: `Error [${describeMachine(sidecar)}]: ${err.message}` };
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+
+    // METHOD_NOT_FOUND means the sidecar does not HAVE the method, so it is
+    // older than this brain -- NOT a capability the operator turned off (#605).
+    // The two used to share one message, and it was the wrong one: the
+    // capability check above has already run and PASSED, so by the time control
+    // reaches here this sidecar has positively advertised the capability. The
+    // old sentence sent the user to a config file that is fine while the real
+    // remedy, a sidecar update, went unsaid (#442: a Mac on 0.9.6).
+    //
+    // There is ALWAYS a sidecar-side remedy, and it is never the config. What
+    // it is depends on the version standing, and that is read with an ORDERED
+    // comparison, not from `update_available` -- which is false for a
+    // non-canonical version and for `dev` builds (src/sidecar/compat.ts),
+    // precisely the sidecars most likely to be missing a method.
+    //
+    // The 'current' case is the one worth spelling out, because it is the
+    // normal state of `main`: a method lands in the brain and `sidecar/VERSION`
+    // is bumped in a later commit (browser_element_point did exactly that), so
+    // a user on the newest released sidecar legitimately has no method and no
+    // update to install. Telling them to update then is as useless as telling
+    // them to check a config file, which is the whole complaint in #605.
+    if (err instanceof SidecarRPCError && err.code === 'METHOD_NOT_FOUND' || !typedErrors && msg.includes('METHOD_NOT_FOUND')) {
+      const standing = sidecarStanding(sidecar);
+      // Claimed only where the check above actually established it: that guard
+      // is skipped when `capabilities` is undefined, and an emphatic "this is
+      // not a configuration problem" is not something to assert on a hunch.
+      const advertised = sidecar.capabilities?.includes(requiredCapability)
+        ? ` It does advertise the "${requiredCapability}" capability, so this is NOT a configuration problem and nothing in the sidecar's config will fix it.`
+        : '';
+      const [diagnosis, remedy] = standing.age === 'current'
+        ? [`so its build predates that method${standing.note} -- which means there may be nothing newer to install: if a fresh sidecar was just built, a stale jarvis-sidecar process has probably reconnected in its place.`,
+           `Do NOT retry this call - ask the user to make sure that machine is running the newest sidecar build.`]
+        : [`so it is older than this brain${standing.note}.`,
+           `Do NOT retry this call - ask the user to update the sidecar on that machine.`];
+      return fail('blocked', 'METHOD_NOT_FOUND', `Error [${describeMachine(sidecar)}]: this sidecar has no "${method}" method, ${diagnosis}${advertised} ${remedy}`);
+    }
+
+    // The OS goes in the message on purpose: the commonest remote failure is
+    // a command written for the wrong platform (`notepad.exe` sent to a Mac),
+    // and "command not found" alone tells neither the model nor the user why.
+    const refused = err instanceof SidecarRPCError && NOT_STARTED_RPC_CODES.has(err.code);
+    return fail(err instanceof SidecarRPCError ? 'error' : 'unknown',
+      err instanceof SidecarRPCError ? err.code : 'SIDECAR_OUTCOME_UNKNOWN',
+      `Error [${describeMachine(sidecar)}]: ${msg}`, refused ? 'not_started' : 'may_have_occurred');
+  }
+}
+
+/**
  * Route an RPC call to a sidecar. Returns the result string, or an error message.
  *
  * @param target - Sidecar name or ID
@@ -74,49 +616,610 @@ export async function routeToSidecar(
   method: string,
   params: Record<string, unknown>,
   requiredCapability: SidecarCapability,
+  typedErrors = false,
 ): Promise<string> {
-  if (!sidecarManager) {
-    return 'Error: Sidecar system not initialized.';
-  }
+  const out = await dispatchToSidecar(target, method, params, requiredCapability, typedErrors);
+  if (out.kind === 'message') return out.text;
+  // Unchanged from before the split, including the stringify: most methods
+  // reply with a string, and the ones that reply with an object are read as
+  // display text by their callers.
+  return typeof out.result === 'string' ? out.result : JSON.stringify(out.result, null, 2);
+}
 
-  const sidecars = sidecarManager.listSidecars();
-  const sidecar = findSidecar(target, sidecars);
+/** Desktop callers require a typed failure, even outside workflows. */
+export function routeToSidecarAction(target: string, method: string,
+  params: Record<string, unknown>, capability: SidecarCapability): Promise<string> {
+  return routeToSidecar(target, method, params, capability, true);
+}
 
-  if (!sidecar) {
-    const available = sidecars.map((s) => s.name).join(', ') || 'none';
-    return `Error: No sidecar found matching "${target}". Available: ${available}`;
-  }
+/**
+ * `routeToSidecarAction`, also handing back the reply it rendered, for a
+ * caller that decides something from the reply's STRUCTURE (#708) rather than
+ * by parsing the display text. `text` is byte for byte what
+ * `routeToSidecarAction` returns; `reply` is undefined when no reply arrived
+ * (a message the dispatch wrote itself).
+ */
+export async function routeToSidecarActionReply(target: string, method: string,
+  params: Record<string, unknown>, capability: SidecarCapability): Promise<{ text: string; reply: unknown }> {
+  const out = await dispatchToSidecar(target, method, params, capability, true);
+  if (out.kind === 'message') return { text: out.text, reply: undefined };
+  return { text: typeof out.result === 'string' ? out.result : JSON.stringify(out.result, null, 2), reply: out.result };
+}
 
-  if (!sidecar.connected) {
-    return `Error: Sidecar "${sidecar.name}" is offline.`;
-  }
+/**
+ * Image types a provider accepts in an image block. A sidecar's `capture_screen`
+ * sends PNG, or JPEG when asked to compact (sidecar/handlers.go); the other two
+ * are the rest of the set every provider here takes. Anything else is refused
+ * rather than forwarded, because the media type goes into the request verbatim
+ * and a provider that rejects it fails the whole turn, not just this tool.
+ */
+const SIDECAR_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 
-  // Check if capability is enabled but unavailable (missing system dependencies)
-  const unavail = sidecar.unavailable_capabilities?.find(u => u.name === requiredCapability);
-  if (unavail) {
-    return `Error: Sidecar "${sidecar.name}" has "${requiredCapability}" enabled but it is unavailable: ${unavail.reason}. Do NOT retry.`;
-  }
+/**
+ * Strict base64: the alphabet, then at most two pad characters. The length is
+ * checked separately (a multiple of 4), since every encoder on the path pads
+ * (`base64.StdEncoding` in the sidecar, `Buffer#toString('base64')` here) and
+ * a provider rejects an unpadded string.
+ */
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
-  if (sidecar.capabilities && !sidecar.capabilities.includes(requiredCapability)) {
-    return `Error: Sidecar "${sidecar.name}" does not have the "${requiredCapability}" capability enabled. Available capabilities: ${sidecar.capabilities.join(', ')}. Do NOT retry — ask the user to enable it in the sidecar's config if needed.`;
-  }
+/**
+ * What to ask for when the full-resolution capture is too big to send. These
+ * are the daemon's own ambient-screenshot parameters (`fetchScreenshot` in
+ * daemon/index.ts), chosen there to stay legible to a vision model -- not a
+ * new number. `grid: false` because the sidecar defaults `grid` to `compact`,
+ * and a coordinate overlay drawn over a general-purpose screenshot is noise
+ * the model would read as screen content.
+ */
+const COMPACT_CAPTURE = {
+  compact: true, max_width: SCREENSHOT_COMPACT.maxWidth, jpeg_quality: SCREENSHOT_COMPACT.jpegQuality, grid: false,
+} as const;
 
-  try {
-    const result = await sidecarManager.dispatchRPC(sidecar.id, method, params);
+type SidecarImage = { mediaType: string; data: string; width: number; height: number; origWidth: number; origHeight: number };
 
-    if (result === 'detached') {
-      return `Task dispatched to "${sidecar.name}" and running in the background.`;
+/**
+ * The image a `capture_screen` reply carries, or null.
+ *
+ * `capture_screen` replies with our own measurements (`{captured, bytes, mime,
+ * width, height, orig_width, orig_height}`) and sends the picture as a binary
+ * frame, which `SidecarManager` staples onto the reply as `_binary` -- an inline
+ * descriptor `{type, mime_type, data}`, or a spooled one whose `data` getter
+ * reads the bytes back from disk (sidecar/binary-spool.ts). So `data` is read
+ * exactly once here. This is the same shape the daemon's ambient screenshot
+ * path reads (`fetchScreenshot` in daemon/index.ts).
+ */
+function readSidecarImage(result: unknown): SidecarImage | null {
+  if (!result || typeof result !== 'object') return null;
+  const reply = result as Record<string, unknown>;
+  const binary = reply._binary;
+  if (!binary || typeof binary !== 'object') return null;
+  const desc = binary as Record<string, unknown>;
+  const mediaType = desc.mime_type;
+  if (typeof mediaType !== 'string' || !SIDECAR_IMAGE_TYPES.has(mediaType)) return null;
+  const data = desc.data;
+  if (typeof data !== 'string' || data.length === 0 || data.length % 4 !== 0 || !BASE64_RE.test(data)) return null;
+  const dim = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : 0);
+  return {
+    mediaType, data, width: dim(reply.width), height: dim(reply.height),
+    origWidth: dim(reply.orig_width), origHeight: dim(reply.orig_height),
+  };
+}
+
+function imageBlock(image: SidecarImage): ContentBlock {
+  return { type: 'image', source: { type: 'base64', media_type: image.mediaType, data: image.data } };
+}
+
+/** Whether the orchestrator would swap this image for a placeholder. */
+function tooBigToSend(image: SidecarImage): boolean {
+  return guardImageSize(imageBlock(image)).type !== 'image';
+}
+
+/**
+ * Route a screenshot to a sidecar and hand the model the PICTURE (#658).
+ *
+ * `routeToSidecar` stringifies the reply, which for `capture_screen` meant the
+ * model received a 6000-character prefix of a JSON blob holding truncated base64
+ * -- no image, and the context spent on noise -- while both tools promise an
+ * image. This returns the same multi-modal result the local branch of
+ * `desktop_screenshot` returns: one line of our own text and an image block.
+ *
+ * Full resolution first, so the model sees what the screen shows whenever it
+ * fits; only a capture `guardImageSize` would replace with a placeholder (a raw
+ * PNG of a large display can pass its 5 MB cap) is retaken compacted, once.
+ * That second capture is a fresh one, so it may show a moment later than the
+ * first -- harmless for a read, and better than no picture.
+ *
+ * The text names only numbers this function validated, never a string from the
+ * reply. A reply with no usable image is a failure, not an empty success: typed
+ * for the desktop tools, a returned message for the legacy text caller. Its
+ * effect is `not_started` because capture_screen changes nothing on the
+ * machine, so there is nothing a retry could repeat.
+ */
+export async function routeScreenshotToSidecar(
+  target: string,
+  params: Record<string, unknown>,
+  typedErrors: boolean,
+): Promise<ToolResult | string> {
+  const fail = (code: string, message: string): string => {
+    if (typedErrors) throw new ActionOutcomeError({ status: 'error', code, message, effect: 'not_started' });
+    return message;
+  };
+  const capture = async (extra: Record<string, unknown>): Promise<SidecarImage | string> => {
+    const out = await dispatchToSidecar(target, 'capture_screen', { ...params, ...extra }, 'screenshot', typedErrors);
+    if (out.kind === 'message') return out.text;
+    return readSidecarImage(out.result)
+      ?? fail('SIDECAR_NO_IMAGE', 'Error: the sidecar answered capture_screen without an image a model provider would accept, so there is nothing to look at. Try again; if it keeps happening the sidecar may need updating.');
+  };
+
+  let image = await capture({});
+  if (typeof image === 'string') return image;
+  let compacted = false;
+  if (tooBigToSend(image)) {
+    compacted = true;
+    image = await capture(COMPACT_CAPTURE);
+    if (typeof image === 'string') return image;
+    if (tooBigToSend(image)) {
+      return fail('SIDECAR_IMAGE_TOO_LARGE', 'Error: the screenshot is too large to send even after compacting it, so there is nothing to look at.');
     }
-
-    return typeof result === 'string' ? result : JSON.stringify(result, null, 2);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-
-    // METHOD_NOT_FOUND means the capability is disabled — tell the LLM not to retry
-    if (msg.includes('METHOD_NOT_FOUND')) {
-      return `Error [${sidecar.name}]: Method "${method}" is not available. The "${requiredCapability}" capability is not enabled on this sidecar. Do NOT retry this call — ask the user to enable the capability in the sidecar's config if needed.`;
-    }
-
-    return `Error [${sidecar.name}]: ${msg}`;
   }
+  // Say when the picture is smaller than the screen, so a size read off it
+  // is not taken for the display's own.
+  const shrunk = compacted && image.origWidth && image.origHeight
+    && (image.origWidth !== image.width || image.origHeight !== image.height)
+    ? `, downscaled from ${image.origWidth}x${image.origHeight} to fit` : '';
+  const size = image.width && image.height ? ` (${image.width}x${image.height}${shrunk})` : '';
+  return { content: [{ type: 'text', text: `Screenshot captured${size}.` }, imageBlock(image)] };
+}
+
+/**
+ * Longest `loader_id` accepted off the wire.
+ *
+ * Chrome's is a short hex string, and the sidecar already refuses to send one
+ * over 64 bytes. This is the daemon not taking that on trust: an unbounded field
+ * from another machine is an unbounded field, whatever the sender promises.
+ */
+const MAX_LOADER_ID_LENGTH = 128;
+
+/**
+ * A browser read from a remote browser: the page text, plus the URL the BROWSER
+ * confirmed for it, or null.
+ *
+ * Returned as ONE VALUE on purpose (#583). The pairing is the guarantee: #579
+ * requires that the URL name the document the text came from, and a URL handed
+ * back through a side channel -- a callback writing to a variable the caller
+ * closed over -- makes that pairing temporal instead of structural. It would hold
+ * only while nothing was ever added after the decode, which is invisible at the
+ * call site and would fail silently as a stale URL against fresh text.
+ */
+export type SidecarPageRead = { readonly text: string; readonly pageUrl: string | null };
+
+/**
+ * Longest `elem_gen` accepted off the wire (#676). The sidecar mints at most 37
+ * bytes and refuses anything over 64 on the way back in, so a longer one is not
+ * a generation that sidecar can match -- recording it would only guarantee a
+ * refusal later, with a less useful message than "no generation".
+ */
+const MAX_ELEM_GEN_LENGTH = 64;
+
+/**
+ * The newest `elem_gen` each READER saw from each sidecar's browser, keyed by
+ * canonical sidecar id and the reader's tool-set scope (#676).
+ *
+ * PER READER, not per sidecar. Keyed by sidecar alone, a snapshot taken by a
+ * sub-agent or a workflow step between the chat model's own snapshot and its
+ * card overwrote the value, so the card bound the OTHER reader's map -- the
+ * one whose ids the model never read -- and the sidecar's comparison then
+ * passed on exactly the refill it exists to refuse. The reader is the
+ * site-playbook delivery scope, which is already how this process tells the
+ * chat's tool calls from a sub-agent's (named) and a workflow's (suppressed);
+ * cards are only raised from the chat's, so another reader's refill now makes
+ * the chat's recorded generation disagree with the sidecar's map and the
+ * approved click is refused.
+ *
+ * AND PER MODEL LOOP inside the default scope (#827). Everything the main
+ * orchestrator runs -- every chat channel, the voice route (which may snapshot,
+ * though it raises no card), every task-tier call -- shares the default scope,
+ * so a snapshot from one of them between another's read and its card bound the
+ * later card. Each orchestrator loop now also records its own reads in a
+ * `SnapshotReadLog` (snapshot-read-log.ts), and a card raised in a loop that
+ * read this sidecar binds THAT loop's newest read. This map stays the fallback
+ * for a card raised in a loop that read nothing from the sidecar itself, which
+ * is the residual: such a card still binds the newest default-scope read.
+ *
+ * Read ONLY at review time, by `browserCallGuard`, which copies it into the
+ * approval; never at execution, where it would name whatever snapshot came
+ * last rather than the one the person reviewed (see reviewed-call-scope.ts).
+ *
+ * A reply WITHOUT one deletes the entry: that read refilled the sidecar's map
+ * under a generation this process does not know, so the previous value no
+ * longer names the map. A dispatch that never reached a page leaves it alone.
+ * That is fail-closed either way: a snapshot that fails on the sidecar after
+ * arming its world DROPS the map and bumps the generation
+ * (`forgetSnapshotElements` in `takePageSnapshot`'s deferred cleanup), so the
+ * kept value no longer matches and the next reviewed click is refused.
+ *
+ * Process-local, like every approval binding: a restart clears both.
+ */
+const remoteSnapshotGenerations = new Map<string, string>();
+
+/** The map key for `sidecarId` as read by the scope this call runs in. */
+//
+// INSIDE AN APPROVED EXECUTION the reader is the one that raised the card, not
+// the scope the executor runs in. Every `browser_navigate` takes a card, and
+// the executor runs it with template delivery suppressed for a reason that has
+// nothing to do with whose read it is -- keyed by that scope, an approved
+// navigate's generation landed under "suppressed", and the chat's next card,
+// for an id from the very page the navigate returned, was refused.
+function readerKey(sidecarId: string): string {
+  return `${sidecarId}\u0000${currentReviewedExecution()?.reader ?? currentSnapshotReader()}`;
+}
+
+/**
+ * Who is reading a remote snapshot right now, outside an approved execution:
+ * the tool-set scope this call runs in (see `remoteSnapshotGenerations`).
+ * Captured by `browserCallGuard` at review time, so an approved call records
+ * under the reader that raised its card.
+ */
+export function currentSnapshotReader(): string {
+  const scope = currentTemplateDeliveryScope();
+  return !scope ? 'default' : scope.kind === 'named' ? `named:${scope.id}` : 'suppressed';
+}
+
+/**
+ * The model loop whose reads this call records and binds against (#827), or
+ * undefined.
+ *
+ * INSIDE AN APPROVED EXECUTION it is the loop that raised the card, for the
+ * reason `readerKey` gives: an approved navigate's snapshot belongs to the
+ * loop that will act on the page it returned, not to the executor.
+ *
+ * OUTSIDE ONE it is the ambient loop, but ONLY in the default scope. A
+ * sub-agent or a workflow step started from inside a chat loop inherits that
+ * loop's async context, and letting its snapshot land in the chat loop's log
+ * would be WEB-001 (#676) again by another route: the chat card would bind the
+ * other reader's map. Those readers already have their own keys.
+ */
+export function currentSnapshotReadLog(): SnapshotReadLog | undefined {
+  const reviewed = currentReviewedExecution();
+  if (reviewed) return reviewed.readLog;
+  return currentSnapshotReader() === 'default' ? currentLoopSnapshotReadLog() : undefined;
+}
+
+/**
+ * The newest `elem_gen` this reader saw from this sidecar's browser, or null:
+ * the current loop's own read when it made one (#827), else the reader's.
+ */
+export function remoteSnapshotGeneration(sidecarId: string): string | null {
+  const log = currentSnapshotReadLog();
+  if (log?.generations.has(sidecarId)) return log.generations.get(sidecarId) ?? null;
+  // A resumed loop that replays snapshot replies it holds no generation for
+  // binds nothing, rather than whatever another reader took during the pause.
+  if (log?.resumedWithReads) return null;
+  return remoteSnapshotGenerations.get(readerKey(sidecarId)) ?? null;
+}
+
+/** Test seam: forget every recorded generation. */
+export function resetRemoteSnapshotGenerations(): void {
+  remoteSnapshotGenerations.clear();
+}
+
+/**
+ * Read the structural page identity out of a browser reply (#583).
+ *
+ * TYPE-CHECKED, not cast. The value arrives from `JSON.parse` on another
+ * machine, through a validator that preserves arrays and objects verbatim
+ * (`sanitize` in sidecar/validator.ts), and `usablePageUrl` downstream is built
+ * of `.length`, a regex and `new URL()` -- all three of which COERCE, so
+ * `["https://mail.google.com/"]` would sail through a `string | null`
+ * annotation that TypeScript erases at runtime and select Gmail's playbook.
+ * TypeScript describes the reply; only these checks constrain it.
+ *
+ * AND A URL IS NEVER ACCEPTED WITHOUT A LOADER ID. That is what carries #579's
+ * same-document guarantee across the wire: the sidecar reports an identity only
+ * when the browser named the document AND held the page to that name across the
+ * read, so a URL arriving without one did not come from that path and is not the
+ * thing the guarantee is about. The daemon cannot redo the check itself -- that
+ * would be another round-trip, at a different instant, to the machine making the
+ * claim -- so it refuses what it cannot vouch for instead.
+ *
+ * An older sidecar replies with a bare string: that is the whole reply, and there
+ * is no identity to read. Same for any shape that is not the documented one.
+ */
+function readSidecarPageReply(result: unknown): SidecarPageRead & { readonly elemGen: string | null } {
+  if (typeof result === 'string') return { text: result, pageUrl: null, elemGen: null };
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) {
+    return { text: JSON.stringify(result, null, 2), pageUrl: null, elemGen: null };
+  }
+  const reply = result as Record<string, unknown>;
+  // No usable text half means no page, so there is no identity worth reading
+  // either -- and the fallback keeps the pre-#583 rendering of an odd reply.
+  if (typeof reply.text !== 'string') return { text: JSON.stringify(result, null, 2), pageUrl: null, elemGen: null };
+  const hasLoader = typeof reply.loader_id === 'string'
+    && reply.loader_id.length > 0
+    && reply.loader_id.length <= MAX_LOADER_ID_LENGTH;
+  const pageUrl = hasLoader && typeof reply.page_url === 'string' ? reply.page_url : null;
+  // Own property, type-checked, bounded: the same reading rule as the pair
+  // above. It is carried back to the sidecar verbatim and compared there, so
+  // nothing here interprets it.
+  const elemGen = Object.hasOwn(reply, 'elem_gen') && typeof reply.elem_gen === 'string'
+    && reply.elem_gen.length > 0 && reply.elem_gen.length <= MAX_ELEM_GEN_LENGTH ? reply.elem_gen : null;
+  return { text: reply.text, pageUrl, elemGen };
+}
+
+/**
+ * Route a browser READ (`browser_navigate`, `browser_snapshot`) and bring back
+ * the browser-confirmed page URL with it (#583).
+ *
+ * Asking for the identity is an opt-in request parameter, so an older sidecar
+ * that has never heard of it replies with the bare text it always did and this
+ * returns `pageUrl: null`. The flag is set HERE, from trusted code, and is not
+ * taken from the tool's own parameters: nothing a model writes may decide the
+ * shape of a reply this function reads structurally.
+ *
+ * A dispatch that never reached a page -- no such sidecar, offline, capability
+ * refused, detached past the timeout -- yields a message rather than a reply, so
+ * `pageUrl` is null exactly when no page was confirmed. `WHY` says which, for a
+ * log line the caller writes: the silent version of this is #583 itself, where a
+ * remote browser simply never got a playbook and nothing said so.
+ */
+export async function routeBrowserReadToSidecar(
+  target: string,
+  method: 'browser_navigate' | 'browser_snapshot',
+  params: Record<string, unknown>,
+): Promise<SidecarPageRead & { readonly why: 'confirmed' | 'no_reply' | 'no_page_identity' }> {
+  const out = await dispatchToSidecar(target, method, { ...params, page_identity: true }, 'browser', false);
+  if (out.kind === 'message') return { text: out.text, pageUrl: null, why: 'no_reply' };
+  const { elemGen, ...read } = readSidecarPageReply(out.result);
+  if (elemGen) remoteSnapshotGenerations.set(readerKey(out.sidecarId), elemGen);
+  else remoteSnapshotGenerations.delete(readerKey(out.sidecarId));
+  // The loop's own record too (#827). A read without a generation is kept as
+  // null rather than deleted, so a card in this loop does not fall back to the
+  // shared record -- which may name a map some other loop filled since.
+  currentSnapshotReadLog()?.generations.set(out.sidecarId, elemGen);
+  return { ...read, why: read.pageUrl ? 'confirmed' : 'no_page_identity' };
+}
+
+/**
+ * The register feature a sidecar advertises when it compares a reviewed
+ * element action's `elem_gen` (#676; `featureBrowserElemGen`, sidecar/client.go).
+ */
+export const SIDECAR_FEATURE_BROWSER_ELEM_GEN = 'browser_elem_gen';
+
+/**
+ * Route a browser element action -- click, type, hover -- and, when it was
+ * REVIEWED, bind it to the snapshot it was reviewed against (#676).
+ *
+ * Unreviewed (`reviewed` undefined: the realtime voice path, or no card at
+ * all) it is `routeToSidecar`, byte for byte.
+ *
+ * Reviewed, it sends the generation the approval captured as `elem_gen`, and
+ * the SIDECAR compares it under its own lock -- the comparison is never made
+ * here, because only the side that owns the counter can make it at the instant
+ * that matters. What this function does is refuse to send a reviewed call
+ * anywhere that comparison would not happen:
+ *
+ *   - a sidecar that does not advertise `browser_elem_gen`. An older one reads
+ *     the params it knows and ignores the rest, so `elem_gen` would be dropped
+ *     on the floor and the click would run unbound -- a fail-open dressed as a
+ *     guard. REFUSED, as the owner decided: this is a user-visible regression
+ *     on every machine running an older sidecar, on a path that works today,
+ *     until that sidecar is updated. The message says it is a version problem.
+ *   - a review that bound no generation: the guard found no snapshot reply
+ *     carrying one for that sidecar, so there is nothing to compare against.
+ *   - a sidecar other than the one reviewed. The guard already compares the
+ *     route; this is the same question asked of the canonical id.
+ *   - a reviewed execution whose guard bound no remote snapshot at all. The
+ *     approval executor enters the scope for every UI call, so this is a guard
+ *     that forgot to bind, and it fails closed rather than running unbound.
+ */
+export async function routeElementActionToSidecar(
+  target: string,
+  method: 'browser_click' | 'browser_type' | 'browser_hover',
+  params: Record<string, unknown>,
+  reviewed: ReviewedExecution | undefined,
+): Promise<string> {
+  if (!reviewed) return routeToSidecar(target, method, params, 'browser');
+  const snapshot = reviewed.remoteBrowserSnapshot;
+  const out = await dispatchToSidecar(target, method, params, 'browser', false, (sidecar) => {
+    if (!snapshot || snapshot.sidecarId !== sidecar.id) {
+      return { kind: 'refuse', code: 'BROWSER_REVIEW_UNBOUND', message: `Error [${describeMachine(sidecar)}]: this ${method} was approved without a record of which browser snapshot on this machine it was reviewed against, so nothing was done. Take a fresh browser_snapshot and request the action again.` };
+    }
+    if (!sidecar.features?.includes(SIDECAR_FEATURE_BROWSER_ELEM_GEN)) {
+      return { kind: 'refuse', code: 'SIDECAR_TOO_OLD_FOR_REVIEWED_ACTION', message: sidecarTooOldForReviewMessage(sidecar, method) };
+    }
+    if (!snapshot.elemGen) {
+      return { kind: 'refuse', code: 'BROWSER_SNAPSHOT_UNVERIFIED', message: `Error [${describeMachine(sidecar)}]: no browser_snapshot from this machine said which snapshot its element ids came from when this ${method} was reviewed, so which page it was reviewed against cannot be verified and nothing was done. Take a fresh browser_snapshot and request the action again.` };
+    }
+    return { kind: 'send', extra: { elem_gen: snapshot.elemGen } };
+  });
+  if (out.kind === 'message') return out.text;
+  return typeof out.result === 'string' ? out.result : JSON.stringify(out.result, null, 2);
+}
+
+/**
+ * The refusal for a reviewed element action on a sidecar that cannot compare
+ * generations (#676). Written for the person as much as the model: the click
+ * did not fail because the browser is broken, and the fix is an update.
+ */
+function sidecarTooOldForReviewMessage(sidecar: SidecarInfo, method: string): string {
+  const standing = sidecarStanding(sidecar);
+  const remedy = standing.age === 'current'
+    ? `Its version is the newest this brain knows of, so this is probably an older sidecar build still running on that machine: ask the user to make sure it runs the newest sidecar build.`
+    : `Updating the sidecar on that machine fixes this: ask the user to update it.`;
+  return `Error [${describeMachine(sidecar)}]: this sidecar is too old to verify which page this ${method} was reviewed against${standing.note}, so the approved action was NOT done. `
+    + `An approved browser click, type or hover is only sent to a sidecar that can check it still acts on the snapshot the user reviewed. `
+    + `This is a sidecar version problem, not a broken browser or a refused approval. ${remedy} Do NOT retry until it is updated.`;
+}
+
+/**
+ * Widest absolute screen coordinate the brain will pass on.
+ *
+ * A SANITY BOUND, not a screen size, and far outside any real multi-monitor
+ * desktop. It fits the pebble's `atomic.Int32` target
+ * (sidecar/pebble_runtime.go) with room to spare, which is the floor it must
+ * clear rather than the reason for its value -- nothing can be read off a
+ * screen here, because `platformGetScreenSize` is a hardcoded stub on darwin
+ * and linux.
+ *
+ * `maxElementPointCoord` in sidecar/browser_element_point.go is the same
+ * number, and both ends check: the sidecar computes the point, but the brain is
+ * the one that hands it to `pebble.point_at`, and a confident pointer at the
+ * wrong place is the single outcome #585 and #591 exist to prevent. The two
+ * constants are a matched pair -- see the note in
+ * docs/sidecar/SIDECAR_PROTOCOL.md.
+ */
+const MAX_ELEMENT_POINT_COORD = 1 << 20;
+
+/** Where a snapshot element is on the sidecar's screen, or why we do not know. */
+export type SidecarElementPoint =
+  | { readonly kind: 'point'; readonly x: number; readonly y: number; readonly loaderId: string }
+  | { readonly kind: 'none'; readonly why: ElementPointRefusal };
+
+/**
+ * Why no point came back: a CLOSED set of brain-authored reasons, so the log
+ * line a caller writes never interpolates text from another machine.
+ */
+export type ElementPointRefusal =
+  /** The dispatch never reached a page -- offline, capability off, timed out. */
+  | 'no_reply'
+  /** The sidecar has no such method, so it predates this surface (#591). */
+  | 'sidecar_too_old'
+  /** The sidecar's handler refused: no browser, headless, stale id, off-screen. */
+  | 'refused'
+  /** The reply was not the documented shape, or claimed a space we do not know. */
+  | 'unusable_reply';
+
+/**
+ * The only coordinate space this brain knows how to hand `pebble.point_at`.
+ *
+ * Checked rather than assumed, and that is the entire purpose of the field. The
+ * sidecar's answer is exact on macOS and Linux and off by the DPI scale on
+ * Windows above 100%; when a measured per-platform conversion lands it ships
+ * under a NEW space name, and an unpatched brain then refuses and shows
+ * "(location unknown)" rather than confidently misplacing the pointer.
+ */
+const ELEMENT_POINT_SPACE = 'screen_dip';
+
+/**
+ * Read a `browser_element_point` reply, strictly.
+ *
+ * TYPE-CHECKED, not cast, for the reason #594 gives at length: the value came
+ * from `JSON.parse` on another machine, through a validator that preserves
+ * arrays and objects verbatim (`sanitize` in src/sidecar/validator.ts), and
+ * everything downstream COERCES -- `Math.round(["431"])` is 431, and arithmetic
+ * on a one-element array works. So a `number` annotation, which TypeScript
+ * erases at runtime, would let `{"x": ["431"]}` through. TypeScript describes
+ * the reply; only these checks constrain it.
+ *
+ * A COORDINATE IS NEVER ACCEPTED WITHOUT ITS LOADER ID. That is #594's pairing
+ * rule transposed: there, no `page_url` without a `loader_id`, because the
+ * loader id is what makes the URL name this document; here, no `x`/`y` without
+ * one, because it is what says which document the two numbers describe. The
+ * sidecar sends all four or an error, so a reply carrying a coordinate and no
+ * identity did not come from that path and is not the thing the guarantee is
+ * about.
+ */
+function readSidecarElementPoint(result: unknown): SidecarElementPoint {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) {
+    return { kind: 'none', why: 'unusable_reply' };
+  }
+  const reply = result as Record<string, unknown>;
+  // OWN properties only. Dotted access walks the prototype chain, so with a
+  // polluted `Object.prototype` an EMPTY reply would answer a complete,
+  // confident point -- exactly the outcome this whole change exists to prevent.
+  // `sanitize` (src/sidecar/validator.ts) does strip `__proto__` and rebuild
+  // plain objects, so the sidecar channel cannot supply the pollution itself;
+  // this is the cheap half of not depending on that.
+  if (!Object.hasOwn(reply, 'space') || !Object.hasOwn(reply, 'loader_id')
+    || !Object.hasOwn(reply, 'x') || !Object.hasOwn(reply, 'y')) {
+    return { kind: 'none', why: 'unusable_reply' };
+  }
+  if (reply.space !== ELEMENT_POINT_SPACE) {
+    return { kind: 'none', why: 'unusable_reply' };
+  }
+  // Every field is bound ONCE, before it is checked, so a property that is a
+  // getter cannot answer one value to the check and another to the use. Not
+  // reachable through `JSON.parse`, which cannot produce getters -- but the
+  // alternative is a function whose guarantees depend on that staying true.
+  const { x, y, loader_id: loaderId } = reply;
+  if (typeof loaderId !== 'string'
+    || loaderId.length === 0
+    || loaderId.length > MAX_LOADER_ID_LENGTH) {
+    return { kind: 'none', why: 'unusable_reply' };
+  }
+  if (typeof x !== 'number' || typeof y !== 'number'
+    || !Number.isFinite(x) || !Number.isFinite(y)
+    || Math.abs(x) > MAX_ELEMENT_POINT_COORD || Math.abs(y) > MAX_ELEMENT_POINT_COORD) {
+    return { kind: 'none', why: 'unusable_reply' };
+  }
+  return { kind: 'point', x: Math.round(x), y: Math.round(y), loaderId };
+}
+
+/**
+ * Ask a sidecar where the element its last snapshot called `elementId` sits on
+ * its screen (#591).
+ *
+ * This is what lets the pebble point at a browser action again. #585 made the
+ * narration read the click's own coordinates and fail closed when there are
+ * none -- and on a default install there are none, because `CapBrowser` is in
+ * the sidecar's default capability set, so the click runs there and its
+ * coordinate map lives in that process. PR #590 was held in draft for exactly
+ * this gap.
+ *
+ * READ-ONLY on the far side, which is what makes it safe for a narration to
+ * call at all: it cannot launch a browser, evaluate script, move focus or
+ * navigate. sidecar/browser_element_point.go enforces that structurally and
+ * docs/sidecar/SIDECAR_PROTOCOL.md states the contract. The path this replaces
+ * dispatched `browser_evaluate`, which is `execute_command` authority in
+ * TOOL_ACTION_MAP -- the same class as `run_command` -- and could lazily start
+ * a headed Chromium for a cosmetic code path.
+ *
+ * `element_id` is the ONLY parameter sent, and pointedly not the tool's own
+ * arguments: no `headless` (which on a sibling method tears a running browser
+ * down and relaunches it) and no `target` override. Nothing a model writes may
+ * widen what this call does or where it goes.
+ *
+ * AN OLDER SIDECAR DOES NOT ANSWER, and that is detected from the dispatch's
+ * `code`. A method that does not exist leaves no reply field to duck-type on,
+ * so `METHOD_NOT_FOUND` is the signal -- read as a code rather than as text.
+ * Since #605 that text says "older than this brain" and no longer asserts the
+ * capability is disabled, which removes the mismatch this classification was
+ * working around; it does NOT make the text safe to classify on. Display text
+ * is written for the model and gets reworded, and some of the refusals on this
+ * path come from `refuseLocalContent`, whose message embeds the page URL.
+ *
+ * One honest caveat: `dispatchToSidecar`'s catch ALSO matches that literal as a
+ * substring of the error message, which predates typed codes and is left alone
+ * here. So a sidecar whose own refusal message happens to contain
+ * "METHOD_NOT_FOUND" would be labelled too old rather than refusing. That costs
+ * a diagnosis in a log line and nothing else: both are `kind: 'none'`. Either
+ * way the answer is `kind: 'none'`, the
+ * caller keeps #585's fail-closed path, and NOTHING falls back to a re-query:
+ * not `browser_evaluate`, not this process's own local `elementCoords` (which
+ * may hold a live snapshot of a different page the model visited locally, and a
+ * hit there would look exactly as authoritative as a real answer), and not a
+ * fresh DOM lookup.
+ */
+export async function routeBrowserElementPointToSidecar(
+  target: string,
+  elementId: number,
+): Promise<SidecarElementPoint> {
+  const out = await dispatchToSidecar(
+    target, 'browser_element_point', { element_id: elementId }, 'browser', false,
+  );
+  if (out.kind === 'message') {
+    // Classified on the CODE. `BROWSER_*` are the handler's own coded refusals
+    // (sidecar/browser_element_point.go); everything else -- offline, no such
+    // sidecar, capability off, timed out, or a message written outside `fail`
+    // and carrying no code at all -- means the call never reached a page, which
+    // the dispatch has already explained.
+    const code = out.code;
+    return {
+      kind: 'none',
+      why: code === 'METHOD_NOT_FOUND' ? 'sidecar_too_old'
+        : code?.startsWith('BROWSER_') ? 'refused'
+        : 'no_reply',
+    };
+  }
+  return readSidecarElementPoint(out.result);
 }

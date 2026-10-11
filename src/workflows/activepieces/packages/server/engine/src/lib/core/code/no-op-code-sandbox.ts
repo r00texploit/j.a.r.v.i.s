@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process'
-import { CodeSandbox } from '../../core/code/code-sandbox-common'
+import { evaluateWorkflowExpression } from '../../../../../../../../runtime/safe-expression'
+import { sanitizedEnv } from '../../../../../../../../../util/subprocess-env'
+import type { CodeSandbox } from '../../core/code/code-sandbox-common'
 
 const CODE_RUNNER_SCRIPT = `
 process.once('message', async function(msg) {
@@ -10,13 +12,13 @@ process.once('message', async function(msg) {
     process.on('unhandledRejection', (reason) => {
         if (settled) return
         settled = true
-        process.send({ success: false, error: inspect(reason) }, () => process.exit(1))
+        process.send({ success: false, error: inspect(undeclaredPackageError(reason)) }, () => process.exit(1))
     })
 
     process.on('uncaughtException', (err) => {
         if (settled) return
         settled = true
-        process.send({ success: false, error: inspect(err) }, () => process.exit(1))
+        process.send({ success: false, error: inspect(undeclaredPackageError(err)) }, () => process.exit(1))
     })
 
     try {
@@ -32,15 +34,73 @@ process.once('message', async function(msg) {
     } catch(e) {
         if (settled) return
         settled = true
-        process.send({ success: false, error: inspect(e) }, () => process.exit(0))
+        process.send({ success: false, error: inspect(undeclaredPackageError(e)) }, () => process.exit(0))
     }
 })
+
+// Jarvis (#837): with auto-install off, a bare name the step did not declare is
+// a MODULE_NOT_FOUND. Say which package and what to do, instead of leaving the
+// author to guess that the registry was never consulted. Only for a require made
+// by the step itself, and only for a package that is not installed where the
+// step would find it: one made from inside an installed package, or a missing
+// file inside an installed package, is not a missing declaration. The original
+// error is kept either way.
+function undeclaredPackageError(e) {
+    if (!e || (e.code !== 'MODULE_NOT_FOUND' && e.code !== 'ERR_MODULE_NOT_FOUND')) return e
+    const text = String(e.message)
+    const m = /Cannot find (?:package|module) '([^']+)'(?: from '([^']*)')?/.exec(text)
+    if (!m || m[1].startsWith('.') || m[1].startsWith('/')) return e
+    // The requiring file, which decides whether this is really a missing
+    // DECLARATION or just a missing file inside a package that IS installed.
+    // Two message shapes, and which one you get depends on the runtime: Bun
+    // 1.3.x writes "from '<path>'", while Bun 1.4.x and Node write a
+    // "Require stack:" block whose first entry is the requiring file. Reading
+    // only the first shape made every 1.4.x error look like a missing
+    // declaration, because the path was never recovered and both exemptions
+    // below are conditional on having it. CI caught this on the first run
+    // after the image and CI converged on Bun 1.4.2.
+    const stack = /(?:^|\\n)Require stack:\\n[ \\t]*-[ \\t]*(.+)/.exec(text)
+    const from = m[2] || (stack ? stack[1].trim() : '')
+    if (from && /[\\\\/]node_modules[\\\\/]/.test(from)) return e
+    const parts = m[1].split('/')
+    const name = m[1].startsWith('@') ? parts.slice(0, 2).join('/') : parts[0]
+    if (from && isInstalledAbove(require('path').dirname(from), name)) return e
+    const err = new Error('CODE step requires package "' + name + '", which its package.json does not declare. ' +
+        'Add it to "dependencies" in the package.json of the step; packages are never fetched from the registry at run time. (' +
+        String(e.message) + ')')
+    err.code = e.code
+    return err
+}
+
+function isInstalledAbove(dir, name) {
+    const path = require('path')
+    const fs = require('fs')
+    for (let d = dir; ; d = path.dirname(d)) {
+        if (fs.existsSync(path.join(d, 'node_modules', name))) return true
+        if (path.dirname(d) === d) return false
+    }
+}
 `
 
 async function runInChildProcess({ codeFilePath, inputs }: { codeFilePath: string, inputs: Record<string, unknown> }): Promise<unknown> {
     return new Promise((resolve, reject) => {
-        const child = spawn(process.execPath, ['--eval', CODE_RUNNER_SCRIPT], {
+        // Jarvis (#837): `--no-install`, because a step file has no `node_modules`
+        // above it unless the daemon installed its declared dependencies there
+        // (code-materialize.ts), and with none Bun AUTO-INSTALLS any bare name the
+        // code requires: fetches the latest version from the npm registry and runs
+        // it. Measured with `is-number`, into an empty install cache. Bun-only:
+        // under Node there is no auto-install and the flag would be rejected.
+        const args = process.versions.bun ? ['--no-install', '--eval', CODE_RUNNER_SCRIPT] : ['--eval', CODE_RUNNER_SCRIPT]
+        const child = spawn(process.execPath, args, {
             stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
+            // Jarvis: this child runs a CODE step, i.e. workflow-authored code.
+            // Inheriting would hand it the engine's own env: SANDBOX_ID (what
+            // the daemon's worker RPC accepts an engine connection on), the WS
+            // port, and the reaper's JARVIS_ENGINE_* markers. This is env
+            // hygiene, not isolation: at the same uid the child can still read
+            // /proc/<engine pid>/environ, and up the parent chain the daemon's
+            // /proc/<pid>/environ, which holds every secret it started with.
+            env: sanitizedEnv(),
         })
 
         let capturedStdout = ''
@@ -103,15 +163,8 @@ export const noOpCodeSandbox: CodeSandbox = {
         return runInChildProcess({ codeFilePath, inputs })
     },
 
-    async runScript({ script, scriptContext, functions }) {
-        const newContext = {
-            ...scriptContext,
-            ...functions,
-        }
-        const params = Object.keys(newContext)
-        const args = Object.values(newContext)
-        const body = `return (${script})`
-        const fn = Function(...params, body)
-        return fn(...args)
+    async runScript({ script, scriptContext }) {
+        // Jarvis: expressions may read data, never execute arbitrary code or callbacks.
+        return evaluateWorkflowExpression(script, scriptContext)
     },
 }

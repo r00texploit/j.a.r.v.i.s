@@ -87,6 +87,14 @@ describe('DailyRhythm', () => {
     expect(todayCheckIn).not.toBeNull();
   });
 
+  test('morning actions have durable work IDs in the stored check-in', async () => {
+    vault.createGoal('Active Goal', 'task', { status: 'active' });
+    const result = await rhythm.runMorningPlan();
+    expect(result.workItems).toHaveLength(result.dailyActions.length);
+    expect(result.workItems.map(w => w.title)).toEqual(result.dailyActions);
+    expect(vault.getTodayCheckIn('morning_plan')?.work_item_ids).toEqual(result.workItems.map(w => w.id));
+  });
+
   test('runEveningReview creates check-in', async () => {
     vault.createGoal('Active Goal', 'task', { status: 'active' });
 
@@ -113,6 +121,45 @@ describe('DailyRhythm', () => {
     vault.createGoal('Goal', 'task', { status: 'active' });
     const result = await rhythm.runEveningReview();
     expect(result.checkIn).toBeTruthy();
+  });
+
+  test('a known goal and a plausible explanation cannot authorize an automatic score change', async () => {
+    const goal = vault.createGoal('Ship the release', 'task', { status: 'active' });
+    const automatic = new DailyRhythm({ chatTier: async () => ({ content: JSON.stringify({
+      score_updates: [{ goalId: goal.id, newScore: 0.8, reason: 'The user worked on it today' }],
+      actions_completed: ['Shipped the release'],
+    }) }) });
+    const result = await automatic.runEveningReview();
+    expect(vault.getGoal(goal.id)!.score).toBe(0);
+    expect(vault.getProgressHistory(goal.id)).toEqual([]);
+    expect(result.scoreUpdates).toEqual([]);
+    expect(result.checkIn.actions_completed).toEqual([]);
+  });
+
+  test('the daily-review write path rejects unsupported scores below the model', () => {
+    const goal = vault.createGoal('Goal', 'task', { status: 'active' });
+    expect(vault.updateGoalScore(goal.id, 0.8, 'Trust me', 'daily_review')).toBeNull();
+    expect(vault.getGoal(goal.id)!.score).toBe(0);
+    expect(vault.getProgressHistory(goal.id)).toEqual([]);
+    expect(vault.updateGoalScore(goal.id, 0.4, 'User assessment')!.score).toBe(0.4);
+  });
+
+  test('evening inputs bind stable goal IDs to criteria and distinguish activity from outcomes', async () => {
+    const goal = vault.createGoal('Release', 'task', {
+      status: 'active', success_criteria: 'Ten confirmed customer deployments',
+    });
+    const activity = vault.addProgressEntry(goal.id, 'auto_detected', 0, 0, 'Editor was open', 'awareness');
+    let context = '';
+    const automatic = new DailyRhythm({ chatTier: async (_t: string, _s: string, messages: any[]) => {
+      context = messages[1].content;
+      return { content: '{}' };
+    } });
+    await automatic.runEveningReview();
+    expect(context).toContain(goal.id);
+    expect(context).toContain(goal.success_criteria);
+    expect(context).toContain(activity.id);
+    expect(context).toContain('activity');
+    expect(context).toContain('verifiedOutcomes');
   });
 });
 

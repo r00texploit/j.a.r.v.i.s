@@ -11,7 +11,9 @@ import type { NLGoalBuilder } from '../../goals/nl-builder.ts';
 import type { GoalEstimator } from '../../goals/estimator.ts';
 import type { DailyRhythm } from '../../goals/rhythm.ts';
 import type { AccountabilityEngine } from '../../goals/accountability.ts';
+import { GoalValidationError } from '../../goals/validation.ts';
 import * as vault from '../../vault/goals.ts';
+import { nextGoalLevel } from '../../goals/validation.ts';
 
 export type GoalToolDeps = {
   goalService: GoalService;
@@ -25,22 +27,21 @@ export function createManageGoalsTool(deps: GoalToolDeps): ToolDefinition {
   return {
     name: 'manage_goals',
     description: [
-      'Manage OKR-style goals with hierarchical structure (objective → key_result → milestone → task → daily_action).',
-      'Google-style 0.0-1.0 scoring (0.7 = good, 1.0 = aimed too low).',
-      '',
-      'Actions: create, list, get, score, update_status, update, decompose, replan, estimate,',
-      '         morning_plan, evening_review, metrics, delete, tree, overdue, escalations',
+      'Manage OKR-style goals: a hierarchy from objective down to daily_action, scored 0.0-1.0.',
+      'Google-style scoring: 0.7 = good, 1.0 = aimed too low.',
+      'For one-off tasks with a due date, use commitments instead.',
     ].join('\n'),
     category: 'goals',
     parameters: {
       action: {
         type: 'string',
-        description: 'The action to perform',
+        description: 'What to do.',
+        enum: ['create', 'list', 'get', 'score', 'update_status', 'update', 'decompose', 'replan', 'estimate', 'morning_plan', 'evening_review', 'metrics', 'delete', 'tree', 'overdue', 'escalations'],
         required: true,
       },
       text: {
         type: 'string',
-        description: 'Natural language goal description (for "create")',
+        description: 'Natural-language goal, for create.',
         required: false,
       },
       goal_id: {
@@ -50,7 +51,7 @@ export function createManageGoalsTool(deps: GoalToolDeps): ToolDefinition {
       },
       score: {
         type: 'number',
-        description: 'Score value 0.0-1.0 (for "score")',
+        description: '0.0-1.0, for score.',
         required: false,
       },
       reason: {
@@ -60,43 +61,44 @@ export function createManageGoalsTool(deps: GoalToolDeps): ToolDefinition {
       },
       status: {
         type: 'string',
-        description: 'New status (for "update_status"): draft, active, paused, completed, failed, killed',
+        description: 'New status for update_status: draft, active, paused, completed, failed, killed.',
         required: false,
       },
       title: {
         type: 'string',
-        description: 'Goal title (for quick "create" without NL)',
+        description: 'Title, for a quick create without text.',
         required: false,
       },
       level: {
         type: 'string',
-        description: 'Goal level: objective, key_result, milestone, task, daily_action',
+        description: 'Goal level: objective, key_result, milestone, task, daily_action. A child is exactly one level below its parent; omit to use that level.',
         required: false,
       },
       parent_id: {
         type: 'string',
-        description: 'Parent goal ID (for "create")',
+        description: 'Parent goal id, for create.',
         required: false,
       },
       filter_status: {
         type: 'string',
-        description: 'Filter by status (for "list")',
+        description: 'Filter list by status.',
         required: false,
       },
       filter_level: {
         type: 'string',
-        description: 'Filter by level (for "list")',
+        description: 'Filter list by level.',
         required: false,
       },
       limit: {
         type: 'number',
-        description: 'Max results (for "list")',
+        description: 'Max results for list.',
         required: false,
       },
     },
     execute: async (params) => {
       const action = String(params.action ?? '').toLowerCase();
 
+      try {
       switch (action) {
         case 'create': {
           const text = params.text as string | undefined;
@@ -105,7 +107,7 @@ export function createManageGoalsTool(deps: GoalToolDeps): ToolDefinition {
           if (text) {
             // NL goal creation
             try {
-              const proposal = await deps.nlBuilder.parseGoal(text);
+              const proposal = await deps.nlBuilder.parseGoal(text, params.parent_id as string | undefined);
 
               if (proposal.clarifying_questions?.length) {
                 return `Before creating this goal, I have some questions:\n${proposal.clarifying_questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nPlease answer these and I'll create the full OKR breakdown.`;
@@ -128,11 +130,17 @@ export function createManageGoalsTool(deps: GoalToolDeps): ToolDefinition {
 
           if (title) {
             // Quick creation
-            const level = (params.level as string) ?? 'task';
-            const goal = deps.goalService.createGoal(title, level as any, {
-              parent_id: params.parent_id as string | undefined,
-            });
-            return `Created ${level}: "${goal.title}" (${goal.id})`;
+            const parentId = params.parent_id as string | undefined;
+            try {
+              // Children sit exactly one level below their parent, so an
+              // omitted level under a parent means that next level.
+              const parent = parentId ? vault.getGoal(parentId) : null;
+              const level = (params.level as string) ?? (parent && nextGoalLevel(parent.level)) ?? 'task';
+              const goal = deps.goalService.createGoal(title, level as any, { parent_id: parentId });
+              return `Created ${level}: "${goal.title}" (${goal.id})`;
+            } catch (err) {
+              return `Error creating goal: ${err instanceof Error ? err.message : err}`;
+            }
           }
 
           return 'Error: Provide either "text" (NL description) or "title" (quick create).';
@@ -191,7 +199,7 @@ export function createManageGoalsTool(deps: GoalToolDeps): ToolDefinition {
         case 'score': {
           const goalId = params.goal_id as string;
           const score = params.score as number;
-          const reason = (params.reason as string) ?? '';
+          const reason = (params.reason === undefined ? '' : params.reason) as string;
           if (!goalId) return 'Error: "goal_id" is required.';
           if (score === undefined || score === null) return 'Error: "score" is required (0.0-1.0).';
 
@@ -363,6 +371,10 @@ export function createManageGoalsTool(deps: GoalToolDeps): ToolDefinition {
 
         default:
           return `Unknown action "${action}". Available: create, list, get, score, update_status, update, decompose, replan, estimate, morning_plan, evening_review, metrics, delete, tree, overdue, escalations`;
+      }
+      } catch (error) {
+        if (error instanceof GoalValidationError) return `Error: ${error.message}`;
+        throw error;
       }
     },
   };

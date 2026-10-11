@@ -15,6 +15,12 @@
  *   merge without a human reading it. Anything else -- a piece entering or
  *   leaving the catalog, a license change, a pinned-SHA bump -- puts
  *   third-party code or a trust assertion in motion and asks for human eyes.
+ *
+ *   Verified pieces are the exception to "a bump is mechanical": each has a
+ *   governed adapter that must cover the version installed. The sync script
+ *   checks that per bump (`verified-upgrade.ts`) and holds back the ones that
+ *   fail, so a verified bump reaching this diff has passed it. One that did
+ *   not -- `checked` does not list it -- forces review, as #664 should have.
  */
 
 /**
@@ -40,6 +46,14 @@ export interface CatalogDiff {
   removed: GeneratedEntryLike[];
   /** Same id, different npm version. The mechanical, expected change. */
   versionChanged: Array<{ id: string; from: string; to: string }>;
+  /**
+   * Bumps that move a verified piece's installed version WITHOUT having passed
+   * the sync script's adapter check. Empty on every run the script makes; it
+   * exists so a code path that skips the check fails loudly instead of
+   * shipping the bump as "safe" (#664 merged eight unchecked ones and turned
+   * `main` red).
+   */
+  verifiedVersionChanged: Array<{ id: string; from: string; to: string }>;
   /** Same id, different SPDX license. A trust/legal signal -- always flagged. */
   licenseChanged: Array<{ id: string; from: string; to: string }>;
   /**
@@ -62,7 +76,18 @@ const byId = (a: { id: string }, b: { id: string }) => a.id.localeCompare(b.id);
 export function diffCatalogs(
   oldEntries: GeneratedEntryLike[],
   newEntries: GeneratedEntryLike[],
-  meta: { oldSha: string; newSha: string },
+  meta: {
+    oldSha: string;
+    newSha: string;
+    /**
+     * Verified ids whose installed version follows the generated one, i.e.
+     * VERIFIED minus VERSION_PIN. Required, so a caller cannot forget it and
+     * get the old every-bump-is-safe behaviour.
+     */
+    verified: ReadonlySet<string>;
+    /** Verified ids whose bump passed the adapter check this run. */
+    checked: ReadonlySet<string>;
+  },
 ): CatalogDiff {
   const oldById = new Map(oldEntries.map((e) => [e.id, e]));
   const newById = new Map(newEntries.map((e) => [e.id, e]));
@@ -99,10 +124,15 @@ export function diffCatalogs(
       ? { from: meta.oldSha, to: meta.newSha }
       : null;
 
+  const verifiedVersionChanged = versionChanged.filter(
+    (c) => meta.verified.has(c.id) && !meta.checked.has(c.id),
+  );
+
   return {
     added,
     removed,
     versionChanged,
+    verifiedVersionChanged,
     licenseChanged,
     otherChanged,
     shaChanged,
@@ -112,10 +142,10 @@ export function diffCatalogs(
 }
 
 /**
- * "safe" only when the diff is purely mechanical: version bumps (and the
- * always-changing timestamp, which isn't represented here). The moment a piece
- * is added/removed, a license changes, metadata drifts, or the pinned SHA
- * moves, a human should look.
+ * "safe" only when the diff is purely mechanical: version bumps of unverified
+ * pieces (and the always-changing timestamp, which isn't represented here). The
+ * moment a piece is added/removed, a license changes, metadata drifts, the
+ * pinned SHA moves, or a verified piece's version moves, a human should look.
  */
 export function verdictFor(diff: CatalogDiff): Verdict {
   const needsReview =
@@ -123,6 +153,7 @@ export function verdictFor(diff: CatalogDiff): Verdict {
     diff.removed.length > 0 ||
     diff.licenseChanged.length > 0 ||
     diff.otherChanged.length > 0 ||
+    diff.verifiedVersionChanged.length > 0 ||
     diff.shaChanged !== null;
   return needsReview ? "review" : "safe";
 }
@@ -154,6 +185,29 @@ export interface ReportOptions {
   fileLabel: string;
   /** Resolve an id to its 1-based line in the generated file, or null. */
   lineOf: (id: string) => number | null;
+  /**
+   * Pieces whose npm lookup failed transiently this run, so the previously
+   * committed latestVersion was reused (metadata still comes from the pinned
+   * SHA, like every other entry). On a routine run -- SHA unchanged -- the
+   * whole entry is therefore identical to the previous catalog and produces
+   * no diff; on a SHA-bump run metadata changes surface in their own diff
+   * sections as usual. Carried-forward status itself never affects the
+   * verdict; the reviewer just needs to know these versions may lag npm
+   * until the next successful run.
+   */
+  carriedForward?: Array<{ id: string; version: string }>;
+  /** The sync script's verified-bump decisions, taken and held. */
+  verifiedUpgrades?: ReadonlyArray<{
+    id: string;
+    from: string;
+    to: string;
+    ok: boolean;
+    added: string[];
+    removed: string[];
+    reasons: ReadonlyArray<{ kind: string }>;
+  }>;
+  /** Where the Tests runs for this PR's branch are listed. */
+  testsUrl?: string;
 }
 
 /** Collapse a list into a `<details>` block once it gets long. */
@@ -199,9 +253,11 @@ export function renderReport(
         : `the only entry changes are ${n} version bump${n === 1 ? "" : "s"} from npm`;
     p("> [!NOTE]");
     p(
-      `> **Safe to merge.** No pieces were added, removed, or relicensed and the ` +
-        `pinned SHA is unchanged -- ${bumps}. CI (catalog invariants + typecheck) ` +
-        `still gates this PR.`,
+      `> **Safe to merge.** No pieces were added, removed, or relicensed, every ` +
+        `verified bump passed the adapter check, and the pinned SHA is unchanged -- ` +
+        `${bumps}. Merge on a green Tests run only: nothing blocks merging a red one, ` +
+        `and a bot PR does not show its checks.` +
+        (opts.testsUrl ? ` [Tests runs for this branch](${opts.testsUrl}).` : ""),
     );
   } else {
     p("> [!WARNING]");
@@ -224,6 +280,15 @@ export function renderReport(
   p(`| Version bumps | ${diff.versionChanged.length} |`);
   p(`| License changes | ${diff.licenseChanged.length} |`);
   p(`| Other metadata | ${diff.otherChanged.length} |`);
+  const upgrades = opts.verifiedUpgrades ?? [];
+  if (upgrades.length > 0) {
+    const taken = upgrades.filter((u) => u.ok).length;
+    p(`| Verified upgrades | ${taken} taken, ${upgrades.length - taken} held |`);
+  }
+  const carried = opts.carriedForward ?? [];
+  if (carried.length > 0) {
+    p(`| Carried forward (stale) | ${carried.length} |`);
+  }
   p();
 
   if (diff.shaChanged) {
@@ -234,6 +299,58 @@ export function renderReport(
         "`sourceUrl` now points at the new commit, and descriptions / licenses may " +
         "have shifted with it. Treat this as a full re-review, not a routine refresh.",
     );
+    p();
+  }
+
+  if (diff.verifiedVersionChanged.length > 0) {
+    p("### Verified pieces bumped without the adapter check -- review required");
+    p();
+    p(
+      "The sync script checks every verified bump against its governed adapter and " +
+        "holds back the ones the adapter no longer covers. These moved without that " +
+        "check, which is a bug in the sync: do not merge until each is checked against " +
+        "`GOVERNED_PIECE_ADAPTERS` (`src/workflows/runtime/piece-effects.ts`):",
+    );
+    p();
+    for (const c of diff.verifiedVersionChanged) {
+      p(`- \`${c.id}\` -- \`${codeSafe(c.from)}\` -> \`${codeSafe(c.to)}\``);
+    }
+    p();
+  }
+
+  const taken = upgrades.filter((u) => u.ok);
+  if (taken.length > 0) {
+    p("### Verified pieces upgraded");
+    p();
+    p(
+      "Each new version passed the adapter check: every action it offers is mapped, " +
+        "no existing action got a more severe upstream classification, and none lost props.",
+    );
+    p();
+    for (const u of taken) {
+      const moved: string[] = [];
+      if (u.added.length > 0) moved.push(`+${u.added.length} (${u.added.map((a) => `\`${codeSafe(a)}\``).join(", ")}, already mapped)`);
+      if (u.removed.length > 0) moved.push(`-${u.removed.length} (${u.removed.map((a) => `\`${codeSafe(a)}\``).join(", ")})`);
+      const actions = moved.length > 0 ? `actions ${moved.join(", ")}` : "same action set";
+      p(`- \`${u.id}\` -- \`${codeSafe(u.from)}\` -> \`${codeSafe(u.to)}\` -- ${actions}`);
+    }
+    p();
+  }
+
+  const held = upgrades.filter((u) => !u.ok);
+  if (held.length > 0) {
+    p("### Verified pieces held back");
+    p();
+    p(
+      "These stay at the installed version because the adapter does not cover the new " +
+        "one yet. They do not affect this PR; the review issue the sync opened says why " +
+        "and how to clear each, and the next run takes the bump once it is cleared.",
+    );
+    p();
+    for (const u of held) {
+      const why = [...new Set(u.reasons.map((r) => r.kind))].join(", ");
+      p(`- \`${u.id}\` -- stays at \`${codeSafe(u.from)}\`, \`${codeSafe(u.to)}\` available -- ${why}`);
+    }
     p();
   }
 
@@ -257,13 +374,41 @@ export function renderReport(
     p("### Removed pieces");
     p();
     p(
-      "A piece leaving the catalog means it was unpublished from npm (or the npm " +
-        "retry budget was exhausted during sync). Confirm this is intentional and " +
-        "not a transient failure:",
+      "A piece leaving the catalog means npm answered 404 for its latest release " +
+        "(unpublished upstream), or the piece left the monorepo at the pinned SHA " +
+        "(renamed or deleted -- a rename shows up as one removal plus one addition). " +
+        "Transient npm failures do NOT remove pieces; those are carried forward and " +
+        "listed separately. Confirm each removal is intentional:",
     );
     p();
     for (const e of diff.removed) {
       p(`- \`${e.id}\` -- was \`${e.npmPackage}\``);
+    }
+    p();
+  }
+
+  if (carried.length > 0) {
+    p("### Stale entries (carried forward)");
+    p();
+    p(
+      "npm could not be reached for these pieces during this run (rate limit or " +
+        "outage), so each kept its previously committed version instead of being " +
+        "removed; the next successful sync catches them up. Any metadata change " +
+        "from the pinned SHA still appears in the sections above. Listed for " +
+        "transparency -- staleness alone needs no action:",
+    );
+    p();
+    const rows = carried.map(
+      (c) => `- \`${codeSafe(c.id)}\` -- kept at \`${codeSafe(c.version)}\``,
+    );
+    if (rows.length > COLLAPSE_THRESHOLD) {
+      p(`<details><summary>Show ${rows.length} carried-forward pieces</summary>`);
+      p();
+      for (const r of rows) p(r);
+      p();
+      p("</details>");
+    } else {
+      for (const r of rows) p(r);
     }
     p();
   }
@@ -309,8 +454,9 @@ export function renderReport(
   p(
     "Hand-tuning (verified status, exclusions, version pins, sizes, descriptions) " +
       "lives in `catalog-overrides.ts`, which this refresh does not touch. If a " +
-      "newly added piece needs an exclusion, pin, or description override, follow " +
-      "up with a commit on this branch.",
+      "newly added piece needs an exclusion, pin, or description override, land it " +
+      "in its own PR to main: the next sync run rebuilds this branch from main and " +
+      "force-pushes it, so a commit made here is lost.",
   );
 
   return { verdict, markdown: out.join("\n") + "\n" };
@@ -335,6 +481,10 @@ function reviewReasons(diff: CatalogDiff): string {
   }
   if (diff.otherChanged.length > 0) {
     parts.push(`${diff.otherChanged.length} metadata change${diff.otherChanged.length === 1 ? "" : "s"}`);
+  }
+  if (diff.verifiedVersionChanged.length > 0) {
+    const n = diff.verifiedVersionChanged.length;
+    parts.push(`${n} verified piece${n === 1 ? "" : "s"} bumped without the adapter check`);
   }
   return parts.join(", ");
 }

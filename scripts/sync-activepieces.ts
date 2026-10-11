@@ -26,6 +26,7 @@ import { existsSync, mkdirSync, readdirSync, statSync, rmSync, copyFileSync, rea
 import { join, relative, dirname } from "node:path";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
+import { expressionPatches, applyExpressionPatch } from './activepieces-expression-patch';
 
 const PINNED_TAG = "0.82.1";
 const PINNED_SHA = "d04e6807c485ecd788a72af0d04abffba78563c7";
@@ -250,12 +251,16 @@ const PATCH_INSERTIONS: Record<
   string,
   Array<{ anchor: RegExp; insert: string; position?: "before" | "after" }>
 > = {
+  'packages/server/engine/src/lib/handler/piece-executor.ts': [
+    { anchor: /^\s*step: \{\s*$/, insert: '                executionPath: executionState.currentPath.path,' },
+  ],
   // Polling triggers need `server.{token,apiUrl}` to call back into the
   // daemon's /v1/jarvis/* endpoints with the engineToken. The engine
   // runtime sets this unconditionally (trigger-helper.ts:137-141) but
   // upstream's TS type omitted it for POLLING; we add it here so trigger
   // code can call back without unsafe casts.
   "packages/pieces/framework/src/lib/context/index.ts": [
+    { anchor: /^export type StepContext = \{\s*$/, insert: '  /** Jarvis runtime loop identity, independent of properties. */\n  executionPath?: readonly [string, number][];' },
     {
       anchor: /^\s*setSchedule\(schedule: \{ cronExpression: string; timezone\?: string \}\): void;\s*$/,
       insert:
@@ -401,23 +406,29 @@ const PATCH_INSERTIONS: Record<
     },
   ],
   // Upstream's `flow-executor.executeFromTrigger` always calls
-  // `triggerHelper.executeOnStart`, which throws `TriggerNameNotSetError`
-  // when the trigger has no piece (the EMPTY / "Manual" type). Without this
-  // patch, manually-triggered runs from the editor's Run button fail
-  // before step 1. Anchor on the `BEGIN` branch's opening brace and insert
-  // an EMPTY-trigger short-circuit that runs the bookkeeping (initial
-  // backup + sendUpdate) and then walks straight into the action chain.
+  // `triggerHelper.executeOnStart`, which reads `settings.triggerName` and
+  // throws `TriggerNameNotSetError` when it is nil. That is nil for the EMPTY
+  // "Manual" trigger AND for a non-manual trigger (e.g. SCHEDULE) invoked
+  // MANUALLY from the Run button — both must run anyway. Without this patch
+  // those runs fail before step 1. Anchor on the `BEGIN` branch's opening
+  // brace and insert a no-triggerName short-circuit that runs the bookkeeping
+  // (initial backup + sendUpdate) and then walks straight into the action chain.
   "packages/server/engine/src/lib/handler/flow-executor.ts": [
     {
       anchor: /^\s*if \(input\.executionType === ExecutionType\.BEGIN\) \{\s*$/,
       insert:
-        "            // === JARVIS PATCH: short-circuit for manual (EMPTY) triggers ===\n" +
+        "            // === JARVIS PATCH: short-circuit when there is no piece trigger to start ===\n" +
         "            // Upstream unconditionally calls `triggerHelper.executeOnStart`,\n" +
-        "            // which throws `TriggerNameNotSetError` whenever the trigger has\n" +
-        "            // no piece (i.e. type === 'EMPTY' -- our user-facing \"Manual\"\n" +
-        "            // trigger). Replicate the surrounding bookkeeping (initial-state\n" +
-        "            // backup + progress update) and skip straight into the action chain.\n" +
-        "            if ((trigger as { type?: string }).type === 'EMPTY') {\n" +
+        "            // which reads `settings.triggerName` and throws\n" +
+        "            // `TriggerNameNotSetError` whenever it is nil -- true for the EMPTY\n" +
+        "            // \"Manual\" trigger AND for a non-manual trigger (e.g. SCHEDULE)\n" +
+        "            // invoked MANUALLY from the Run button. Both must run: skip straight\n" +
+        "            // into the action chain after the same bookkeeping (backup +\n" +
+        "            // sendUpdate). A real trigger firing carries a triggerName and still\n" +
+        "            // runs executeOnStart below, unchanged.\n" +
+        "            const jarvisTriggerName = (trigger as { settings?: { triggerName?: unknown } }).settings\n" +
+        "                ?.triggerName\n" +
+        "            if (isNil(jarvisTriggerName)) {\n" +
         "                void runProgressService.backup({\n" +
         "                    engineConstants: constants,\n" +
         "                    flowExecutorContext: executionState,\n" +
@@ -557,6 +568,12 @@ for (const [relPath, patches] of Object.entries(PATCH_INSERTIONS)) {
   }
   writeFileSync(dst, out.join("\n"));
   info(`applied ${patches.length} patch insertion(s) to ${relPath}`);
+}
+
+for (const [relPath, replacements] of Object.entries(expressionPatches)) {
+  const dst = join(VENDOR_DIR, relPath);
+  writeFileSync(dst, applyExpressionPatch(readFileSync(dst, 'utf8'), replacements));
+  info(`applied expression boundary patch to ${relPath}`);
 }
 
 // 8. Defense-in-depth: walk the vendor tree and abort if any /ee/ path slipped through

@@ -10,7 +10,7 @@
  *   aggressive: 5s cancel window
  */
 
-import { getDueCommitments, getUpcoming, updateCommitmentStatus } from '../vault/commitments.ts';
+import { getDueCommitments, getUpcoming, updateCommitmentStatus, getCommitment, isWorkItemCommitment } from '../vault/commitments.ts';
 import type { Commitment } from '../vault/commitments.ts';
 import type { IAgentService } from './agent-service-interface.ts';
 import type { WSMessage } from '../comms/websocket.ts';
@@ -35,6 +35,21 @@ const CANCEL_WINDOW: Record<Aggressiveness, number> = {
   aggressive: 5_000,
 };
 
+/** Minimal view of an approval request the executor needs to settle a commitment. */
+export type ApprovalLookup = (requestId: string) => { status: string; execution_result: string | null } | null;
+
+/** Result prefix of a commitment parked on approval requests. */
+const AWAITING_PREFIX = 'Awaiting user approval ';
+const AWAITING_RE = /^Awaiting user approval \[req:([^\]]*)\]/;
+
+/** Request ids encoded in a parked commitment's result, or null if not parked. */
+export function parseParkedRequestIds(result: string | null | undefined): string[] | null {
+  if (!result) return null;
+  const m = AWAITING_RE.exec(result);
+  if (!m) return null;
+  return m[1]!.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
 export class CommitmentExecutor {
   private agentService: IAgentService | null = null;
   private broadcast: BroadcastFn | null = null;
@@ -43,6 +58,9 @@ export class CommitmentExecutor {
   private notifiedIds: Set<string> = new Set();
   private pending: Map<string, ExecutionState> = new Map();
   private executedIds: Set<string> = new Set();
+  /** Commitments parked on approval requests, keyed by commitment id. */
+  private awaitingApproval: Map<string, { what: string; requestIds: string[] }> = new Map();
+  private approvalLookup: ApprovalLookup | null = null;
   private checkTimer: Timer | null = null;
   /**
    * Per-pending execution-fire timers. Replaces the global 5s polling tick:
@@ -60,6 +78,59 @@ export class CommitmentExecutor {
 
   setAgentService(agent: IAgentService): void {
     this.agentService = agent;
+  }
+
+  /** Lets the executor read approval outcomes for parked commitments. */
+  setApprovalLookup(lookup: ApprovalLookup): void {
+    this.approvalLookup = lookup;
+  }
+
+  /**
+   * Close commitments parked on approval requests once every request has a
+   * final outcome: completed if at least one executed, failed if they were
+   * all denied or expired. Runs on every check tick and can be called
+   * directly (tests, or right after an approval decision).
+   */
+  settleAwaitingApprovals(): void {
+    if (!this.approvalLookup) return;
+    for (const [commitmentId, entry] of this.awaitingApproval) {
+      try {
+        if (isWorkItemCommitment(commitmentId)) {
+          this.awaitingApproval.delete(commitmentId);
+          continue;
+        }
+        let pending = 0;
+        let executed = 0;
+        const results: string[] = [];
+        for (const id of entry.requestIds) {
+          const req = this.approvalLookup(id);
+          const status = req?.status ?? 'expired'; // a vanished row counts as expired
+          if (status === 'pending' || status === 'approved') pending += 1;
+          else if (status === 'executed') {
+            executed += 1;
+            if (req?.execution_result) results.push(req.execution_result);
+          }
+        }
+        if (pending > 0) continue;
+
+        this.awaitingApproval.delete(commitmentId);
+        // The user (dashboard, commitments tool) may have closed or cancelled
+        // it by hand in the meantime; their decision wins over the outcome.
+        const current = getCommitment(commitmentId);
+        if (!current || current.status !== 'active') continue;
+        if (executed > 0) {
+          const summary = results.join('\n').slice(0, 500) || 'Approved and executed';
+          updateCommitmentStatus(commitmentId, 'completed', summary);
+          console.log(`[Executor] Completed after approval: "${entry.what}"`);
+        } else {
+          updateCommitmentStatus(commitmentId, 'failed', 'Approval denied or expired');
+          console.log(`[Executor] Approval denied or expired: "${entry.what}"`);
+        }
+      } catch (err) {
+        // One bad row must not skip the rest of the tick.
+        console.error('[Executor] Failed to settle commitment status:', err);
+      }
+    }
   }
 
   setBroadcast(fn: BroadcastFn): void {
@@ -111,10 +182,11 @@ export class CommitmentExecutor {
    * triggers fire on transitions (not every poll).
    */
   checkAndAnnounce(): void {
+    this.settleAwaitingApprovals();
     try {
       const now = Date.now();
-      const dueNow = getDueCommitments(); // when_due <= now
-      const upcoming = getUpcoming(20); // all upcoming with when_due
+      const dueNow = getDueCommitments({ excludeWorkItems: true }); // when_due <= now
+      const upcoming = getUpcoming(20, { excludeWorkItems: true }); // all upcoming with when_due
 
       // Filter upcoming to those due within 15 minutes (matches the workflow
       // event semantics that the deleted heartbeat used).
@@ -157,6 +229,17 @@ export class CommitmentExecutor {
         if (this.pending.has(commitment.id)) continue;
         if (this.executedIds.has(commitment.id)) continue;
         if (commitment.status === 'completed' || commitment.status === 'failed') continue;
+
+        // Parked on approval requests (possibly from before a restart, or
+        // evicted from executedIds): rehydrate the wait instead of running
+        // the commitment again and creating a second request.
+        const parked = parseParkedRequestIds(commitment.result);
+        if (parked) {
+          if (!this.awaitingApproval.has(commitment.id)) {
+            this.awaitingApproval.set(commitment.id, { what: commitment.what, requestIds: parked });
+          }
+          continue;
+        }
 
         this.announceExecution(commitment);
       }
@@ -276,7 +359,7 @@ export class CommitmentExecutor {
   private async fireExecution(commitmentId: string): Promise<void> {
     const state = this.pending.get(commitmentId);
     if (!state) return;
-    if (state.cancelled || state.executed) {
+    if (state.cancelled || state.executed || isWorkItemCommitment(commitmentId)) {
       this.pending.delete(commitmentId);
       return;
     }
@@ -321,12 +404,60 @@ export class CommitmentExecutor {
       'Instructions:',
       '1. Use your available tools (browser, terminal, file operations) to complete this task.',
       '2. Be thorough — actually perform the work, don\'t just describe it.',
-      '3. **Intent Gating still applies.** If this task involves sending email/messages, payments, installs, destructive ops, or any other gated category, you MUST call `request_approval` first and wait for `[APPROVED]` before acting. Do NOT write "APPROVAL REQUIRED" yourself — always use the tool.',
+      '3. Gated actions (commands that change the machine, file writes, app control, deletions, installs, settings, messages, email, payments) stop automatically for the user\'s approval and return [AWAITING_APPROVAL]. Do the autonomous part first, then make the call; if it is awaiting approval, say so and stop. Do NOT write "APPROVAL REQUIRED" yourself and do not claim the action was done.',
       '4. After completion, summarize what you did.',
       '5. If the task is impossible or unclear, explain why and suggest alternatives.',
       '',
       'BEGIN EXECUTION.',
     ].join('\n');
+
+    // The `commitments` scope gap (#561, #571), stated where it happens rather
+    // than only in a module doc.
+    //
+    // A commitment created in a project-scoped site chat now RECORDS that
+    // scope (`commitments.scope_id`, stamped by ws-service). This turn still
+    // does not run under it, and that is a decision rather than an oversight:
+    // the executor's agentService is the BackgroundAgentService, which owns a
+    // separate AgentOrchestrator and a separate tool registry built in its own
+    // `start()` -- and the site-builder tools are registered only into the
+    // MAIN orchestrator's registry (daemon/index.ts). So applying
+    // PROJECT_SITE_CHAT_SCOPE here would withhold the four generic file and
+    // shell tools with nothing to substitute: the pinned `site-builder`
+    // category is empty on this registry, so a due "deploy the site" would be
+    // handed no file tool of any kind. That is worse than the gap.
+    //
+    // Closing it properly needs one of: registering the site tools on the
+    // background registry (a real behaviour expansion -- those tools would
+    // become reachable from every background turn, under a different authority
+    // profile, and #570 rated a site build-file write as execution), or
+    // routing a scoped commitment through the main orchestrator instead. Both
+    // are their own change.
+    //
+    // What partly holds the line meanwhile is the background authority
+    // profile: `execute_command` and `write_data` are in
+    // DEFAULT_BACKGROUND_GOVERNED, so a commitment that reaches for the shell
+    // or writes a file stops for the user's approval.
+    //
+    // Two limits on that, stated because it would be easy to read the sentence
+    // above as "covered". First, `read_data` is NOT in that list
+    // (authority/background-profile.ts) and the background registry does
+    // register the generic readers, so a model-written commitment like "read
+    // the notes in ~/... and add them to the site tomorrow" performs an
+    // unframed, untainting read on a later turn with no gate at all -- which is
+    // consequence one of #561, the one this scope exists to remove. Second, an
+    // explicit `authority.background.governed_categories: []` is a valid
+    // opt-out, so the control can be configured away entirely.
+    //
+    // Hence the log line: a scoped commitment executing unscoped is visible
+    // rather than silent. It is not a substitute for either fix above.
+    const commitmentScopeId = (() => {
+      try { return getCommitment(state.commitmentId)?.scope_id ?? null; } catch { return null; }
+    })();
+    if (commitmentScopeId) {
+      console.warn(`[Executor] commitment ${state.commitmentId} was created under tool scope `
+        + `"${commitmentScopeId}" but executes on the background agent, which does not carry it (#571). `
+        + 'The background authority profile is the control for this turn.');
+    }
 
     const response = await this.agentService!.handleMessage(prompt, 'system');
 
@@ -341,10 +472,28 @@ export class CommitmentExecutor {
       timestamp: Date.now(),
     });
 
-    // Mark commitment as completed
     const resultSummary = response
       ? response.length > 500 ? response.slice(0, 497) + '...' : response
       : 'Executed successfully';
+
+    // A turn that stopped on an approval request did not do the work. Park
+    // the commitment as active, remember which requests it is waiting on,
+    // and let settleAwaitingApprovals() close it from their outcome instead
+    // of recording it as done on the strength of a request that may still
+    // be denied or expire.
+    const requestIds = this.agentService?.lastTurnApprovalIds?.() ?? [];
+    if (requestIds.length > 0) {
+      this.awaitingApproval.set(state.commitmentId, { what: state.what, requestIds });
+      try {
+        // The request ids ride in the stored result so a restarted daemon can
+        // pick the parked commitment back up instead of re-running it.
+        updateCommitmentStatus(state.commitmentId, 'active', `${AWAITING_PREFIX}[req:${requestIds.join(',')}]: ${resultSummary}`);
+      } catch (err) {
+        console.error('[Executor] Failed to update commitment status:', err);
+      }
+      console.log(`[Executor] Awaiting approval (${requestIds.length} request(s)): "${state.what}"`);
+      return;
+    }
 
     try {
       updateCommitmentStatus(state.commitmentId, 'completed', resultSummary);

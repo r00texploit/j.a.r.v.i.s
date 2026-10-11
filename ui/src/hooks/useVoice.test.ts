@@ -7,7 +7,21 @@ import {
   selectActiveWakeEngine,
   isWithinSpeakingTailCooldown,
   planContainsWakeFlip,
+  isSpeechStopCommand,
 } from "./useVoice.ts";
+
+describe("isSpeechStopCommand", () => {
+  test("recognizes direct stop/quiet commands", () => {
+    expect(isSpeechStopCommand("Jarvis stop")).toBe(true);
+    expect(isSpeechStopCommand("Hey Jarvis, stop!")).toBe(true);
+    expect(isSpeechStopCommand("Jarvis be quiet")).toBe(true);
+  });
+
+  test("does not turn ordinary wake phrases into stop-only commands", () => {
+    expect(isSpeechStopCommand("Jarvis")).toBe(false);
+    expect(isSpeechStopCommand("Jarvis what time is it")).toBe(false);
+  });
+});
 
 describe("matchesSpeechWakePhrase (strict; used during TTS playback)", () => {
   test("accepts direct wake phrases", () => {
@@ -72,6 +86,7 @@ describe("shouldSpeechWakeBeRunning", () => {
   const base = {
     isMicAvailable: true,
     wakeWordEnabled: true,
+    nativeWakeActive: false,
     voiceState: "idle" as const,
     wakeEngine: "webspeech" as const,
     speechRecognitionAvailable: true,
@@ -119,6 +134,7 @@ describe("selectActiveWakeEngine", () => {
   const base = {
     isMicAvailable: true,
     wakeWordEnabled: true,
+    nativeWakeActive: false,
     wakeEngine: "openwakeword" as const,
     speechRecognitionAvailable: true,
     speechWakeFatal: false,
@@ -242,5 +258,54 @@ describe("planContainsWakeFlip — regression boundary for the mid-turn cooldown
       const allEqual = flags.every((f) => f === flags[0]);
       expect(allEqual).toBe(true);
     }
+  });
+});
+
+// The dashboard defers wake detection to the sidecar. Every dashboard session
+// has one behind it (the only credential the app is served with is a token an
+// enrolled sidecar minted), and the sidecar's listener coordinates with
+// playback in a way the browser one cannot: it releases the microphone for a
+// capture session and suppresses itself while the assistant speaks.
+//
+// Holding the microphone here regardless degraded audio played by every process
+// on the output device, because Chromium's default constraints turn on echo
+// cancellation, which attaches the page to that device.
+describe("deferring the wake word to the sidecar", () => {
+  const base = {
+    isMicAvailable: true,
+    wakeWordEnabled: true,
+    nativeWakeActive: true,
+    wakeEngine: "openwakeword" as const,
+    speechRecognitionAvailable: true,
+    speechWakeFatal: false,
+  };
+
+  test("runs no browser engine when the sidecar is listening", () => {
+    expect(selectActiveWakeEngine(base)).toBe("none");
+    expect(selectActiveWakeEngine({ ...base, wakeEngine: "webspeech" })).toBe("none");
+    expect(selectActiveWakeEngine({ ...base, wakeEngine: "auto" })).toBe("none");
+  });
+
+  test("keeps the speech recognizer off too, in every voice state", () => {
+    for (const voiceState of ["idle", "speaking", "processing", "wake_detected"] as const) {
+      expect(
+        shouldSpeechWakeBeRunning({ ...base, wakeEngine: "webspeech", voiceState }),
+      ).toBe(false);
+    }
+  });
+
+  // The flag is the only thing turning it off, so it has to be load-bearing:
+  // if the access model ever allows a dashboard with no sidecar, flipping this
+  // must bring the browser engine back rather than leaving it silently dead.
+  test("restores the browser engine when no sidecar is listening", () => {
+    expect(selectActiveWakeEngine({ ...base, nativeWakeActive: false })).toBe("openwakeword");
+    expect(
+      shouldSpeechWakeBeRunning({
+        ...base,
+        nativeWakeActive: false,
+        wakeEngine: "webspeech",
+        voiceState: "idle",
+      }),
+    ).toBe(true);
   });
 });
